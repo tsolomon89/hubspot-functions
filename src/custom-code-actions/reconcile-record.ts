@@ -23,7 +23,7 @@ export interface HubSpotCustomCodeEvent {
 
 export interface CustomCodeCallbackResult {
   outputFields: {
-    status: 'NO_CHANGE' | 'UPDATED_EXISTING' | 'CREATED_SUCCESSOR' | 'BLOCKED' | 'MANUAL_REVIEW';
+    status: 'NO_CHANGE' | 'UPDATED_EXISTING' | 'CREATED_SUCCESSOR' | 'DRY_RUN_SUCCESSOR_PLANNED' | 'BLOCKED' | 'MANUAL_REVIEW';
     opportunityKey: string;
     qualificationState: string;
     appliedIntentsCount: number;
@@ -104,8 +104,9 @@ export async function processHubSpotCustomCodeAction(
   let status: CustomCodeCallbackResult['outputFields']['status'] = 'UPDATED_EXISTING';
   if (evaluation.qualificationState === 'BLOCKED') status = 'BLOCKED';
   else if (evaluation.qualificationState === 'MANUAL_REVIEW') status = 'MANUAL_REVIEW';
-  else if (intents.some(i => i.kind === 'CREATE_SUCCESSOR')) status = 'CREATED_SUCCESSOR';
-  else if (intents.every(i => i.kind === 'NOOP')) status = 'NO_CHANGE';
+  else if (intents.some(i => i.kind === 'CREATE_SUCCESSOR')) {
+    status = config.featureFlags?.dryRunTransactions ? 'DRY_RUN_SUCCESSOR_PLANNED' : 'CREATED_SUCCESSOR';
+  } else if (intents.every(i => i.kind === 'NOOP')) status = 'NO_CHANGE';
 
   const verified = applyRes.success && applyRes.receipts.length > 0 && applyRes.receipts.every(r => r.verified);
 

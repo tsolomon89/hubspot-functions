@@ -22,17 +22,22 @@ export class OrganizationConfigResolver {
     let orgKey = options.organizationKey;
     let relType = options.relationshipType ? options.relationshipType.trim().toLowerCase() : undefined;
 
-    if (options.portalId) {
-      const installation = this.resolvePortalInstallation(options.portalId);
-      if (!installation) {
-        throw new Error(`UNSUPPORTED_PORTAL: Portal '${options.portalId}' is not registered in portal-installations.yaml`);
-      }
-      if (!orgKey) orgKey = installation.organizationKey;
-      if (!relType) relType = installation.defaultRelationshipType;
+    const installation = options.portalId ? this.resolvePortalInstallation(options.portalId) : null;
+    if (options.portalId && !installation) {
+      throw new Error(`UNSUPPORTED_PORTAL: Portal '${options.portalId}' is not registered in portal-installations.yaml`);
     }
 
-    if (!relType) relType = 'b2b';
-    if (!orgKey) orgKey = relType === 'b2c' ? 'org_consumer_brand' : 'org_global_corp';
+    if (!relType) {
+      relType = installation?.defaultRelationshipType || 'b2b';
+    }
+
+    if (!orgKey) {
+      if (installation && (!options.relationshipType || options.relationshipType === installation.defaultRelationshipType)) {
+        orgKey = installation.organizationKey;
+      } else {
+        orgKey = relType === 'b2c' ? 'org_consumer_brand' : 'org_global_corp';
+      }
+    }
 
     const embeddedKey = `${orgKey}:${relType}`;
     if (EMBEDDED_CONFIGS[embeddedKey]) {
@@ -52,23 +57,7 @@ export class OrganizationConfigResolver {
       if (valRes.valid) return config;
     }
 
-    // Fallback to default B2B or B2C embedded config if matching key not found
-    const fallbackKey = relType === 'b2c' ? 'org_consumer_brand:b2c' : 'org_global_corp:b2b';
-    if (EMBEDDED_CONFIGS[fallbackKey]) {
-      const raw = EMBEDDED_CONFIGS[fallbackKey];
-      return {
-        organizationKey: raw.organizationKey || orgKey,
-        configVersion: raw.configVersion || '1.0.0',
-        relationshipType: raw.relationshipType || relType,
-        goalsByOpportunityType: raw.goalsByOpportunityType || { MQL: [], SQL: [], FTP: [], RTP: [] },
-        hubspotPipelines: raw.hubspotPipelines || {
-          leadPipelineId: 'b2b_qualification_lead_pipeline',
-          dealPipelineId: 'b2b_transaction_deal_pipeline'
-        },
-        featureFlags: raw.featureFlags || {}
-      };
-    }
-
-    throw new Error(`UNSUPPORTED_RELATIONSHIP_TYPE: Qualification configuration for relationship type '${relType}' was not found`);
+    // Fail closed explicitly if requested org key or relationship type is unknown
+    throw new Error(`UNSUPPORTED_RELATIONSHIP_TYPE: Qualification configuration for '${orgKey}:${relType}' was not found`);
   }
 }

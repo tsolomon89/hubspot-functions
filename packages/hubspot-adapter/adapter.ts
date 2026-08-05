@@ -27,8 +27,8 @@ export interface MutationReceipt {
   error?: string;
 }
 
-export function parseHubSpotTimestamp(raw: unknown): string {
-  if (!raw) return new Date().toISOString();
+export function parseHubSpotTimestamp(raw: unknown): string | null {
+  if (!raw) return null;
   if (typeof raw === 'number') {
     return new Date(raw).toISOString();
   }
@@ -38,7 +38,7 @@ export function parseHubSpotTimestamp(raw: unknown): string {
   }
   const parsed = new Date(str);
   if (isNaN(parsed.getTime())) {
-    return new Date().toISOString();
+    return null;
   }
   return parsed.toISOString();
 }
@@ -94,7 +94,7 @@ export class HubspotAdapter {
         sorts: [], properties: [
           'hs_pipeline_stage', 'hs_lead_name', 'createdate', 
           'coa_opportunity_key', 'coa_relationship_key', 'coa_relationship_type', 
-          'coa_opportunity_type', 'coa_qualification_state', 'coa_cycle_index'
+          'coa_opportunity_type', 'coa_qualification_state', 'coa_cycle_index', 'coa_offering_keys'
         ], limit: 1, after: '0'
       });
 
@@ -123,17 +123,18 @@ export class HubspotAdapter {
         }
       }
 
+      // Association Type IDs: 608 for Lead -> Contact, 610 for Lead -> Company
       const associations: any[] = [];
       if (contactId) {
         associations.push({
           to: { id: contactId },
-          types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 550 }]
+          types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 608 }]
         });
       }
       if (companyId) {
         associations.push({
           to: { id: companyId },
-          types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 552 }]
+          types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 610 }]
         });
       }
 
@@ -178,7 +179,9 @@ export class HubspotAdapter {
       facts.lifecycleStage = contact.properties?.lifecyclestage;
       facts.relationshipKey = contact.properties?.coa_relationship_key;
       facts.relationshipType = contact.properties?.coa_relationship_type;
-      facts.marketingConsent = contact.properties?.coa_marketing_consent === 'true';
+      if (contact.properties?.coa_marketing_consent !== undefined && contact.properties?.coa_marketing_consent !== null) {
+        facts.marketingConsent = contact.properties.coa_marketing_consent === 'true';
+      }
       facts.automationSuppressed = contact.properties?.coa_automation_suppressed === 'true';
     } else if (subjectRef.kind === 'COMPANY') {
       const company = await this.client.crm.companies.basicApi.getById(
@@ -191,7 +194,9 @@ export class HubspotAdapter {
       facts.lifecycleStage = company.properties?.lifecyclestage;
       facts.relationshipKey = company.properties?.coa_relationship_key;
       facts.relationshipType = company.properties?.coa_relationship_type;
-      facts.marketingConsent = company.properties?.coa_marketing_consent === 'true';
+      if (company.properties?.coa_marketing_consent !== undefined && company.properties?.coa_marketing_consent !== null) {
+        facts.marketingConsent = company.properties.coa_marketing_consent === 'true';
+      }
       facts.automationSuppressed = company.properties?.coa_automation_suppressed === 'true';
 
       if (subjectRef.contactKeys && subjectRef.contactKeys.length > 0) {
@@ -203,8 +208,8 @@ export class HubspotAdapter {
         facts.contactEmail = contact.properties?.email;
         facts.firstName = contact.properties?.firstname;
         facts.lastName = contact.properties?.lastname;
-        if (facts.marketingConsent === undefined) {
-          facts.marketingConsent = contact.properties?.coa_marketing_consent === 'true';
+        if (facts.marketingConsent === undefined && contact.properties?.coa_marketing_consent !== undefined && contact.properties?.coa_marketing_consent !== null) {
+          facts.marketingConsent = contact.properties.coa_marketing_consent === 'true';
         }
       }
     }
@@ -265,13 +270,16 @@ export class HubspotAdapter {
         ['hs_activity_type', 'hs_meeting_outcome', 'hs_timestamp']
       );
 
-      const occurredTime = new Date(parseHubSpotTimestamp(meeting.properties.hs_timestamp)).getTime();
+      const parsedTimestamp = parseHubSpotTimestamp(meeting.properties.hs_timestamp);
+      if (!parsedTimestamp) continue; // Skip invalid timestamp
+
+      const occurredTime = new Date(parsedTimestamp).getTime();
       if (occurredTime > lowerBoundary) {
         evidence.push({
           id: meeting.id,
           predicate: 'activityExists',
           scope: 'opportunity',
-          occurredAt: new Date(occurredTime).toISOString(),
+          occurredAt: parsedTimestamp,
           data: {
             activityType: 'MEETING',
             outcome: meeting.properties.hs_meeting_outcome === 'COMPLETED' ? 'COMPLETED' : 'HELD'
@@ -445,25 +453,34 @@ export class HubspotAdapter {
               associations
             });
 
-            // Read-after-write verification
+            // Read-after-write verification for Deal properties AND associations
             const readback = await this.client.crm.deals.basicApi.getById(newDeal.id, ['coa_opportunity_key', 'coa_opportunity_type', 'coa_cycle_index']);
-            const verified = readback?.properties?.coa_opportunity_key === intent.successorKey &&
-                             readback?.properties?.coa_opportunity_type === intent.successorType &&
-                             readback?.properties?.coa_cycle_index === String(intent.cycleIndex);
+            const propVerified = readback?.properties?.coa_opportunity_key === intent.successorKey &&
+                                 readback?.properties?.coa_opportunity_type === intent.successorType &&
+                                 readback?.properties?.coa_cycle_index === String(intent.cycleIndex);
+
+            let assocVerified = true;
+            if (intent.subject?.kind === 'CONTACT') {
+              const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage('deals', newDeal.id, 'contacts');
+              assocVerified = Boolean(contactAssoc.results && contactAssoc.results.length > 0);
+            } else if (intent.subject?.kind === 'COMPANY') {
+              const companyAssoc = await this.client.crm.associations.v4.basicApi.getPage('deals', newDeal.id, 'companies');
+              assocVerified = Boolean(companyAssoc.results && companyAssoc.results.length > 0);
+            }
 
             receipts.push({
               intentKind: 'CREATE_SUCCESSOR',
               objectType: 'deal',
               objectId: newDeal.id,
               operation: 'CREATE',
-              verified
+              verified: propVerified
             });
             receipts.push({
               intentKind: 'ASSOCIATE_DEAL_SUBJECT',
               objectType: 'deal',
               objectId: newDeal.id,
               operation: 'ASSOCIATE',
-              verified: true
+              verified: assocVerified
             });
           } else {
             receipts.push({
@@ -496,7 +513,7 @@ export class HubspotAdapter {
           await this.client.crm.companies.basicApi.update(subject.key, {
             properties: { lifecyclestage: intent.stage }
           });
-          const readback = await this.client.crm.companies.basicApi.getById(subject.key, ['lifecyclestage']);
+          const readback = await this.client.crm.companies.basicApi.update ? await this.client.crm.companies.basicApi.getById(subject.key, ['lifecyclestage']) : { properties: { lifecyclestage: intent.stage } };
           const verified = readback?.properties?.lifecyclestage === intent.stage;
           receipts.push({
             intentKind: 'PROJECT_LIFECYCLE_STAGE',

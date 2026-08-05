@@ -64,7 +64,7 @@ export const EMBEDDED_CONFIGS: Record<string, any> = {
     },
     "featureFlags": {
       "automationSuppressed": false,
-      "dryRunTransactions": true
+      "dryRunTransactions": false
     }
   },
   "org_consumer_brand:b2c": {

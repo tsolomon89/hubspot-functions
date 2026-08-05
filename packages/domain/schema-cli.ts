@@ -177,19 +177,21 @@ export class SchemaTool {
       }
     }
 
-    // 3. Create Pipelines
+    // 3. Create Pipelines with explicit pipelineId and stageIds!
     for (const pipe of actualDiff.pipelinesToCreate) {
       const targetObj = pipe.objectType || 'deals';
       try {
         await rawClient.crm.pipelines.pipelinesApi.create(targetObj, {
+          pipelineId: pipe.pipelineId,
           label: pipe.name,
           displayOrder: pipe.displayOrder || 1,
           stages: (pipe.stages || []).map((s: any) => ({
+            stageId: s.stageId,
             label: s.label,
             displayOrder: s.displayOrder,
             metadata: s.metadata || { probability: (s.stageId === 'closedwon' ? '1.0' : '0.2') }
           }))
-        });
+        } as any);
         appliedCount++;
       } catch (err: any) {
         if (err.statusCode !== 409 && err.code !== 409) {

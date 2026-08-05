@@ -64,7 +64,7 @@ export class HubSpotSnapshotLoader {
         cycleIndex = Number(managedLead.coa_cycle_index || 1);
         opportunityKey = managedLead.coa_opportunity_key || opportunityKey;
         if (managedLead.createdate) {
-          openedAt = parseHubSpotTimestamp(managedLead.createdate);
+          openedAt = parseHubSpotTimestamp(managedLead.createdate) || openedAt;
         }
         const stage = (managedLead.hs_pipeline_stage as string) || 'mql';
         if (stage === 'qualified') opportunityState = 'WON';
@@ -85,7 +85,7 @@ export class HubSpotSnapshotLoader {
       opportunityKey = (leadProps.coa_opportunity_key as string) || `${relationshipKey}::LEAD::1`;
       predecessorOpportunityKey = leadProps.coa_predecessor_opportunity_key as string;
       if (leadProps.createdate) {
-        openedAt = parseHubSpotTimestamp(leadProps.createdate);
+        openedAt = parseHubSpotTimestamp(leadProps.createdate) || openedAt;
       }
 
       // Query associated Contact / Company to resolve subject identity
@@ -116,10 +116,10 @@ export class HubSpotSnapshotLoader {
       opportunityKey = (dealProps.coa_opportunity_key as string) || `${relationshipKey}::${opportunityType}::${cycleIndex}`;
       predecessorOpportunityKey = dealProps.coa_predecessor_opportunity_key as string;
       if (dealProps.coa_predecessor_completed_at) {
-        predecessorCompletedAt = parseHubSpotTimestamp(dealProps.coa_predecessor_completed_at);
+        predecessorCompletedAt = parseHubSpotTimestamp(dealProps.coa_predecessor_completed_at) || undefined;
       }
       if (dealProps.createdate) {
-        openedAt = parseHubSpotTimestamp(dealProps.createdate);
+        openedAt = parseHubSpotTimestamp(dealProps.createdate) || openedAt;
       }
 
       // Query associated Contact / Company
@@ -160,8 +160,8 @@ export class HubSpotSnapshotLoader {
         facts.products = productIds;
         facts.offeringKeys = productIds;
         facts.lineItems = lineItems;
-      } catch (err) {
-        // No line items associated
+      } catch (err: any) {
+        if (err.statusCode && err.statusCode !== 404) throw err;
       }
 
       const stage = (dealProps.dealstage as string) || 'open';

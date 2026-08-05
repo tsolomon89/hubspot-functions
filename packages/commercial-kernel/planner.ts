@@ -79,7 +79,8 @@ export function planTransition(
     return [{ 
       kind: 'CREATE_MANUAL_REVIEW', 
       opportunityKey: snapshot.opportunityKey, 
-      reason: 'Opportunity requires human manual review' 
+      reason: 'Opportunity requires human manual review',
+      subject: snapshot.subject
     }];
   }
 
@@ -137,7 +138,8 @@ export function planTransition(
       predecessorKey: snapshot.opportunityKey,
       successorKey,
       successorType: 'FTP',
-      cycleIndex: 1
+      cycleIndex: 1,
+      subject: snapshot.subject
     });
   } else if (snapshot.opportunityType === 'FTP') {
     intents.push({
@@ -158,7 +160,8 @@ export function planTransition(
       predecessorKey: snapshot.opportunityKey,
       successorKey,
       successorType: 'RTP',
-      cycleIndex: 1
+      cycleIndex: 1,
+      subject: snapshot.subject
     });
   } else if (snapshot.opportunityType === 'RTP') {
     intents.push({
@@ -180,7 +183,8 @@ export function planTransition(
       predecessorKey: snapshot.opportunityKey,
       successorKey,
       successorType: 'RTP',
-      cycleIndex: nextCycleIndex
+      cycleIndex: nextCycleIndex,
+      subject: snapshot.subject
     });
   }
 

@@ -24,6 +24,18 @@ properties:
       hasUniqueValue: false
       description: "Relationship Type category (b2b, b2c)."
 
+    - name: "coa_marketing_consent"
+      label: "Marketing Consent"
+      type: "bool"
+      fieldType: "booleancheckbox"
+      groupName: "commercial_operations_automation"
+      options:
+        - label: "True"
+          value: "true"
+        - label: "False"
+          value: "false"
+      description: "Explicit marketing consent flag."
+
     - name: "coa_managed"
       label: "COA Managed"
       type: "bool"
@@ -61,6 +73,18 @@ properties:
       groupName: "commercial_operations_automation"
       hasUniqueValue: false
       description: "Relationship Type category (b2b, b2c)."
+
+    - name: "coa_marketing_consent"
+      label: "Marketing Consent"
+      type: "bool"
+      fieldType: "booleancheckbox"
+      groupName: "commercial_operations_automation"
+      options:
+        - label: "True"
+          value: "true"
+        - label: "False"
+          value: "false"
+      description: "Explicit marketing consent flag."
 
     - name: "coa_managed"
       label: "COA Managed"
@@ -119,6 +143,13 @@ properties:
         - label: "SQL"
           value: "SQL"
       description: "Qualification Opportunity Type (MQL or SQL)."
+
+    - name: "coa_offering_keys"
+      label: "Offering Keys"
+      type: "string"
+      fieldType: "text"
+      groupName: "commercial_operations_automation"
+      description: "Comma-separated list of commercial offering keys."
 
     - name: "coa_cycle_index"
       label: "Cycle Index"
@@ -221,6 +252,13 @@ properties:
         - label: "RTP"
           value: "RTP"
       description: "Transaction Opportunity Type (FTP or RTP)."
+
+    - name: "coa_offering_keys"
+      label: "Offering Keys"
+      type: "string"
+      fieldType: "text"
+      groupName: "commercial_operations_automation"
+      description: "Comma-separated list of commercial offering keys."
 
     - name: "coa_cycle_index"
       label: "Cycle Index"
