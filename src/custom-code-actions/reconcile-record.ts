@@ -106,12 +106,15 @@ export async function processHubSpotCustomCodeAction(
   else if (intents.some(i => i.kind === 'CREATE_SUCCESSOR')) status = 'CREATED_SUCCESSOR';
   else if (intents.every(i => i.kind === 'NOOP')) status = 'NO_CHANGE';
 
+  const verified = applyRes.success && applyRes.receipts.length > 0 && applyRes.receipts.every(r => r.verified);
+
   logger.info('Stateless HubSpot Custom Code Action executed successfully', {
     objectId,
     objectType,
     opportunityKey: snapshot.opportunityKey,
     qualificationState: evaluation.qualificationState,
-    appliedIntentsCount: applyRes.appliedIntents
+    appliedIntentsCount: applyRes.appliedIntents,
+    verified
   });
 
   return {
@@ -120,7 +123,7 @@ export async function processHubSpotCustomCodeAction(
       opportunityKey: snapshot.opportunityKey,
       qualificationState: evaluation.qualificationState,
       appliedIntentsCount: applyRes.appliedIntents,
-      verified: true
+      verified
     }
   };
 }

@@ -13,13 +13,13 @@ export interface ResolveConfigOptions {
 // Embedded in-memory static configurations for zero-filesystem runtime execution (HubSpot Custom Code Actions)
 const EMBEDDED_INSTALLATIONS: Record<string, { organizationKey: string; defaultRelationshipType: string }> = {
   '149041124': {
-    organizationKey: 'org_default',
+    organizationKey: 'org_global_corp',
     defaultRelationshipType: 'b2b'
   }
 };
 
 const EMBEDDED_CONFIGS: Record<string, QualificationConfig> = {
-  'org_default:b2b': {
+  'org_global_corp:b2b': {
     organizationKey: 'org_global_corp',
     configVersion: '1.0.0',
     relationshipType: 'b2b',
@@ -40,7 +40,7 @@ const EMBEDDED_CONFIGS: Record<string, QualificationConfig> = {
     },
     featureFlags: { automationSuppressed: false }
   },
-  'org_default:b2c': {
+  'org_consumer_brand:b2c': {
     organizationKey: 'org_consumer_brand',
     configVersion: '1.0.0',
     relationshipType: 'b2c',
@@ -111,18 +111,15 @@ export class OrganizationConfigResolver {
     }
 
     if (!relType) relType = 'b2b';
-    if (!orgKey) orgKey = 'org_default';
+    if (!orgKey) orgKey = relType === 'b2c' ? 'org_consumer_brand' : 'org_global_corp';
 
     const embeddedKey = `${orgKey}:${relType}`;
     if (EMBEDDED_CONFIGS[embeddedKey]) {
       return EMBEDDED_CONFIGS[embeddedKey];
     }
-    if (EMBEDDED_CONFIGS[`org_default:${relType}`]) {
-      return EMBEDDED_CONFIGS[`org_default:${relType}`];
-    }
 
     let candidateFilename = `${relType}.yaml`;
-    if (orgKey && orgKey !== 'org_default') {
+    if (orgKey && orgKey !== 'org_global_corp' && orgKey !== 'org_consumer_brand') {
       candidateFilename = `${orgKey}-${relType}.yaml`;
     }
 

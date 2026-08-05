@@ -59,7 +59,15 @@ export interface EvaluationResult {
 }
 
 export type TransitionIntent =
-  | { kind: 'UPDATE_OPPORTUNITY'; opportunityKey: string; newState: OpportunityState; qualificationState: QualificationState; details?: Record<string, unknown> }
+  | { 
+      kind: 'UPDATE_OPPORTUNITY'; 
+      opportunityKey: string; 
+      newState: OpportunityState; 
+      qualificationState: QualificationState; 
+      targetRecordId?: string;
+      targetObjectType?: 'contact' | 'company' | 'lead' | 'deal';
+      details?: Record<string, unknown>;
+    }
   | { kind: 'CREATE_SUCCESSOR'; predecessorKey: string; successorKey: string; successorType: OpportunityType; cycleIndex: number }
   | { kind: 'PROJECT_LIFECYCLE_STAGE'; subject: CommercialSubjectRef; stage: string }
   | { kind: 'CREATE_MANUAL_REVIEW'; opportunityKey: string; reason: string }

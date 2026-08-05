@@ -77,23 +77,25 @@ export function evaluatePredicate(
   // Enforce evidence window scope rules
   const matchingEvidence = snapshot.evidence.filter(ev => {
     if (goal.scope === 'opportunity' && ev.occurredAt < snapshot.openedAt) {
-      return false; // Pre-opportunity evidence ignored
+      return false;
     }
     if (goal.scope === 'sincePredecessorCompletion') {
       if (!snapshot.predecessorCompletedAt || ev.occurredAt <= snapshot.predecessorCompletedAt) {
-        return false; // Evidence prior to predecessor completion boundary ignored for RTP!
+        return false;
       }
     }
     return true;
   });
 
   switch (goal.predicate) {
+    case 'hasIdentity':
     case 'anyCommunicationChannel': {
       const email = snapshot.facts.email || snapshot.facts.contactEmail;
       const phone = snapshot.facts.phone;
       const satisfied = Boolean(email || phone);
       return { satisfied, evidenceRefs: satisfied ? ['fact_communication_channel'] : [] };
     }
+    case 'hasOfferingInterest':
     case 'offeringKnown': {
       const products = snapshot.facts.products || snapshot.facts.offeringKeys || snapshot.facts.offering;
       const hasOffering = Array.isArray(products) ? products.length > 0 : Boolean(products);
@@ -118,12 +120,12 @@ export function evaluatePredicate(
       const evMatches = matchingEvidence.filter(e => e.data?.associatedObjectType === objectType || e.predicate === 'associationExists');
       return { satisfied: evMatches.length > 0, evidenceRefs: evMatches.map(e => e.id) };
     }
+    case 'transactionComplete':
     case 'transactionExists': {
       const evMatches = matchingEvidence.filter(e => e.predicate === 'transactionExists' || e.data?.transactionId || e.data?.orderId);
       
-      // Fact-based transaction check: ONLY valid for current cycle if completed after predecessor boundary!
       let hasFactTransaction = false;
-      if (snapshot.facts.transactionCompleted || snapshot.facts.orderCompleted) {
+      if (snapshot.facts.transactionCompleted || snapshot.facts.orderCompleted || snapshot.facts.amount) {
         const factTxTime = (snapshot.facts.transactionCompletedAt as string) || snapshot.openedAt;
         if (goal.scope === 'sincePredecessorCompletion') {
           hasFactTransaction = Boolean(snapshot.predecessorCompletedAt && factTxTime > snapshot.predecessorCompletedAt);

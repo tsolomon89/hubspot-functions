@@ -1,20 +1,26 @@
 import { describe, it, expect, vi } from 'vitest';
-import { HubspotAdapter } from '../../packages/hubspot-adapter';
+import { HubspotAdapter } from '../../packages/hubspot-adapter/adapter';
 import { TransitionIntent } from '../../packages/commercial-kernel';
 
 describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
   it('should apply CREATE_SUCCESSOR intent for SQL Lead natively', async () => {
     const adapter = new HubspotAdapter('fake-token');
-    
-    // Mock underlying CRM API methods
-    const createLeadMock = vi.fn().mockResolvedValue({ id: 'lead_1001', properties: { coa_opportunity_key: 'rel_acme::SQL::1' } });
-    const searchLeadMock = vi.fn().mockResolvedValue({ results: [] });
-    const getLeadMock = vi.fn().mockResolvedValue({ id: 'lead_1001', properties: { coa_opportunity_key: 'rel_acme::SQL::1' } });
-
     const rawClient = adapter.getRawClient();
-    rawClient.crm.objects.leads.searchApi.doSearch = searchLeadMock;
+
+    const searchMock = vi.fn().mockResolvedValue({ results: [] });
+    const createLeadMock = vi.fn().mockResolvedValue({ id: 'lead_123' });
+    const getByIdMock = vi.fn().mockResolvedValue({
+      id: 'lead_123',
+      properties: {
+        coa_opportunity_key: 'rel_acme::SQL::1',
+        coa_opportunity_type: 'SQL',
+        coa_cycle_index: '1'
+      }
+    });
+
+    rawClient.crm.objects.leads.searchApi.doSearch = searchMock;
     rawClient.crm.objects.leads.basicApi.create = createLeadMock;
-    rawClient.crm.objects.leads.basicApi.getById = getLeadMock;
+    rawClient.crm.objects.leads.basicApi.getById = getByIdMock;
 
     const intents: TransitionIntent[] = [{
       kind: 'CREATE_SUCCESSOR',
@@ -24,7 +30,7 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
       cycleIndex: 1
     }];
 
-    const result = await adapter.applyTransitionIntents(intents, 'trans_sql_1');
+    const result = await adapter.applyTransitionIntents(intents, 'trans_123');
 
     expect(result.success).toBe(true);
     expect(result.appliedIntents).toBe(1);
@@ -38,15 +44,22 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
 
   it('should apply CREATE_SUCCESSOR intent for FTP Deal natively', async () => {
     const adapter = new HubspotAdapter('fake-token');
-    
-    const createDealMock = vi.fn().mockResolvedValue({ id: 'deal_2002', properties: { coa_opportunity_key: 'rel_acme::FTP::1' } });
-    const searchDealMock = vi.fn().mockResolvedValue({ results: [] });
-    const getDealMock = vi.fn().mockResolvedValue({ id: 'deal_2002', properties: { coa_opportunity_key: 'rel_acme::FTP::1' } });
-
     const rawClient = adapter.getRawClient();
-    rawClient.crm.deals.searchApi.doSearch = searchDealMock;
+
+    const searchMock = vi.fn().mockResolvedValue({ results: [] });
+    const createDealMock = vi.fn().mockResolvedValue({ id: 'deal_456' });
+    const getByIdMock = vi.fn().mockResolvedValue({
+      id: 'deal_456',
+      properties: {
+        coa_opportunity_key: 'rel_acme::FTP::1',
+        coa_opportunity_type: 'FTP',
+        coa_cycle_index: '1'
+      }
+    });
+
+    rawClient.crm.deals.searchApi.doSearch = searchMock;
     rawClient.crm.deals.basicApi.create = createDealMock;
-    rawClient.crm.deals.basicApi.getById = getDealMock;
+    rawClient.crm.deals.basicApi.getById = getByIdMock;
 
     const intents: TransitionIntent[] = [{
       kind: 'CREATE_SUCCESSOR',
@@ -56,7 +69,7 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
       cycleIndex: 1
     }];
 
-    const result = await adapter.applyTransitionIntents(intents, 'trans_ftp_1');
+    const result = await adapter.applyTransitionIntents(intents, 'trans_456');
 
     expect(result.success).toBe(true);
     expect(result.appliedIntents).toBe(1);
