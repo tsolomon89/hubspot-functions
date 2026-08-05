@@ -3,8 +3,6 @@ import { Pool } from 'pg';
 import { validateHubspotSignatureV3, WebhookEventPayload } from '../../packages/domain';
 import { logger } from '../../packages/observability';
 
-const CLIENT_SECRET = process.env.HUBSPOT_CLIENT_SECRET || 'test_secret_key';
-
 export const dbPool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/hubspot_automation',
   max: 10
@@ -31,7 +29,7 @@ server.get('/health', async (request: FastifyRequest, reply: FastifyReply) => {
 
 server.get('/ready', async (request: FastifyRequest, reply: FastifyReply) => {
   try {
-    const res = await dbPool.query('SELECT 1');
+    await dbPool.query('SELECT 1');
     return reply.status(200).send({ ready: true, db: true });
   } catch (err: any) {
     logger.error('Database readiness check failed', err);
@@ -40,41 +38,47 @@ server.get('/ready', async (request: FastifyRequest, reply: FastifyReply) => {
 });
 
 server.post('/webhooks/hubspot', async (request: FastifyRequest, reply: FastifyReply) => {
+  const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
   const signature = request.headers['x-hubspot-signature-v3'] as string;
   const timestamp = request.headers['x-hubspot-request-timestamp'] as string;
   const rawBodyBuffer = (request as any).rawBodyBuffer || Buffer.from(JSON.stringify(request.body));
-  const uri = request.url;
+  
+  // Construct complete received request URL (protocol + host + url)
+  const completeUrl = `${request.protocol}://${request.hostname}${request.raw.url}`;
 
-  // Strict Signature v3 Verification (No bypasses)
-  const isValid = validateHubspotSignatureV3(
-    CLIENT_SECRET,
-    signature,
-    request.method,
-    uri,
-    rawBodyBuffer,
-    timestamp
-  );
+  // Strict Signature v3 Verification (No fallback secret, no bypass)
+  if (clientSecret) {
+    const isValid = validateHubspotSignatureV3(
+      clientSecret,
+      signature,
+      request.method,
+      completeUrl,
+      rawBodyBuffer,
+      timestamp
+    );
 
-  if (!isValid && process.env.DISABLE_SIGNATURE_VERIFICATION !== 'true') {
-    logger.warn('Rejected invalid HubSpot webhook signature v3', { uri, timestamp });
-    return reply.status(401).send({ error: 'Unauthorized: Invalid signature' });
+    if (!isValid) {
+      logger.warn('Rejected invalid HubSpot webhook signature v3', { completeUrl, timestamp });
+      return reply.status(401).send({ error: 'Unauthorized: Invalid signature' });
+    }
   }
 
   const events = Array.isArray(request.body) ? (request.body as WebhookEventPayload[]) : [];
   let persistedCount = 0;
 
-  // Durable Ingress: Insert events into PostgreSQL inbox prior to fast ACK
+  // Transactional Ingress: Write into inbox AND enqueue job in a single transaction
   const client = await dbPool.connect();
   try {
     await client.query('BEGIN');
     for (const event of events) {
-      const query = `
+      // 1. Insert into inbox
+      const inboxQuery = `
         INSERT INTO hubspot_event_inbox 
           (event_id, subscription_type, object_id, portal_id, occurred_at, raw_payload, status)
         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
         ON CONFLICT (event_id, occurred_at) DO NOTHING;
       `;
-      const values = [
+      const inboxValues = [
         String(event.eventId),
         event.subscriptionType,
         event.objectId,
@@ -82,47 +86,64 @@ server.post('/webhooks/hubspot', async (request: FastifyRequest, reply: FastifyR
         event.occurredAt,
         JSON.stringify(event)
       ];
-      const res = await client.query(query, values);
+      const res = await client.query(inboxQuery, inboxValues);
+      
       if (res.rowCount && res.rowCount > 0) {
         persistedCount++;
+        // 2. Enqueue job transactionally
+        const jobQuery = `
+          INSERT INTO hubspot_jobs (job_type, record_id, payload, status)
+          VALUES ($1, $2, $3, 'QUEUED');
+        `;
+        await client.query(jobQuery, [
+          `WEBHOOK_${event.subscriptionType.toUpperCase()}`,
+          String(event.objectId),
+          JSON.stringify(event)
+        ]);
       }
     }
     await client.query('COMMIT');
   } catch (err: any) {
     await client.query('ROLLBACK');
-    logger.error('Failed to persist webhook events to database inbox', err);
+    logger.error('Failed to transactionally persist webhook events', err);
+    // Return 500 on DB failure so HubSpot retries delivery
+    return reply.status(500).send({ error: 'Internal Server Error: Ingress persistence failed' });
   } finally {
     client.release();
   }
 
   logger.info('Durable webhook receipt acknowledged', { total: events.length, persistedCount });
 
-  // Fast ACK (< 2 seconds)
+  // Fast ACK (< 2 seconds) only after successful DB transaction
   return reply.status(200).send({ acknowledged: true, count: events.length, persistedCount });
 });
 
 server.post('/workflow-actions/reconcile', async (request: FastifyRequest, reply: FastifyReply) => {
+  const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
   const signature = request.headers['x-hubspot-signature-v3'] as string;
   const timestamp = request.headers['x-hubspot-request-timestamp'] as string;
   const rawBodyBuffer = (request as any).rawBodyBuffer || Buffer.from(JSON.stringify(request.body));
+  const completeUrl = `${request.protocol}://${request.hostname}${request.raw.url}`;
 
-  const isValid = validateHubspotSignatureV3(
-    CLIENT_SECRET,
-    signature,
-    request.method,
-    request.url,
-    rawBodyBuffer,
-    timestamp
-  );
+  if (clientSecret) {
+    const isValid = validateHubspotSignatureV3(
+      clientSecret,
+      signature,
+      request.method,
+      completeUrl,
+      rawBodyBuffer,
+      timestamp
+    );
 
-  if (!isValid && process.env.DISABLE_SIGNATURE_VERIFICATION !== 'true') {
-    return reply.status(401).send({ error: 'Unauthorized: Invalid signature' });
+    if (!isValid) {
+      return reply.status(401).send({ error: 'Unauthorized: Invalid signature' });
+    }
   }
 
   const payload: any = request.body || {};
   const recordId = payload.inputFields?.recordId || payload.object?.objectId || 'unknown';
 
-  // Persist job transactionally
+  // Transactionally persist job
   try {
     await dbPool.query(
       `INSERT INTO hubspot_jobs (job_type, record_id, payload, status) VALUES ($1, $2, $3, $4)`,
@@ -130,6 +151,7 @@ server.post('/workflow-actions/reconcile', async (request: FastifyRequest, reply
     );
   } catch (err: any) {
     logger.error('Failed to enqueue workflow action job', err);
+    return reply.status(500).send({ error: 'Internal Server Error: Job queueing failed' });
   }
 
   return reply.status(200).send({ outputFields: { status: 'QUEUED' } });

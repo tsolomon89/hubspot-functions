@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS hubspot_jobs (
   status VARCHAR(50) DEFAULT 'QUEUED',
   attempts INT DEFAULT 0,
   max_attempts INT DEFAULT 5,
+  leased_until TIMESTAMP WITH TIME ZONE,
   last_error TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -56,7 +57,7 @@ CREATE TABLE IF NOT EXISTS hubspot_dead_letters (
 CREATE TABLE IF NOT EXISTS hubspot_schema_runs (
   id BIGSERIAL PRIMARY KEY,
   manifest_version VARCHAR(50) NOT NULL,
-  mode VARCHAR(50) NOT NULL, -- inspect, plan, apply
+  mode VARCHAR(50) NOT NULL, -- inspect, plan, apply, readback
   diff_summary JSONB,
   executed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

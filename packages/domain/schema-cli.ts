@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
 import { HubspotClientWrapper } from '../hubspot-client';
+import { logger } from '../observability';
 
 export interface SchemaDiff {
   propertyGroupsToCreate: any[];
@@ -24,6 +25,7 @@ export class SchemaTool {
 
   public async inspect(hsClient?: HubspotClientWrapper): Promise<any> {
     if (!hsClient) {
+      logger.warn('SchemaTool.inspect running without authenticated client; returning empty state.');
       return { properties: {}, associationLabels: [], pipelines: [] };
     }
 
@@ -42,8 +44,9 @@ export class SchemaTool {
         associationLabels: [],
         pipelines: []
       };
-    } catch (err) {
-      return { properties: {}, associationLabels: [], pipelines: [] };
+    } catch (err: any) {
+      logger.error('SchemaTool.inspect failed to query CRM Properties API', err);
+      throw err;
     }
   }
 
@@ -55,8 +58,7 @@ export class SchemaTool {
     const associationLabelsToCreate: any[] = [];
     const pipelinesToCreate: any[] = [];
 
-    if (!currentAccountSchema || !currentAccountSchema.properties) {
-      // Full plan against un-provisioned account
+    if (!currentAccountSchema || !currentAccountSchema.properties || Object.keys(currentAccountSchema.properties).length === 0) {
       for (const group of (manifest.propertyGroups || [])) {
         propertyGroupsToCreate.push(group);
       }
@@ -72,7 +74,6 @@ export class SchemaTool {
         pipelinesToCreate.push(pipe);
       }
     } else {
-      // Diff against current account schema
       for (const [objType, props] of Object.entries(manifest.properties || {})) {
         const existingProps = currentAccountSchema.properties[objType] || [];
         for (const p of (props as any[])) {
@@ -92,31 +93,30 @@ export class SchemaTool {
   }
 
   public async apply(diff: SchemaDiff, hsClient?: HubspotClientWrapper): Promise<{ applied: boolean; count: number }> {
-    let appliedCount = 0;
+    if (!hsClient) {
+      logger.warn('SchemaTool.apply called without authenticated HubSpot client; returning unapplied diff count.');
+      return { applied: false, count: 0 };
+    }
 
-    if (hsClient) {
-      const rawClient = hsClient.getRawClient();
-      
-      // Apply properties
-      for (const prop of diff.propertiesToCreate) {
-        try {
-          await rawClient.crm.properties.coreApi.create(prop.objectType, {
-            name: prop.name,
-            label: prop.label,
-            type: prop.type,
-            fieldType: prop.fieldType,
-            groupName: prop.groupName,
-            hasUniqueValue: prop.hasUniqueValue || false,
-            options: prop.options || [],
-            description: prop.description || ''
-          } as any);
-          appliedCount++;
-        } catch (err: any) {
-          // Ignore if property already exists
-        }
+    let appliedCount = 0;
+    const rawClient = hsClient.getRawClient();
+
+    for (const prop of diff.propertiesToCreate) {
+      try {
+        await rawClient.crm.properties.coreApi.create(prop.objectType, {
+          name: prop.name,
+          label: prop.label,
+          type: prop.type,
+          fieldType: prop.fieldType,
+          groupName: prop.groupName,
+          hasUniqueValue: prop.hasUniqueValue || false,
+          options: prop.options || [],
+          description: prop.description || ''
+        } as any);
+        appliedCount++;
+      } catch (err: any) {
+        logger.info(`Property ${prop.name} already exists or error occurred: ${err.message}`);
       }
-    } else {
-      appliedCount = diff.propertiesToCreate.length + diff.associationLabelsToCreate.length + diff.pipelinesToCreate.length;
     }
 
     return {
@@ -124,18 +124,50 @@ export class SchemaTool {
       count: appliedCount
     };
   }
+
+  public async readback(hsClient?: HubspotClientWrapper): Promise<{ verified: boolean; diffAfterApply: SchemaDiff }> {
+    const inspected = await this.inspect(hsClient);
+    const diffAfterApply = this.plan(inspected);
+    const verified = diffAfterApply.propertiesToCreate.length === 0;
+
+    return {
+      verified,
+      diffAfterApply
+    };
+  }
 }
 
 if (require.main === module) {
   const mode = process.argv[2] || 'plan';
   const tool = new SchemaTool();
-  if (mode === 'plan') {
-    const diff = tool.plan();
-    console.log('Schema Plan Diff:', JSON.stringify(diff, null, 2));
+  const token = process.env.HUBSPOT_DEVELOPMENT_PERSONAL_ACCESS_KEY || process.env.HUBSPOT_ACCESS_TOKEN;
+  const hsClient = token ? new HubspotClientWrapper(token) : undefined;
+
+  if (mode === 'inspect') {
+    tool.inspect(hsClient).then(res => {
+      console.log('Schema Inspection Result:', JSON.stringify(res, null, 2));
+    }).catch(err => {
+      console.error('Inspection failed:', err);
+      process.exit(1);
+    });
+  } else if (mode === 'plan') {
+    if (hsClient) {
+      tool.inspect(hsClient).then(inspected => {
+        const diff = tool.plan(inspected);
+        console.log('Schema Plan Diff against Account:', JSON.stringify(diff, null, 2));
+      });
+    } else {
+      const diff = tool.plan();
+      console.log('Schema Plan Diff (Static Manifest):', JSON.stringify(diff, null, 2));
+    }
   } else if (mode === 'apply') {
     const diff = tool.plan();
-    tool.apply(diff).then(result => {
+    tool.apply(diff, hsClient).then(result => {
       console.log('Schema Apply Result:', JSON.stringify(result, null, 2));
+    });
+  } else if (mode === 'readback') {
+    tool.readback(hsClient).then(result => {
+      console.log('Schema Readback Result:', JSON.stringify(result, null, 2));
     });
   } else {
     console.log(`Unknown mode: ${mode}`);

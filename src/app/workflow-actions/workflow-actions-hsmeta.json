@@ -2,7 +2,7 @@
   "uid": "reconcile_record_action",
   "type": "workflow-action",
   "config": {
-    "actionUrl": "https://example.com/workflow-actions/reconcile",
+    "actionUrl": "https://api.example.com/workflow-actions/reconcile",
     "isPublished": false,
     "supportedClients": [
       {
@@ -26,6 +26,7 @@
       "en": {
         "actionName": "Reconcile Commercial Record",
         "actionDescription": "Submits record to the external Commercial Operations state machine reconciler.",
+        "appDisplayName": "Commercial Operations Automation",
         "inputFieldLabels": {
           "recordId": "Record ID"
         },

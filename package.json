@@ -10,11 +10,12 @@
     "test:watch": "vitest",
     "schema:inspect": "ts-node packages/domain/schema-cli.ts inspect",
     "schema:plan": "ts-node packages/domain/schema-cli.ts plan",
-    "schema:apply": "ts-node packages/domain/schema-cli.ts apply"
+    "schema:apply": "ts-node packages/domain/schema-cli.ts apply",
+    "schema:readback": "ts-node packages/domain/schema-cli.ts readback"
   },
   "dependencies": {
     "@hubspot/api-client": "^14.0.0",
-    "fastify": "^4.26.0",
+    "fastify": "^5.0.0",
     "pg": "^8.11.3",
     "yaml": "^2.3.4"
   },

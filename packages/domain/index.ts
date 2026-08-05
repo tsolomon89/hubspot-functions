@@ -38,9 +38,12 @@ export function validateHubspotSignatureV3(
     return false;
   }
 
+  // Ensure URI is properly formatted and decoded if necessary
+  const formattedUri = decodeURIComponent(requestUri);
+
   // Construct exact source string: METHOD + URI + RAW_BODY + TIMESTAMP
   const rawBodyString = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf-8');
-  const sourceString = `${httpMethod.toUpperCase()}${requestUri}${rawBodyString}${timestampHeader}`;
+  const sourceString = `${httpMethod.toUpperCase()}${formattedUri}${rawBodyString}${timestampHeader}`;
 
   // Compute HMAC SHA256
   const hash = createHmac('sha256', clientSecret)

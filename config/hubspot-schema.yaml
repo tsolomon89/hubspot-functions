@@ -93,11 +93,8 @@ associationLabels:
     category: "USER_DEFINED"
     labels:
       - name: "Decision Maker"
-        typeId: 1001
       - name: "End User"
-        typeId: 1002
       - name: "Influencer"
-        typeId: 1003
 
 pipelines:
   deals:
@@ -108,35 +105,27 @@ pipelines:
         - label: "Marketing Consent"
           stageId: "marketing_consent"
           displayOrder: 1
-          probability: 0.1
         - label: "Demo Booking"
           stageId: "demo_booking"
           displayOrder: 2
-          probability: 0.2
         - label: "Demo Confirmation"
           stageId: "demo_confirmation"
           displayOrder: 3
-          probability: 0.3
         - label: "Demo Hosted"
           stageId: "demo_hosted"
           displayOrder: 4
-          probability: 0.5
         - label: "Proposal Preparation"
           stageId: "proposal_preparation"
           displayOrder: 5
-          probability: 0.6
         - label: "Commercial Agreement"
           stageId: "commercial_agreement"
           displayOrder: 6
-          probability: 0.8
         - label: "Onboarding"
           stageId: "onboarding"
           displayOrder: 7
-          probability: 0.9
         - label: "Renewal"
           stageId: "renewal"
           displayOrder: 8
-          probability: 0.95
 
 webhooks:
   targetUrl: "/webhooks/hubspot"

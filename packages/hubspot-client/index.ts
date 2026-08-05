@@ -64,16 +64,24 @@ export class HubspotClientWrapper {
       return existing.id;
     }
 
-    const created = await this.client.crm.companies.basicApi.create({
-      properties: {
-        company_key: identity.companyKey,
-        name: identity.companyName,
-        domain: identity.domain || ''
-      },
-      associations: []
-    });
-
-    return created.id;
+    try {
+      const created = await this.client.crm.companies.basicApi.create({
+        properties: {
+          company_key: identity.companyKey,
+          name: identity.companyName,
+          domain: identity.domain || ''
+        },
+        associations: []
+      });
+      return created.id;
+    } catch (err: any) {
+      // Race condition protection: If creation fails due to duplicate, search again
+      if (err.statusCode === 409 || err.code === 409) {
+        const retryFound = await this.getCompanyByKey(identity.companyKey);
+        if (retryFound) return retryFound.id;
+      }
+      throw err;
+    }
   }
 
   public async upsertContact(identity: ResolvedIdentity): Promise<string> {
@@ -82,41 +90,56 @@ export class HubspotClientWrapper {
       return existing.id;
     }
 
-    const created = await this.client.crm.contacts.basicApi.create({
-      properties: {
-        email: identity.contactEmail,
-        firstname: identity.contactFirstName || '',
-        lastname: identity.contactLastName || '',
-        phone: identity.contactPhone || ''
-      },
-      associations: []
-    });
-
-    return created.id;
+    try {
+      const created = await this.client.crm.contacts.basicApi.create({
+        properties: {
+          email: identity.contactEmail,
+          firstname: identity.contactFirstName || '',
+          lastname: identity.contactLastName || '',
+          phone: identity.contactPhone || ''
+        },
+        associations: []
+      });
+      return created.id;
+    } catch (err: any) {
+      // Race condition protection: Search again on 409 conflict
+      if (err.statusCode === 409 || err.code === 409) {
+        const retryFound = await this.getContactByEmail(identity.contactEmail);
+        if (retryFound) return retryFound.id;
+      }
+      throw err;
+    }
   }
 
   public async associateContactToCompany(contactId: string, companyId: string): Promise<void> {
-    await this.client.crm.associations.v4.basicApi.create(
-      'contact', contactId,
-      'company', companyId,
-      [{ associationCategory: 'HUBSPOT_DEFINED' as any, associationTypeId: 1 }] // Primary Contact to Company association
-    );
+    try {
+      await this.client.crm.associations.v4.basicApi.create(
+        'contact', contactId,
+        'company', companyId,
+        [{ associationCategory: 'HUBSPOT_DEFINED' as any, associationTypeId: 1 }] // Primary Contact to Company
+      );
+    } catch (err: any) {
+      // Ignore if association already exists
+    }
   }
 
   public async associateContactToDeal(contactId: string, dealId: string, role: string): Promise<void> {
-    // Map role to association type ID
     const typeIdMap: Record<string, number> = {
       'Decision Maker': 1001,
       'End User': 1002,
       'Influencer': 1003
     };
-    const typeId = typeIdMap[role] || 4; // Default to standard contact to deal association if unmapped
+    const typeId = typeIdMap[role] || 4;
 
-    await this.client.crm.associations.v4.basicApi.create(
-      'contact', contactId,
-      'deal', dealId,
-      [{ associationCategory: typeId >= 1000 ? ('USER_DEFINED' as any) : ('HUBSPOT_DEFINED' as any), associationTypeId: typeId }]
-    );
+    try {
+      await this.client.crm.associations.v4.basicApi.create(
+        'contact', contactId,
+        'deal', dealId,
+        [{ associationCategory: typeId >= 1000 ? ('USER_DEFINED' as any) : ('HUBSPOT_DEFINED' as any), associationTypeId: typeId }]
+      );
+    } catch (err: any) {
+      // Ignore if association already exists
+    }
   }
 
   public async upsertProductDeal(dealState: CommercialDealState, companyId: string): Promise<string> {
@@ -125,29 +148,37 @@ export class HubspotClientWrapper {
       return existing.id;
     }
 
-    const created = await this.client.crm.deals.basicApi.create({
-      properties: {
-        deal_key: dealState.dealKey,
-        dealname: dealState.dealName,
-        product_key: dealState.productKey,
-        pipeline: dealState.pipeline,
-        dealstage: dealState.opportunityStage,
-        opportunity_type: dealState.opportunityType,
-        opportunity_state: dealState.opportunityState,
-        opportunity_status: dealState.opportunityStatus,
-        automation_suppressed: String(dealState.automationSuppressed)
-      },
-      associations: []
-    });
+    try {
+      const created = await this.client.crm.deals.basicApi.create({
+        properties: {
+          deal_key: dealState.dealKey,
+          dealname: dealState.dealName,
+          product_key: dealState.productKey,
+          pipeline: dealState.pipeline,
+          dealstage: dealState.opportunityStage,
+          opportunity_type: dealState.opportunityType,
+          opportunity_state: dealState.opportunityState,
+          opportunity_status: dealState.opportunityStatus,
+          automation_suppressed: String(dealState.automationSuppressed)
+        },
+        associations: []
+      });
 
-    // Associate Deal to Company (Primary)
-    await this.client.crm.associations.v4.basicApi.create(
-      'deal', created.id,
-      'company', companyId,
-      [{ associationCategory: 'HUBSPOT_DEFINED' as any, associationTypeId: 6 }]
-    );
+      // Associate Deal to Company (Primary)
+      await this.client.crm.associations.v4.basicApi.create(
+        'deal', created.id,
+        'company', companyId,
+        [{ associationCategory: 'HUBSPOT_DEFINED' as any, associationTypeId: 6 }]
+      );
 
-    return created.id;
+      return created.id;
+    } catch (err: any) {
+      if (err.statusCode === 409 || err.code === 409) {
+        const retryFound = await this.getDealByKey(dealState.dealKey);
+        if (retryFound) return retryFound.id;
+      }
+      throw err;
+    }
   }
 
   public async createActivationTask(task: ActivationTask, contactId: string, dealId: string): Promise<string> {
@@ -161,7 +192,6 @@ export class HubspotClientWrapper {
       associations: []
     });
 
-    // Associate Task to Contact and Deal
     if (contactId) {
       await this.client.crm.associations.v4.basicApi.create(
         'task', created.id,
@@ -200,14 +230,5 @@ export class HubspotClientWrapper {
     }
 
     return created.id;
-  }
-
-  public async testApiConnection(): Promise<{ success: boolean; status: number; accountId?: number }> {
-    try {
-      const response = await this.client.crm.companies.basicApi.getPage(1);
-      return { success: true, status: 200 };
-    } catch (err: any) {
-      return { success: false, status: err.statusCode || 500 };
-    }
   }
 }

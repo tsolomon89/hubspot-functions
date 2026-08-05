@@ -41,6 +41,14 @@ const B2B_STAGE_PROGRESSION_ORDER: Record<string, number> = {
   'renewal': 8
 };
 
+const VALID_CANONICAL_PRODUCT_KEYS = new Set([
+  'jurnii_360',
+  'jurnii_ux',
+  'jurnii_cortex',
+  'sku-360-fixed',
+  'sku-ux-flex'
+]);
+
 export function isPartnershipPipeline(pipelineName?: string): boolean {
   return pipelineName === 'partnership_pipeline' || pipelineName === 'partnership';
 }
@@ -49,9 +57,20 @@ export function validateProductKey(productKey: string): { valid: boolean; ambigu
   if (!productKey || productKey.trim().length === 0) {
     return { valid: false, ambiguous: true };
   }
-  if (productKey.toLowerCase().includes('unknown') || productKey.toLowerCase().includes('ambiguous')) {
+  
+  const normalized = productKey.trim().toLowerCase();
+  
+  if (normalized.includes('unknown') || normalized.includes('ambiguous')) {
     return { valid: false, ambiguous: true };
   }
+
+  // Check against known base product keys or valid SKU pattern
+  const isValidBaseKey = VALID_CANONICAL_PRODUCT_KEYS.has(normalized) || normalized.startsWith('jurnii_') || normalized.startsWith('sku-');
+  
+  if (!isValidBaseKey) {
+    return { valid: false, ambiguous: true };
+  }
+
   return { valid: true, ambiguous: false };
 }
 
@@ -70,7 +89,7 @@ export function createInitialProductDeal(input: DealInput): CommercialDealState 
     opportunityStage: 'marketing_consent',
     opportunityState: 'Open',
     opportunityStatus: 'New',
-    automationSuppressed: isPartnershipPipeline(input.pipeline) // Partnership automation is suppressed by default
+    automationSuppressed: isPartnershipPipeline(input.pipeline) // Partnership deals bypass B2B automation
   };
 }
 
