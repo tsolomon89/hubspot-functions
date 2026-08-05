@@ -1,0 +1,5 @@
+version: "1.0.0"
+installations:
+  "149041124":
+    organizationKey: "org_default"
+    defaultRelationshipType: "b2b"

@@ -90,7 +90,7 @@ export function planTransition(
     }];
   }
 
-  // Opportunity is SATISFIED -> Close current opportunity as WON and plan successor
+  // Opportunity is SATISFIED
   const intents: TransitionIntent[] = [{
     kind: 'UPDATE_OPPORTUNITY',
     opportunityKey: snapshot.opportunityKey,
@@ -106,36 +106,42 @@ export function planTransition(
     stage: projectedStage
   });
 
-  // Determine successor type & cycle index
-  let successorType: OpportunityType | null = null;
-  let nextCycleIndex = 1;
-
-  switch (snapshot.opportunityType) {
-    case 'MQL':
-      successorType = 'SQL';
-      nextCycleIndex = 1;
-      break;
-    case 'SQL':
-      successorType = 'FTP';
-      nextCycleIndex = 1;
-      break;
-    case 'FTP':
-      successorType = 'RTP';
-      nextCycleIndex = 1;
-      break;
-    case 'RTP':
-      successorType = 'RTP';
-      nextCycleIndex = snapshot.cycleIndex + 1;
-      break;
-  }
-
-  if (successorType) {
-    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, successorType, nextCycleIndex);
+  // Single Lead progression: MQL satisfied -> Lead advances to SQL stage (no successor Lead created).
+  // SQL satisfied -> Lead becomes Qualified AND creates first FTP Deal.
+  if (snapshot.opportunityType === 'MQL') {
+    intents.push({
+      kind: 'UPDATE_OPPORTUNITY',
+      opportunityKey: snapshot.opportunityKey,
+      newState: 'OPEN',
+      qualificationState: 'SATISFIED',
+      details: { targetOpportunityType: 'SQL', targetLeadStage: 'sql' }
+    });
+  } else if (snapshot.opportunityType === 'SQL') {
+    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'FTP', 1);
     intents.push({
       kind: 'CREATE_SUCCESSOR',
       predecessorKey: snapshot.opportunityKey,
       successorKey,
-      successorType,
+      successorType: 'FTP',
+      cycleIndex: 1
+    });
+  } else if (snapshot.opportunityType === 'FTP') {
+    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', 1);
+    intents.push({
+      kind: 'CREATE_SUCCESSOR',
+      predecessorKey: snapshot.opportunityKey,
+      successorKey,
+      successorType: 'RTP',
+      cycleIndex: 1
+    });
+  } else if (snapshot.opportunityType === 'RTP') {
+    const nextCycleIndex = snapshot.cycleIndex + 1;
+    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', nextCycleIndex);
+    intents.push({
+      kind: 'CREATE_SUCCESSOR',
+      predecessorKey: snapshot.opportunityKey,
+      successorKey,
+      successorType: 'RTP',
       cycleIndex: nextCycleIndex
     });
   }
