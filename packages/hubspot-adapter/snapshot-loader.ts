@@ -5,7 +5,8 @@ import {
   OpportunityType, 
   OpportunityState, 
   EvidenceRecord,
-  QualificationConfig
+  QualificationConfig,
+  deriveSuccessorKey
 } from '../commercial-kernel';
 import { logger } from '../observability';
 
@@ -58,8 +59,11 @@ export class HubSpotSnapshotLoader {
           if (companyFacts.relationshipType) facts.relationshipType = companyFacts.relationshipType;
           if (companyFacts.automationSuppressed === true) facts.automationSuppressed = true;
         }
-      } catch (e: any) {
-        logger.warn('Could not resolve company for contact', e);
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) {
+          throw err;
+        }
+        logger.warn('No company association found for contact', { contactId: recordRef.objectId });
       }
 
       relationshipKey = (facts.relationshipKey as string) || (facts.domain as string) || (facts.email as string) || `rel_${recordRef.objectId}`;
@@ -99,7 +103,11 @@ export class HubSpotSnapshotLoader {
           if (contactFacts.email) facts.email = contactFacts.email;
           if (contactFacts.automationSuppressed === true) facts.automationSuppressed = true;
         }
-      } catch (e) {}
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) {
+          throw err;
+        }
+      }
 
       relationshipKey = (facts.relationshipKey as string) || (facts.domain as string) || `rel_${recordRef.objectId}`;
       opportunityKey = `${relationshipKey}::LEAD::1`;
@@ -145,7 +153,9 @@ export class HubSpotSnapshotLoader {
           const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: resolvedContactId });
           Object.assign(facts, contactFacts);
         }
-      } catch (e) {}
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      }
 
       try {
         const companyAssoc = await client.crm.associations.v4.basicApi.getPage('lead', recordRef.objectId, 'company');
@@ -154,7 +164,9 @@ export class HubSpotSnapshotLoader {
           const companyFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'COMPANY', key: resolvedCompanyId });
           if (companyFacts.relationshipKey) facts.relationshipKey = companyFacts.relationshipKey;
         }
-      } catch (e) {}
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      }
 
       if (resolvedCompanyId) {
         subject = { kind: 'COMPANY', key: resolvedCompanyId, contactKeys: resolvedContactId ? [resolvedContactId] : [] };
@@ -163,8 +175,20 @@ export class HubSpotSnapshotLoader {
       }
 
       const stage = (leadProps.hs_pipeline_stage as string) || 'mql';
-      if (stage === 'qualified') opportunityState = 'WON';
-      else if (stage === 'disqualified') opportunityState = 'LOST';
+      if (stage === 'qualified') {
+        opportunityState = 'WON';
+        // Check if successor FTP Deal already exists
+        const successorKey = deriveSuccessorKey(relationshipKey, 'FTP', 1);
+        const successorSearch = await client.crm.deals.searchApi.doSearch({
+          filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: successorKey }] }],
+          sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: '0'
+        });
+        if (successorSearch.results && successorSearch.results.length > 0) {
+          facts.successorAlreadyExists = true;
+        }
+      } else if (stage === 'disqualified') {
+        opportunityState = 'LOST';
+      }
 
       facts.stage = stage;
       facts.email = leadProps.email;
@@ -198,7 +222,9 @@ export class HubSpotSnapshotLoader {
           const companyFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'COMPANY', key: resolvedCompanyId });
           if (companyFacts.relationshipKey) facts.relationshipKey = companyFacts.relationshipKey;
         }
-      } catch (e) {}
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      }
 
       try {
         const contactAssoc = await client.crm.associations.v4.basicApi.getPage('deal', recordRef.objectId, 'contact');
@@ -207,7 +233,9 @@ export class HubSpotSnapshotLoader {
           const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: resolvedContactId });
           Object.assign(facts, contactFacts);
         }
-      } catch (e) {}
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      }
 
       if (resolvedCompanyId) {
         subject = { kind: 'COMPANY', key: resolvedCompanyId, contactKeys: resolvedContactId ? [resolvedContactId] : [] };
@@ -240,6 +268,19 @@ export class HubSpotSnapshotLoader {
       if (stage === 'closedwon') {
         opportunityState = 'WON';
         facts.transactionCompleted = true;
+
+        // Check if deterministic successor Deal already exists
+        const nextCycle = opportunityType === 'FTP' ? 1 : cycleIndex + 1;
+        const nextType: OpportunityType = 'RTP';
+        const successorKey = deriveSuccessorKey(relationshipKey, nextType, nextCycle);
+
+        const successorSearch = await client.crm.deals.searchApi.doSearch({
+          filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: successorKey }] }],
+          sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: '0'
+        });
+        if (successorSearch.results && successorSearch.results.length > 0) {
+          facts.successorAlreadyExists = true;
+        }
       } else if (stage === 'closedlost') {
         opportunityState = 'LOST';
       }

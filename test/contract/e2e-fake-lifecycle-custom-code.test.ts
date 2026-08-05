@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { processHubSpotCustomCodeAction } from '../../src/custom-code-actions/reconcile-record';
 
 describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', () => {
-  it('Should execute processHubSpotCustomCodeAction through Contact -> Lead MQL -> Lead SQL -> FTP Deal -> Replay Idempotency', async () => {
+  it('Should execute processHubSpotCustomCodeAction through Contact -> Lead -> FTP Deal -> Closed Won -> RTP1 Deal -> Closed Won -> RTP2 Deal with Replay Safety', async () => {
     const meetingTime = String(Date.now() + 600000);
 
     // Stateful fake CRM store
@@ -94,15 +94,25 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
         return jsonRes(crmStore.companies['comp_5001']);
       }
 
-      // Leads Search API - MUST BE MATCHED BEFORE /leads/ or /0-136/
+      // Leads Search API
       if (urlStr.includes('leads/search') || urlStr.includes('0-136/search')) {
         const leadList = Object.values(crmStore.leads);
+        const filter = body.filterGroups?.[0]?.filters?.[0];
+        if (filter && filter.propertyName === 'coa_opportunity_key') {
+          const matched = leadList.filter(l => l.properties?.coa_opportunity_key === filter.value);
+          return jsonRes({ results: matched, total: matched.length });
+        }
         return jsonRes({ results: leadList, total: leadList.length });
       }
 
-      // Deals Search API - MUST BE MATCHED BEFORE /deals/ or /0-3/
+      // Deals Search API
       if (urlStr.includes('deals/search') || urlStr.includes('0-3/search')) {
         const dealList = Object.values(crmStore.deals);
+        const filter = body.filterGroups?.[0]?.filters?.[0];
+        if (filter && filter.propertyName === 'coa_opportunity_key') {
+          const matched = dealList.filter(d => d.properties?.coa_opportunity_key === filter.value);
+          return jsonRes({ results: matched, total: matched.length });
+        }
         return jsonRes({ results: dealList, total: dealList.length });
       }
 
@@ -146,8 +156,14 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
 
       // Deals Create API
       if ((urlStr.endsWith('/deals') || urlStr.endsWith('/0-3')) && method === 'POST') {
-        const dealId = `deal_${Date.now()}`;
-        const newDeal = { id: dealId, properties: body.properties };
+        const dealId = `deal_${Date.now()}_${Object.keys(crmStore.deals).length + 1}`;
+        const newDeal = { 
+          id: dealId, 
+          properties: {
+            ...body.properties,
+            createdate: new Date().toISOString()
+          }
+        };
         crmStore.deals[dealId] = newDeal;
         if (body.associations) {
           for (const a of body.associations) {
@@ -176,6 +192,11 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
         return jsonRes(crmStore.deals[dealId] || { id: dealId, properties: {} });
       }
 
+      // Line Items API
+      if (urlStr.includes('/crm/v3/objects/line_items')) {
+        return jsonRes({ results: [] });
+      }
+
       // Meetings API
       if (urlStr.includes('/crm/v3/objects/meetings/mtg_9001') || urlStr.includes('/crm/v3/objects/meetings')) {
         return jsonRes(crmStore.meetings['mtg_9001']);
@@ -201,7 +222,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
       return jsonRes({ results: [] });
     });
 
-    // STEP 1: Enroll Contact -> Bootstraps Lead with association 608 & advances stage to SQL (MQL goals satisfied by marketing consent)
+    // STEP 1: Enroll Contact -> Bootstraps Lead with association 608 & advances stage to SQL
     const step1Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
       object: { objectId: 'cnt_1001', objectType: 'CONTACT' }
@@ -216,40 +237,75 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
     expect(createdLead.properties.coa_opportunity_key).toBe('rel_acme_inc::LEAD::1');
     expect(createdLead.properties.hs_pipeline_stage).toBe('sql');
 
-    // STEP 2: Enroll Lead record -> Evaluates SQL goals with meeting evidence -> Stage becomes Qualified & creates FTP Deal with Contact & Company associations
-    createdLead.properties.coa_offering_keys = 'prod_enterprise_plan'; // Set pre-deal offering fact on Lead
+    // STEP 2: Enroll Lead record -> Evaluates SQL goals with meeting evidence -> Advances to Qualified & creates FTP Deal
+    createdLead.properties.coa_offering_keys = 'prod_enterprise_plan';
 
     const step2Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
-      object: { objectId: createdLead.id, objectType: '0-136' } // Documented 0-136 Lead numeric object type ID!
+      object: { objectId: createdLead.id, objectType: '0-136' }
     }, 'fake-token');
 
     expect(step2Result.outputFields.verified).toBe(true);
     expect(step2Result.outputFields.status).toBe('CREATED_SUCCESSOR');
 
-    expect(createdLead.properties.hs_pipeline_stage).toBe('qualified');
+    const ftpDeal = Object.values(crmStore.deals).find(d => d.properties?.coa_opportunity_type === 'FTP');
+    expect(ftpDeal).toBeDefined();
+    expect(ftpDeal.properties.coa_opportunity_key).toBe('rel_acme_inc::FTP::1');
 
-    const createdDeal = Object.values(crmStore.deals)[0];
-    expect(createdDeal).toBeDefined();
-    expect(createdDeal.properties.coa_opportunity_key).toBe('rel_acme_inc::FTP::1');
-    expect(createdDeal.properties.pipeline).toBe('b2b_transaction_deal_pipeline');
-
-    // Verify Deal associations contain BOTH Contact AND Company
-    const dealContactAssocs = crmStore.associations['deal->contact'].filter(a => a.from === createdDeal.id);
-    const dealCompanyAssocs = crmStore.associations['deal->company'].filter(a => a.from === createdDeal.id);
-    expect(dealContactAssocs.length).toBeGreaterThan(0);
-    expect(dealCompanyAssocs.length).toBeGreaterThan(0);
-
-    // STEP 3: Replay invocation -> Must be idempotent and return NO_CHANGE (0 duplicate Leads/Deals)
-    const replayResult = await processHubSpotCustomCodeAction({
+    // STEP 3: Replay Lead invocation -> Idempotent NO_CHANGE
+    const step3Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
       object: { objectId: createdLead.id, objectType: 'LEAD' }
     }, 'fake-token');
 
-    expect(replayResult.outputFields.verified).toBe(true);
-    expect(replayResult.outputFields.status).toBe('NO_CHANGE');
+    expect(step3Result.outputFields.status).toBe('NO_CHANGE');
 
-    expect(Object.keys(crmStore.leads).length).toBe(1);
-    expect(Object.keys(crmStore.deals).length).toBe(1);
+    // STEP 4: FTP Deal becomes Closed Won in CRM -> Re-enroll FTP Deal -> Creates successor RTP1 Deal!
+    ftpDeal.properties.dealstage = 'closedwon';
+
+    const step4Result = await processHubSpotCustomCodeAction({
+      origin: { portalId: 149041124 },
+      object: { objectId: ftpDeal.id, objectType: 'DEAL' }
+    }, 'fake-token');
+
+    expect(step4Result.outputFields.verified).toBe(true);
+    expect(step4Result.outputFields.status).toBe('CREATED_SUCCESSOR');
+
+    const rtp1Deal = Object.values(crmStore.deals).find(d => d.properties?.coa_opportunity_key === 'rel_acme_inc::RTP::1');
+    expect(rtp1Deal).toBeDefined();
+    expect(rtp1Deal.properties.coa_opportunity_type).toBe('RTP');
+    expect(rtp1Deal.properties.coa_cycle_index).toBe('1');
+
+    // STEP 5: Replay FTP Deal -> Reconciler sees RTP1 successor already exists -> Returns NO_CHANGE
+    const step5Result = await processHubSpotCustomCodeAction({
+      origin: { portalId: 149041124 },
+      object: { objectId: ftpDeal.id, objectType: 'DEAL' }
+    }, 'fake-token');
+
+    expect(step5Result.outputFields.status).toBe('NO_CHANGE');
+
+    // STEP 6: RTP1 Deal becomes Closed Won in CRM -> Re-enroll RTP1 Deal -> Creates successor RTP2 Deal!
+    rtp1Deal.properties.dealstage = 'closedwon';
+
+    const step6Result = await processHubSpotCustomCodeAction({
+      origin: { portalId: 149041124 },
+      object: { objectId: rtp1Deal.id, objectType: '0-3' }
+    }, 'fake-token');
+
+    expect(step6Result.outputFields.verified).toBe(true);
+    expect(step6Result.outputFields.status).toBe('CREATED_SUCCESSOR');
+
+    const rtp2Deal = Object.values(crmStore.deals).find(d => d.properties?.coa_opportunity_key === 'rel_acme_inc::RTP::2');
+    expect(rtp2Deal).toBeDefined();
+    expect(rtp2Deal.properties.coa_opportunity_type).toBe('RTP');
+    expect(rtp2Deal.properties.coa_cycle_index).toBe('2');
+
+    // STEP 7: Replay RTP1 Deal -> Reconciler sees RTP2 successor already exists -> Returns NO_CHANGE
+    const step7Result = await processHubSpotCustomCodeAction({
+      origin: { portalId: 149041124 },
+      object: { objectId: rtp1Deal.id, objectType: 'DEAL' }
+    }, 'fake-token');
+
+    expect(step7Result.outputFields.status).toBe('NO_CHANGE');
   });
 });

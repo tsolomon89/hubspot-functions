@@ -9,6 +9,7 @@ export interface SchemaDiff {
   propertiesToCreate: any[];
   associationLabelsToCreate: any[];
   pipelinesToCreate: any[];
+  pipelinesToUpdate: any[];
 }
 
 export class SchemaTool {
@@ -26,7 +27,12 @@ export class SchemaTool {
   public async inspect(hsAdapter?: HubspotAdapter): Promise<any> {
     if (!hsAdapter) {
       logger.warn('SchemaTool.inspect running without authenticated client; returning empty state.');
-      return { propertyGroups: [], properties: {}, associationLabels: [], pipelines: { deals: [], leads: [] } };
+      return { 
+        propertyGroups: { deals: [], companies: [], contacts: [], leads: [] }, 
+        properties: {}, 
+        associationLabels: [], 
+        pipelines: { deals: [], leads: [] } 
+      };
     }
 
     try {
@@ -38,19 +44,36 @@ export class SchemaTool {
       let leadsProps: any = { results: [] };
       try {
         leadsProps = await rawClient.crm.properties.coreApi.getAll('leads');
-      } catch (e) {}
+      } catch (e: any) {
+        if (e?.statusCode !== 404 && e?.status !== 404) throw e;
+      }
 
       let dealPipelines: any = { results: [] };
       try {
         dealPipelines = await rawClient.crm.pipelines.pipelinesApi.getAll('deals');
-      } catch (e) {}
+      } catch (e: any) {
+        if (e?.statusCode !== 404 && e?.status !== 404) throw e;
+      }
 
       let leadPipelines: any = { results: [] };
       try {
         leadPipelines = await rawClient.crm.pipelines.pipelinesApi.getAll('leads');
-      } catch (e) {}
+      } catch (e: any) {
+        if (e?.statusCode !== 404 && e?.status !== 404) throw e;
+      }
+
+      const propertyGroups: Record<string, any[]> = {};
+      for (const objType of ['deals', 'companies', 'contacts', 'leads']) {
+        try {
+          const res = await rawClient.crm.properties.groupsApi.getAll(objType);
+          propertyGroups[objType] = res.results || [];
+        } catch (e: any) {
+          propertyGroups[objType] = [];
+        }
+      }
 
       return {
+        propertyGroups,
         properties: {
           companies: companiesProps.results || [],
           deals: dealsProps.results || [],
@@ -76,6 +99,7 @@ export class SchemaTool {
     const propertiesToCreate: any[] = [];
     const associationLabelsToCreate: any[] = [];
     const pipelinesToCreate: any[] = [];
+    const pipelinesToUpdate: any[] = [];
 
     const hasAnyCustomProperty = currentAccountSchema?.properties && 
       Object.values(currentAccountSchema.properties).some((arr: any) => 
@@ -100,6 +124,17 @@ export class SchemaTool {
         }
       }
     } else {
+      // Compare property groups
+      for (const group of (manifest.propertyGroups || [])) {
+        for (const objType of group.objectTypes || ['deals', 'companies', 'leads', 'contacts']) {
+          const existingGroups = currentAccountSchema.propertyGroups?.[objType] || [];
+          const exists = existingGroups.some((g: any) => g.name === group.name);
+          if (!exists) {
+            propertyGroupsToCreate.push({ ...group, targetObjectType: objType });
+          }
+        }
+      }
+
       // Compare properties
       for (const [objType, props] of Object.entries(manifest.properties || {})) {
         const existingProps = currentAccountSchema.properties[objType] || [];
@@ -111,7 +146,7 @@ export class SchemaTool {
         }
       }
 
-      // Compare pipelines and individual stages
+      // Compare pipelines and individual stages (missing stages, display order, probability)
       for (const [objType, pipes] of Object.entries(manifest.pipelines || {})) {
         const existingPipes = currentAccountSchema.pipelines?.[objType] || [];
         for (const pipe of (pipes as any[])) {
@@ -119,12 +154,29 @@ export class SchemaTool {
           if (!existing) {
             pipelinesToCreate.push({ objectType: objType, ...pipe });
           } else {
-            // Check if stages match
-            const existingStageIds = (existing.stages || []).map((s: any) => s.id || s.stageId);
-            const manifestStageIds = (pipe.stages || []).map((s: any) => s.stageId);
-            const missingStage = manifestStageIds.some((id: string) => !existingStageIds.includes(id));
-            if (missingStage) {
-              pipelinesToCreate.push({ objectType: objType, ...pipe });
+            // Compare stages: missing stages, stage order, or probability diffs
+            const existingStages = existing.stages || [];
+            const manifestStages = pipe.stages || [];
+            
+            let stageDiff = false;
+            for (const mStage of manifestStages) {
+              const eStage = existingStages.find((s: any) => (s.id || s.stageId) === mStage.stageId);
+              if (!eStage) {
+                stageDiff = true;
+                break;
+              }
+              if (mStage.displayOrder !== undefined && eStage.displayOrder !== undefined && Number(mStage.displayOrder) !== Number(eStage.displayOrder)) {
+                stageDiff = true;
+                break;
+              }
+              if (mStage.metadata?.probability !== undefined && eStage.metadata?.probability !== undefined && String(mStage.metadata.probability) !== String(eStage.metadata.probability)) {
+                stageDiff = true;
+                break;
+              }
+            }
+
+            if (stageDiff) {
+              pipelinesToUpdate.push({ objectType: objType, existingPipelineId: existing.id || pipe.pipelineId, ...pipe });
             }
           }
         }
@@ -135,7 +187,8 @@ export class SchemaTool {
       propertyGroupsToCreate,
       propertiesToCreate,
       associationLabelsToCreate,
-      pipelinesToCreate
+      pipelinesToCreate,
+      pipelinesToUpdate
     };
   }
 
@@ -155,7 +208,8 @@ export class SchemaTool {
 
     // 1. Create Property Groups
     for (const group of actualDiff.propertyGroupsToCreate) {
-      for (const objType of group.objectTypes || ['deals', 'companies', 'leads', 'contacts']) {
+      const objTypes = group.targetObjectType ? [group.targetObjectType] : (group.objectTypes || ['deals', 'companies', 'leads', 'contacts']);
+      for (const objType of objTypes) {
         try {
           await rawClient.crm.properties.groupsApi.create(objType, {
             name: group.name,
@@ -192,7 +246,7 @@ export class SchemaTool {
       }
     }
 
-    // 3. Create Pipelines with explicit pipelineId and stageIds!
+    // 3. Create Pipelines
     for (const pipe of actualDiff.pipelinesToCreate) {
       const targetObj = pipe.objectType || 'deals';
       try {
@@ -215,6 +269,27 @@ export class SchemaTool {
       }
     }
 
+    // 4. Update Existing Pipelines (Patch missing/modified stages rather than recreating)
+    for (const pipe of actualDiff.pipelinesToUpdate) {
+      const targetObj = pipe.objectType || 'deals';
+      const pipelineId = pipe.existingPipelineId || pipe.pipelineId;
+      try {
+        await rawClient.crm.pipelines.pipelinesApi.update(targetObj, pipelineId, {
+          label: pipe.name,
+          displayOrder: pipe.displayOrder || 1,
+          stages: (pipe.stages || []).map((s: any) => ({
+            stageId: s.stageId,
+            label: s.label,
+            displayOrder: s.displayOrder,
+            metadata: s.metadata || { probability: (s.stageId === 'closedwon' ? '1.0' : '0.2') }
+          }))
+        } as any);
+        appliedCount++;
+      } catch (err: any) {
+        errors.push(`Failed to update pipeline ${pipe.name} (${pipelineId}) on ${targetObj}: ${err.message}`);
+      }
+    }
+
     const applied = errors.length === 0;
     return { applied, count: appliedCount, errors };
   }
@@ -224,7 +299,8 @@ export class SchemaTool {
     const diffAfterApply = this.plan(inspected);
     const verified = diffAfterApply.propertyGroupsToCreate.length === 0 &&
                      diffAfterApply.propertiesToCreate.length === 0 && 
-                     diffAfterApply.pipelinesToCreate.length === 0;
+                     diffAfterApply.pipelinesToCreate.length === 0 &&
+                     diffAfterApply.pipelinesToUpdate.length === 0;
 
     return {
       verified,

@@ -1,9 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { processHubSpotCustomCodeAction, main } from '../../src/custom-code-actions/reconcile-record';
 
 describe('HubSpot Custom Code Action Contract Tests', () => {
   it('should throw error when missing valid record ID in production-shaped HubSpot event payload', async () => {
-    await expect(processHubSpotCustomCodeAction({ object: { objectId: 0, objectType: 'CONTACT' } }))
+    await expect(processHubSpotCustomCodeAction({ object: { objectId: '0', objectType: 'CONTACT' } }))
       .rejects.toThrow('INVALID_ENROLLMENT');
   });
 

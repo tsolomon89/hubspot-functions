@@ -62,9 +62,14 @@ export function planTransition(
   evaluation: EvaluationResult,
   config: QualificationConfig
 ): TransitionIntent[] {
-  // Replay Safety: Prevent re-evaluating already closed opportunities
-  if (snapshot.opportunityState === 'WON' || snapshot.opportunityState === 'LOST') {
-    return [{ kind: 'NOOP', reason: `Opportunity is already closed (${snapshot.opportunityState})` }];
+  // Replay Safety: Lost opportunities are terminal NOOP
+  if (snapshot.opportunityState === 'LOST') {
+    return [{ kind: 'NOOP', reason: 'Opportunity is LOST' }];
+  }
+
+  // Successor-Aware Reconciliation: Closed Won opportunity with an already existing verified successor is terminal NOOP
+  if (snapshot.opportunityState === 'WON' && snapshot.facts.successorAlreadyExists === true) {
+    return [{ kind: 'NOOP', reason: 'Opportunity is WON and deterministic successor already exists' }];
   }
 
   if (config.featureFlags?.automationSuppressed) {

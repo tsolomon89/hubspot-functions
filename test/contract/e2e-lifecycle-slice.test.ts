@@ -1,23 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateOpportunity, planTransition, QualificationConfig, OpportunitySnapshot } from '../../packages/commercial-kernel';
+import { 
+  evaluateOpportunity, 
+  planTransition,
+  OpportunitySnapshot
+} from '../../packages/commercial-kernel';
+import { OrganizationConfigResolver } from '../../packages/domain/config-resolver';
 
 describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creation', () => {
-  const config: QualificationConfig = {
-    organizationKey: 'org_global_corp',
-    configVersion: '1.0.0',
-    relationshipType: 'b2b',
-    goalsByOpportunityType: {
-      MQL: [{ key: 'mql_identity', name: 'Identifiable subject with email', predicate: 'hasIdentity', params: { field: 'email' } }],
-      SQL: [
-        { key: 'sql_offering', name: 'Known offering interest', predicate: 'hasOfferingInterest', params: { minProducts: 1 } },
-        { key: 'sql_meeting', name: 'Completed positive meeting', predicate: 'activityExists', params: { activityType: 'MEETING', outcome: 'COMPLETED' } }
-      ],
-      FTP: [{ key: 'ftp_transaction', name: 'First completed transaction', predicate: 'transactionExists', params: { minAmount: 1 } }],
-      RTP: []
-    }
-  };
+  const config = OrganizationConfigResolver.resolveConfigByPortalId(149041124);
 
-  it('Step 1: Should evaluate MQL goals satisfied and advance Lead to SQL stage without closing Lead', () => {
+  it('Step 1: Should evaluate MQL opportunity for Contact, satisfy goals via marketing consent, and plan transition to SQL', () => {
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_global_corp',
       relationshipKey: 'comp_acme',
@@ -28,7 +20,10 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       cycleIndex: 1,
       openedAt: '2026-08-05T00:00:00.000Z',
       subject: { kind: 'COMPANY', key: 'comp_acme', contactKeys: ['cnt_1'] },
-      facts: { email: 'alice@acme.com' },
+      facts: {
+        email: 'alice@acme.com',
+        marketingConsent: true
+      },
       evidence: []
     };
 
@@ -37,16 +32,18 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
 
     const intents = planTransition(snapshot, evalRes, config);
     expect(intents).toHaveLength(2);
-    expect(intents[0].kind).toBe('UPDATE_OPPORTUNITY');
     if (intents[0].kind === 'UPDATE_OPPORTUNITY') {
-      expect(intents[0].newState).toBe('OPEN');
-      expect(intents[0].details?.targetLeadStage).toBe('sql');
+      expect(intents[0].qualificationState).toBe('SATISFIED');
       expect(intents[0].details?.targetOpportunityType).toBe('SQL');
+      expect(intents[0].details?.targetLeadStage).toBe('sql');
     }
     expect(intents[1].kind).toBe('PROJECT_LIFECYCLE_STAGE');
+    if (intents[1].kind === 'PROJECT_LIFECYCLE_STAGE') {
+      expect(intents[1].stage).toBe('marketingqualifiedlead');
+    }
   });
 
-  it('Step 2: Should evaluate SQL goals satisfied, mark Lead Qualified (WON), and create FTP Deal successor', () => {
+  it('Step 2: Should evaluate SQL opportunity with meeting evidence, satisfy goals, and plan transition to Qualified & FTP Deal creation', () => {
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_global_corp',
       relationshipKey: 'comp_acme',
@@ -57,27 +54,42 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       cycleIndex: 1,
       openedAt: '2026-08-05T00:00:00.000Z',
       subject: { kind: 'COMPANY', key: 'comp_acme', contactKeys: ['cnt_1'] },
-      facts: { email: 'alice@acme.com', products: ['prod_software'] },
-      evidence: [{
-        id: 'meet_101',
-        predicate: 'activityExists',
-        scope: 'opportunity',
-        occurredAt: '2026-08-05T01:00:00.000Z',
-        data: { activityType: 'MEETING', outcome: 'COMPLETED' }
-      }]
+      facts: {
+        email: 'alice@acme.com',
+        products: ['prod_software']
+      },
+      evidence: [
+        {
+          id: 'mtg_1',
+          predicate: 'activityExists',
+          scope: 'opportunity',
+          occurredAt: '2026-08-05T01:00:00.000Z',
+          data: { activityType: 'MEETING', outcome: 'COMPLETED' }
+        }
+      ]
     };
 
     const evalRes = evaluateOpportunity(snapshot, config);
     expect(evalRes.qualificationState).toBe('SATISFIED');
 
     const intents = planTransition(snapshot, evalRes, config);
-    expect(intents.some(i => i.kind === 'CREATE_SUCCESSOR')).toBe(true);
+    expect(intents).toHaveLength(3);
+    
+    if (intents[0].kind === 'UPDATE_OPPORTUNITY') {
+      expect(intents[0].newState).toBe('WON');
+      expect(intents[0].details?.targetLeadStage).toBe('qualified');
+    }
 
-    const successorIntent = intents.find(i => i.kind === 'CREATE_SUCCESSOR');
-    if (successorIntent && successorIntent.kind === 'CREATE_SUCCESSOR') {
-      expect(successorIntent.successorType).toBe('FTP');
-      expect(successorIntent.successorKey).toBe('comp_acme::FTP::1');
-      expect(successorIntent.predecessorKey).toBe('comp_acme::LEAD::1');
+    expect(intents[1].kind).toBe('PROJECT_LIFECYCLE_STAGE');
+    if (intents[1].kind === 'PROJECT_LIFECYCLE_STAGE') {
+      expect(intents[1].stage).toBe('salesqualifiedlead');
+    }
+
+    expect(intents[2].kind).toBe('CREATE_SUCCESSOR');
+    if (intents[2].kind === 'CREATE_SUCCESSOR') {
+      expect(intents[2].successorType).toBe('FTP');
+      expect(intents[2].successorKey).toBe('comp_acme::FTP::1');
+      expect(intents[2].predecessorKey).toBe('comp_acme::LEAD::1');
     }
   });
 
@@ -92,7 +104,7 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       cycleIndex: 1,
       openedAt: '2026-08-05T00:00:00.000Z',
       subject: { kind: 'COMPANY', key: 'comp_acme', contactKeys: ['cnt_1'] },
-      facts: { email: 'alice@acme.com', products: ['prod_software'] },
+      facts: { email: 'alice@acme.com', products: ['prod_software'], successorAlreadyExists: true },
       evidence: []
     };
 

@@ -17,7 +17,7 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
 
     const lead = await adapter.findOrCreateLeadForSubject({ kind: 'COMPANY', key: 'comp_123' }, 'rel_acme', 'b2b');
 
-    expect(lead.id).toBe('lead_bootstrap_1');
+    expect(lead?.id).toBe('lead_bootstrap_1');
     expect(createLeadMock).toHaveBeenCalledWith(expect.objectContaining({
       properties: expect.objectContaining({
         coa_opportunity_key: 'rel_acme::LEAD::1',
@@ -36,9 +36,14 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
     const getByIdMock = vi.fn().mockResolvedValue({
       id: 'deal_456',
       properties: {
+        dealname: 'Transaction Deal - rel_acme::FTP::1',
+        pipeline: 'b2b_transaction_deal_pipeline',
+        dealstage: 'open',
         coa_opportunity_key: 'rel_acme::FTP::1',
+        coa_relationship_key: 'rel_acme',
         coa_opportunity_type: 'FTP',
-        coa_cycle_index: '1'
+        coa_cycle_index: '1',
+        coa_managed: 'true'
       }
     });
 

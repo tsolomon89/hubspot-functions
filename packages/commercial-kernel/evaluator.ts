@@ -80,7 +80,7 @@ export function evaluatePredicate(
       return false;
     }
     if (goal.scope === 'sincePredecessorCompletion') {
-      if (!snapshot.predecessorCompletedAt || ev.occurredAt <= snapshot.predecessorCompletedAt) {
+      if (!snapshot.predecessorCompletedAt || ev.occurredAt < snapshot.predecessorCompletedAt) {
         return false;
       }
     }
@@ -128,7 +128,7 @@ export function evaluatePredicate(
       if (snapshot.facts.transactionCompleted === true || snapshot.facts.stage === 'closedwon') {
         const factTxTime = (snapshot.facts.transactionCompletedAt as string) || snapshot.openedAt;
         if (goal.scope === 'sincePredecessorCompletion') {
-          hasFactTransaction = Boolean(snapshot.predecessorCompletedAt && factTxTime > snapshot.predecessorCompletedAt);
+          hasFactTransaction = Boolean(snapshot.predecessorCompletedAt && factTxTime >= snapshot.predecessorCompletedAt);
         } else {
           hasFactTransaction = true;
         }
@@ -148,47 +148,16 @@ export function evaluatePredicate(
         satisfied = val === goal.params.equals;
       } else if (goal.params?.notEquals !== undefined) {
         satisfied = val !== goal.params.notEquals;
-      } else if (Array.isArray(goal.params?.in)) {
-        satisfied = (goal.params.in as any[]).includes(val);
-      } else if (goal.params?.greaterThan !== undefined) {
-        satisfied = Number(val) > Number(goal.params.greaterThan);
-      } else if (goal.params?.lessThan !== undefined) {
-        satisfied = Number(val) < Number(goal.params.lessThan);
-      } else {
-        satisfied = val !== undefined && val !== null;
+      } else if (goal.params?.isTruthy) {
+        satisfied = Boolean(val);
+      } else if (goal.params?.isFalsy) {
+        satisfied = !val;
       }
 
       return { satisfied, evidenceRefs: satisfied ? [`fact_prop_${propName}`] : [] };
     }
-    case 'count': {
-      const targetPredicate = goal.params?.targetPredicate as string;
-      const threshold = Number(goal.params?.threshold || 1);
-      const evMatches = matchingEvidence.filter(e => e.predicate === targetPredicate);
-      const satisfied = evMatches.length >= threshold;
-      return { satisfied, evidenceRefs: evMatches.map(e => e.id) };
-    }
-    case 'all': {
-      const subGoals = (goal.params?.goals as GoalDefinition[]) || [];
-      const results = subGoals.map(g => evaluatePredicate(g, snapshot));
-      const satisfied = results.every(r => r.satisfied);
-      const refs = results.flatMap(r => r.evidenceRefs);
-      return { satisfied, evidenceRefs: refs };
-    }
-    case 'any': {
-      const subGoals = (goal.params?.goals as GoalDefinition[]) || [];
-      const results = subGoals.map(g => evaluatePredicate(g, snapshot));
-      const satisfied = results.some(r => r.satisfied);
-      const refs = results.flatMap(r => r.evidenceRefs);
-      return { satisfied, evidenceRefs: refs };
-    }
-    case 'not': {
-      const subGoal = goal.params?.goal as GoalDefinition;
-      const result = subGoal ? evaluatePredicate(subGoal, snapshot) : { satisfied: false, evidenceRefs: [] };
-      return { satisfied: !result.satisfied, evidenceRefs: [] };
-    }
-    default: {
+    default:
       return { satisfied: false, evidenceRefs: [] };
-    }
   }
 }
 
@@ -196,24 +165,20 @@ export function evaluateOpportunity(
   snapshot: OpportunitySnapshot,
   config: QualificationConfig
 ): EvaluationResult {
-  const fullConfig = injectUniversalGoals(config);
-  const goals = fullConfig.goalsByOpportunityType[snapshot.opportunityType] || [];
-
-  // Kill Switch / Automation Suppression MUST be evaluated FIRST before any goals!
-  if (
-    config.featureFlags?.automationSuppressed ||
-    snapshot.facts.automationSuppressed === true ||
-    snapshot.facts.blocked === true
-  ) {
+  // Early kill switch checks
+  if (config.featureFlags?.automationSuppressed || snapshot.facts.automationSuppressed === true) {
     return {
       qualificationState: 'BLOCKED',
       satisfiedGoalKeys: [],
-      unsatisfiedGoalKeys: goals.map(g => g.key),
+      unsatisfiedGoalKeys: [],
       evidenceRefsByGoal: {},
-      evaluatedConfigVersion: fullConfig.configVersion
+      evaluatedConfigVersion: config.configVersion
     };
   }
-  
+
+  const mergedConfig = injectUniversalGoals(config);
+  const goals = mergedConfig.goalsByOpportunityType[snapshot.opportunityType] || [];
+
   const satisfiedGoalKeys: string[] = [];
   const unsatisfiedGoalKeys: string[] = [];
   const evidenceRefsByGoal: Record<string, string[]> = {};
@@ -229,11 +194,9 @@ export function evaluateOpportunity(
     }
   }
 
-  let qualificationState: QualificationState = 'PENDING';
-  if (unsatisfiedGoalKeys.length === 0) {
-    qualificationState = 'SATISFIED';
-  } else if (snapshot.facts.manualReviewRequired === true) {
-    qualificationState = 'MANUAL_REVIEW';
+  let qualificationState: QualificationState = 'SATISFIED';
+  if (unsatisfiedGoalKeys.length > 0) {
+    qualificationState = 'PENDING';
   }
 
   return {
@@ -241,6 +204,6 @@ export function evaluateOpportunity(
     satisfiedGoalKeys,
     unsatisfiedGoalKeys,
     evidenceRefsByGoal,
-    evaluatedConfigVersion: fullConfig.configVersion
+    evaluatedConfigVersion: config.configVersion
   };
 }

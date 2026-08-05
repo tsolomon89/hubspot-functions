@@ -78,6 +78,11 @@ export async function processHubSpotCustomCodeAction(
     const correlationKey = `${snapshot.opportunityKey}:${Date.now()}`;
     const mutationResult = await adapter.applyTransitionIntents(intents, correlationKey, config);
 
+    if (!mutationResult.success) {
+      const unverified = mutationResult.receipts.filter(r => !r.verified);
+      throw new Error(`ACTION_UNVERIFIED: Custom Code Action mutation verification failed for ${unverified.length} receipt(s): ${JSON.stringify(unverified)}`);
+    }
+
     let status: 'NO_CHANGE' | 'UPDATED_EXISTING' | 'CREATED_SUCCESSOR' | 'DRY_RUN_SUCCESSOR_PLANNED' | 'BLOCKED' | 'MANUAL_REVIEW' = 'NO_CHANGE';
 
     if (evalRes.qualificationState === 'BLOCKED') {
