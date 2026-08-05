@@ -29,6 +29,9 @@ export function deriveSuccessorKey(
   successorType: OpportunityType,
   cycleIndex: number
 ): string {
+  if (successorType === 'MQL' || successorType === 'SQL') {
+    return `${relationshipKey}::LEAD::1`;
+  }
   return `${relationshipKey}::${successorType}::${cycleIndex}`;
 }
 
@@ -81,19 +84,26 @@ export function planTransition(
   }
 
   if (evaluation.qualificationState !== 'SATISFIED') {
+    // Preserve current stage on pending evaluation
+    const currentLeadStage = snapshot.opportunityType === 'MQL' ? 'mql' : 'sql';
+    const currentDealStage = snapshot.facts.stage ? String(snapshot.facts.stage) : 'open';
     return [{ 
       kind: 'UPDATE_OPPORTUNITY', 
       opportunityKey: snapshot.opportunityKey, 
       newState: 'OPEN', 
       qualificationState: 'PENDING',
-      details: { unsatisfiedGoalKeys: evaluation.unsatisfiedGoalKeys }
+      details: { 
+        unsatisfiedGoalKeys: evaluation.unsatisfiedGoalKeys,
+        targetLeadStage: currentLeadStage,
+        targetDealStage: currentDealStage
+      }
     }];
   }
 
   // Opportunity is SATISFIED
   const intents: TransitionIntent[] = [];
 
-  // Single Lead Progression: MQL satisfied -> Lead remains OPEN, advances stage to SQL, no successor Lead created.
+  // Single Lead Progression: MQL satisfied -> Lead remains OPEN, advances stage to SQL
   if (snapshot.opportunityType === 'MQL') {
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
@@ -108,12 +118,13 @@ export function planTransition(
       stage: 'marketingqualifiedlead'
     });
   } else if (snapshot.opportunityType === 'SQL') {
-    // SQL satisfied -> Lead closed WON/QUALIFIED and creates first FTP Deal
+    // SQL satisfied -> Lead stage moves to qualified and creates first FTP Deal
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
       opportunityKey: snapshot.opportunityKey,
       newState: 'WON',
-      qualificationState: 'SATISFIED'
+      qualificationState: 'SATISFIED',
+      details: { targetLeadStage: 'qualified' }
     });
     intents.push({
       kind: 'PROJECT_LIFECYCLE_STAGE',
@@ -133,7 +144,8 @@ export function planTransition(
       kind: 'UPDATE_OPPORTUNITY',
       opportunityKey: snapshot.opportunityKey,
       newState: 'WON',
-      qualificationState: 'SATISFIED'
+      qualificationState: 'SATISFIED',
+      details: { targetDealStage: 'closedwon' }
     });
     intents.push({
       kind: 'PROJECT_LIFECYCLE_STAGE',
@@ -153,7 +165,8 @@ export function planTransition(
       kind: 'UPDATE_OPPORTUNITY',
       opportunityKey: snapshot.opportunityKey,
       newState: 'WON',
-      qualificationState: 'SATISFIED'
+      qualificationState: 'SATISFIED',
+      details: { targetDealStage: 'closedwon' }
     });
     intents.push({
       kind: 'PROJECT_LIFECYCLE_STAGE',

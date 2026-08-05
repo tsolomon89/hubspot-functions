@@ -26,7 +26,7 @@ export class SchemaTool {
   public async inspect(hsAdapter?: HubspotAdapter): Promise<any> {
     if (!hsAdapter) {
       logger.warn('SchemaTool.inspect running without authenticated client; returning empty state.');
-      return { propertyGroups: [], properties: {}, associationLabels: [], pipelines: [] };
+      return { propertyGroups: [], properties: {}, associationLabels: [], pipelines: { deals: [], leads: [] } };
     }
 
     try {
@@ -34,16 +34,36 @@ export class SchemaTool {
       const companiesProps = await rawClient.crm.properties.coreApi.getAll('companies');
       const dealsProps = await rawClient.crm.properties.coreApi.getAll('deals');
       const contactsProps = await rawClient.crm.properties.coreApi.getAll('contacts');
-      const pipelines = await rawClient.crm.pipelines.pipelinesApi.getAll('deals');
+      
+      let leadsProps: any = { results: [] };
+      try {
+        leadsProps = await rawClient.crm.properties.coreApi.getAll('leads');
+      } catch (e) {
+        // Fallback if portal uses standard object types
+      }
+
+      let dealPipelines: any = { results: [] };
+      try {
+        dealPipelines = await rawClient.crm.pipelines.pipelinesApi.getAll('deals');
+      } catch (e) {}
+
+      let leadPipelines: any = { results: [] };
+      try {
+        leadPipelines = await rawClient.crm.pipelines.pipelinesApi.getAll('leads');
+      } catch (e) {}
 
       return {
         properties: {
           companies: companiesProps.results || [],
           deals: dealsProps.results || [],
-          contacts: contactsProps.results || []
+          contacts: contactsProps.results || [],
+          leads: leadsProps.results || []
         },
         associationLabels: [],
-        pipelines: pipelines.results || []
+        pipelines: {
+          deals: dealPipelines.results || [],
+          leads: leadPipelines.results || []
+        }
       };
     } catch (err: any) {
       logger.error('SchemaTool.inspect failed to query CRM API', err);
@@ -71,8 +91,10 @@ export class SchemaTool {
       for (const label of (manifest.associationLabels || [])) {
         associationLabelsToCreate.push(label);
       }
-      for (const pipe of (manifest.pipelines?.deals || [])) {
-        pipelinesToCreate.push(pipe);
+      for (const [objType, pipes] of Object.entries(manifest.pipelines || {})) {
+        for (const pipe of (pipes as any[])) {
+          pipelinesToCreate.push({ objectType: objType, ...pipe });
+        }
       }
     } else {
       for (const [objType, props] of Object.entries(manifest.properties || {})) {
@@ -85,11 +107,13 @@ export class SchemaTool {
         }
       }
 
-      for (const pipe of (manifest.pipelines?.deals || [])) {
-        const existingPipes = currentAccountSchema.pipelines || [];
-        const existing = existingPipes.find((e: any) => e.id === pipe.pipelineId || e.label === pipe.name);
-        if (!existing) {
-          pipelinesToCreate.push(pipe);
+      for (const [objType, pipes] of Object.entries(manifest.pipelines || {})) {
+        const existingPipes = currentAccountSchema.pipelines?.[objType] || [];
+        for (const pipe of (pipes as any[])) {
+          const existing = existingPipes.find((e: any) => e.id === pipe.pipelineId || e.label === pipe.name);
+          if (!existing) {
+            pipelinesToCreate.push({ objectType: objType, ...pipe });
+          }
         }
       }
     }
@@ -114,7 +138,7 @@ export class SchemaTool {
 
     // 1. Create Property Groups
     for (const group of diff.propertyGroupsToCreate) {
-      for (const objType of group.objectTypes || ['deals', 'companies']) {
+      for (const objType of group.objectTypes || ['deals', 'companies', 'leads', 'contacts']) {
         try {
           await rawClient.crm.properties.groupsApi.create(objType, {
             name: group.name,
@@ -153,20 +177,21 @@ export class SchemaTool {
 
     // 3. Create Pipelines
     for (const pipe of diff.pipelinesToCreate) {
+      const targetObj = pipe.objectType || 'deals';
       try {
-        await rawClient.crm.pipelines.pipelinesApi.create('deals', {
+        await rawClient.crm.pipelines.pipelinesApi.create(targetObj, {
           label: pipe.name,
           displayOrder: pipe.displayOrder || 1,
           stages: (pipe.stages || []).map((s: any) => ({
             label: s.label,
             displayOrder: s.displayOrder,
-            metadata: s.metadata || { probability: 0.5 }
+            metadata: s.metadata || { probability: (s.stageId === 'closedwon' ? '1.0' : '0.2') }
           }))
         });
         appliedCount++;
       } catch (err: any) {
         if (err.statusCode !== 409 && err.code !== 409) {
-          errors.push(`Failed to create deal pipeline ${pipe.name}: ${err.message}`);
+          errors.push(`Failed to create pipeline ${pipe.name} on ${targetObj}: ${err.message}`);
         }
       }
     }

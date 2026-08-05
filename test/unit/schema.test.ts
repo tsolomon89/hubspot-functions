@@ -29,12 +29,18 @@ describe('Schema Tool Plan & Apply Determinism', () => {
         companies: manifest.properties.companies || [],
         deals: manifest.properties.deals || [],
         leads: manifest.properties.leads || [],
-        contacts: []
+        contacts: manifest.properties.contacts || []
       },
-      pipelines: (manifest.pipelines?.deals || []).map((p: any) => ({
-        id: p.pipelineId,
-        label: p.name
-      }))
+      pipelines: {
+        deals: (manifest.pipelines?.deals || []).map((p: any) => ({
+          id: p.pipelineId,
+          label: p.name
+        })),
+        leads: (manifest.pipelines?.leads || []).map((p: any) => ({
+          id: p.pipelineId,
+          label: p.name
+        }))
+      }
     };
 
     const diff = tool.plan(mockCurrentSchema);

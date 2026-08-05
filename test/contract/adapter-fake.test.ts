@@ -3,41 +3,24 @@ import { HubspotAdapter } from '../../packages/hubspot-adapter/adapter';
 import { TransitionIntent } from '../../packages/commercial-kernel';
 
 describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
-  it('should apply CREATE_SUCCESSOR intent for SQL Lead natively', async () => {
+  it('should find or create initial Lead for subject natively', async () => {
     const adapter = new HubspotAdapter('fake-token');
     const rawClient = adapter.getRawClient();
 
     const searchMock = vi.fn().mockResolvedValue({ results: [] });
-    const createLeadMock = vi.fn().mockResolvedValue({ id: 'lead_123' });
-    const getByIdMock = vi.fn().mockResolvedValue({
-      id: 'lead_123',
-      properties: {
-        coa_opportunity_key: 'rel_acme::SQL::1',
-        coa_opportunity_type: 'SQL',
-        coa_cycle_index: '1'
-      }
-    });
+    const createLeadMock = vi.fn().mockResolvedValue({ id: 'lead_bootstrap_1', properties: { coa_opportunity_key: 'rel_acme::LEAD::1' } });
 
     rawClient.crm.objects.leads.searchApi.doSearch = searchMock;
     rawClient.crm.objects.leads.basicApi.create = createLeadMock;
-    rawClient.crm.objects.leads.basicApi.getById = getByIdMock;
 
-    const intents: TransitionIntent[] = [{
-      kind: 'CREATE_SUCCESSOR',
-      predecessorKey: 'rel_acme::MQL::1',
-      successorKey: 'rel_acme::SQL::1',
-      successorType: 'SQL',
-      cycleIndex: 1
-    }];
+    const lead = await adapter.findOrCreateLeadForSubject({ kind: 'COMPANY', key: 'comp_123' }, 'rel_acme', 'b2b');
 
-    const result = await adapter.applyTransitionIntents(intents, 'trans_123');
-
-    expect(result.success).toBe(true);
-    expect(result.appliedIntents).toBe(1);
+    expect(lead.id).toBe('lead_bootstrap_1');
     expect(createLeadMock).toHaveBeenCalledWith(expect.objectContaining({
       properties: expect.objectContaining({
-        coa_opportunity_key: 'rel_acme::SQL::1',
-        coa_opportunity_type: 'SQL'
+        coa_opportunity_key: 'rel_acme::LEAD::1',
+        coa_opportunity_type: 'MQL',
+        hs_pipeline_stage: 'mql'
       })
     }));
   });
@@ -63,7 +46,7 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
 
     const intents: TransitionIntent[] = [{
       kind: 'CREATE_SUCCESSOR',
-      predecessorKey: 'rel_acme::SQL::1',
+      predecessorKey: 'rel_acme::LEAD::1',
       successorKey: 'rel_acme::FTP::1',
       successorType: 'FTP',
       cycleIndex: 1

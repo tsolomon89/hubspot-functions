@@ -76,7 +76,7 @@ export async function processHubSpotCustomCodeAction(
   const configResolver = new OrganizationConfigResolver();
   const snapshotLoader = new HubSpotSnapshotLoader(hsAdapter);
 
-  // 1. Resolve Organization Configuration (Filesystem-free)
+  // 1. Resolve Organization Configuration (Pure In-Memory)
   const config = configResolver.resolveConfig({
     portalId,
     organizationKey: event.inputFields?.organizationKey,
@@ -107,6 +107,10 @@ export async function processHubSpotCustomCodeAction(
   else if (intents.every(i => i.kind === 'NOOP')) status = 'NO_CHANGE';
 
   const verified = applyRes.success && applyRes.receipts.length > 0 && applyRes.receipts.every(r => r.verified);
+
+  if (!verified) {
+    throw new Error(`ACTION_UNVERIFIED: Action execution produced unverified mutation receipts. Applied: ${applyRes.appliedIntents}`);
+  }
 
   logger.info('Stateless HubSpot Custom Code Action executed successfully', {
     objectId,

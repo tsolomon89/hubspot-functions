@@ -5,7 +5,7 @@
   "description": "HubSpot Commercial Operations Automation Foundation",
   "main": "dist/hubspot-custom-code/reconcile-record.js",
   "scripts": {
-    "build": "tsc --noEmit && npm run build:custom-code",
+    "build": "npx ts-node scripts/compile-configs.ts && tsc --noEmit && npm run build:custom-code",
     "build:custom-code": "esbuild src/custom-code-actions/reconcile-record.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/hubspot-custom-code/reconcile-record.js --external:@hubspot/api-client",
     "test": "vitest run",
     "test:watch": "vitest",

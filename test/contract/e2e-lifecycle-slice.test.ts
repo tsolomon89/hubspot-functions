@@ -12,7 +12,7 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
         { key: 'sql_offering', name: 'Known offering interest', predicate: 'hasOfferingInterest', params: { minProducts: 1 } },
         { key: 'sql_meeting', name: 'Completed positive meeting', predicate: 'activityExists', params: { activityType: 'MEETING', outcome: 'COMPLETED' } }
       ],
-      FTP: [{ key: 'ftp_transaction', name: 'First completed transaction', predicate: 'transactionComplete', params: { minAmount: 1 } }],
+      FTP: [{ key: 'ftp_transaction', name: 'First completed transaction', predicate: 'transactionExists', params: { minAmount: 1 } }],
       RTP: []
     }
   };
@@ -22,7 +22,7 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       organizationKey: 'org_global_corp',
       relationshipKey: 'comp_acme',
       relationshipType: 'b2b',
-      opportunityKey: 'comp_acme::MQL::1',
+      opportunityKey: 'comp_acme::LEAD::1',
       opportunityType: 'MQL',
       opportunityState: 'OPEN',
       cycleIndex: 1,
@@ -51,7 +51,7 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       organizationKey: 'org_global_corp',
       relationshipKey: 'comp_acme',
       relationshipType: 'b2b',
-      opportunityKey: 'comp_acme::SQL::1',
+      opportunityKey: 'comp_acme::LEAD::1',
       opportunityType: 'SQL',
       opportunityState: 'OPEN',
       cycleIndex: 1,
@@ -77,7 +77,7 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
     if (successorIntent && successorIntent.kind === 'CREATE_SUCCESSOR') {
       expect(successorIntent.successorType).toBe('FTP');
       expect(successorIntent.successorKey).toBe('comp_acme::FTP::1');
-      expect(successorIntent.predecessorKey).toBe('comp_acme::SQL::1');
+      expect(successorIntent.predecessorKey).toBe('comp_acme::LEAD::1');
     }
   });
 
@@ -86,7 +86,7 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       organizationKey: 'org_global_corp',
       relationshipKey: 'comp_acme',
       relationshipType: 'b2b',
-      opportunityKey: 'comp_acme::SQL::1',
+      opportunityKey: 'comp_acme::LEAD::1',
       opportunityType: 'SQL',
       opportunityState: 'WON',
       cycleIndex: 1,

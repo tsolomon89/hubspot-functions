@@ -97,7 +97,7 @@ export function evaluatePredicate(
     }
     case 'hasOfferingInterest':
     case 'offeringKnown': {
-      const products = snapshot.facts.products || snapshot.facts.offeringKeys || snapshot.facts.offering;
+      const products = snapshot.facts.products || snapshot.facts.offeringKeys || snapshot.facts.offering || snapshot.facts.lineItems;
       const hasOffering = Array.isArray(products) ? products.length > 0 : Boolean(products);
       const evMatches = matchingEvidence.filter(e => e.predicate === 'offeringKnown' || e.data?.productKey);
       const satisfied = hasOffering || evMatches.length > 0;
@@ -124,8 +124,9 @@ export function evaluatePredicate(
     case 'transactionExists': {
       const evMatches = matchingEvidence.filter(e => e.predicate === 'transactionExists' || e.data?.transactionId || e.data?.orderId);
       
+      // Authoritative transaction completion: requires Closed Won stage or explicit completion fact! (Amount alone is NOT completion)
       let hasFactTransaction = false;
-      if (snapshot.facts.transactionCompleted || snapshot.facts.orderCompleted || snapshot.facts.amount) {
+      if (snapshot.facts.transactionCompleted === true || snapshot.facts.stage === 'closedwon') {
         const factTxTime = (snapshot.facts.transactionCompletedAt as string) || snapshot.openedAt;
         if (goal.scope === 'sincePredecessorCompletion') {
           hasFactTransaction = Boolean(snapshot.predecessorCompletedAt && factTxTime > snapshot.predecessorCompletedAt);
