@@ -38,9 +38,7 @@ export class SchemaTool {
       let leadsProps: any = { results: [] };
       try {
         leadsProps = await rawClient.crm.properties.coreApi.getAll('leads');
-      } catch (e) {
-        // Fallback if portal uses standard object types
-      }
+      } catch (e) {}
 
       let dealPipelines: any = { results: [] };
       try {
@@ -132,12 +130,16 @@ export class SchemaTool {
       return { applied: false, count: 0, errors: ['No authenticated HubSpot client provided'] };
     }
 
+    // Inspect account state first before applying diff!
+    const currentAccountState = await this.inspect(hsAdapter);
+    const actualDiff = this.plan(currentAccountState);
+
     let appliedCount = 0;
     const errors: string[] = [];
     const rawClient = hsAdapter.getRawClient();
 
     // 1. Create Property Groups
-    for (const group of diff.propertyGroupsToCreate) {
+    for (const group of actualDiff.propertyGroupsToCreate) {
       for (const objType of group.objectTypes || ['deals', 'companies', 'leads', 'contacts']) {
         try {
           await rawClient.crm.properties.groupsApi.create(objType, {
@@ -155,7 +157,7 @@ export class SchemaTool {
     }
 
     // 2. Create Properties
-    for (const prop of diff.propertiesToCreate) {
+    for (const prop of actualDiff.propertiesToCreate) {
       try {
         await rawClient.crm.properties.coreApi.create(prop.objectType, {
           name: prop.name,
@@ -176,7 +178,7 @@ export class SchemaTool {
     }
 
     // 3. Create Pipelines
-    for (const pipe of diff.pipelinesToCreate) {
+    for (const pipe of actualDiff.pipelinesToCreate) {
       const targetObj = pipe.objectType || 'deals';
       try {
         await rawClient.crm.pipelines.pipelinesApi.create(targetObj, {

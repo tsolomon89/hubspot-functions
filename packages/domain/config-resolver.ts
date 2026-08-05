@@ -42,6 +42,10 @@ export class OrganizationConfigResolver {
         configVersion: raw.configVersion || '1.0.0',
         relationshipType: raw.relationshipType || relType,
         goalsByOpportunityType: raw.goalsByOpportunityType || { MQL: [], SQL: [], FTP: [], RTP: [] },
+        hubspotPipelines: raw.hubspotPipelines || {
+          leadPipelineId: 'b2b_qualification_lead_pipeline',
+          dealPipelineId: 'b2b_transaction_deal_pipeline'
+        },
         featureFlags: raw.featureFlags || {}
       };
       const valRes = validateCommercialModel(config);
@@ -51,7 +55,18 @@ export class OrganizationConfigResolver {
     // Fallback to default B2B or B2C embedded config if matching key not found
     const fallbackKey = relType === 'b2c' ? 'org_consumer_brand:b2c' : 'org_global_corp:b2b';
     if (EMBEDDED_CONFIGS[fallbackKey]) {
-      return EMBEDDED_CONFIGS[fallbackKey];
+      const raw = EMBEDDED_CONFIGS[fallbackKey];
+      return {
+        organizationKey: raw.organizationKey || orgKey,
+        configVersion: raw.configVersion || '1.0.0',
+        relationshipType: raw.relationshipType || relType,
+        goalsByOpportunityType: raw.goalsByOpportunityType || { MQL: [], SQL: [], FTP: [], RTP: [] },
+        hubspotPipelines: raw.hubspotPipelines || {
+          leadPipelineId: 'b2b_qualification_lead_pipeline',
+          dealPipelineId: 'b2b_transaction_deal_pipeline'
+        },
+        featureFlags: raw.featureFlags || {}
+      };
     }
 
     throw new Error(`UNSUPPORTED_RELATIONSHIP_TYPE: Qualification configuration for relationship type '${relType}' was not found`);

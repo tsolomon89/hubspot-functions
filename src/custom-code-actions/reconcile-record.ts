@@ -87,7 +87,8 @@ export async function processHubSpotCustomCodeAction(
   const snapshot = await snapshotLoader.loadSnapshotFromRecord(
     { objectType, objectId },
     config.organizationKey,
-    config.relationshipType
+    config.relationshipType,
+    config
   );
 
   // 3. Evaluate Commercial Kernel Goals
@@ -98,7 +99,7 @@ export async function processHubSpotCustomCodeAction(
 
   // 5. Apply real CRM mutations synchronously
   const correlationKey = `cc_${Date.now()}_${snapshot.opportunityKey}`;
-  const applyRes = await hsAdapter.applyTransitionIntents(intents, correlationKey);
+  const applyRes = await hsAdapter.applyTransitionIntents(intents, correlationKey, config);
 
   let status: CustomCodeCallbackResult['outputFields']['status'] = 'UPDATED_EXISTING';
   if (evaluation.qualificationState === 'BLOCKED') status = 'BLOCKED';

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import * as path from 'path';
 import { main, processHubSpotCustomCodeAction } from '../../src/custom-code-actions/reconcile-record';
+import { parseHubSpotTimestamp } from '../../packages/hubspot-adapter/adapter';
 
 describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
   it('should verify that committed generated CommonJS bundle exposes exports.main', () => {
@@ -8,6 +9,13 @@ describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
     const bundle = require(bundlePath);
     expect(bundle).toHaveProperty('main');
     expect(typeof bundle.main).toBe('function');
+  });
+
+  it('should parse ISO 8601 strings and epoch timestamps robustly without returning NaN', () => {
+    expect(parseHubSpotTimestamp('2026-08-05T00:00:00.000Z')).toBe('2026-08-05T00:00:00.000Z');
+    expect(parseHubSpotTimestamp(1785945000000)).toBe(new Date(1785945000000).toISOString());
+    expect(parseHubSpotTimestamp('1785945000000')).toBe(new Date(1785945000000).toISOString());
+    expect(parseHubSpotTimestamp(null)).toBeDefined();
   });
 
   it('should execute processHubSpotCustomCodeAction on production-shaped Contact event and throw when unverified', async () => {

@@ -1,10 +1,11 @@
-import { HubspotAdapter } from './adapter';
+import { HubspotAdapter, parseHubSpotTimestamp } from './adapter';
 import { 
   OpportunitySnapshot, 
   CommercialSubjectRef, 
   OpportunityType, 
   OpportunityState, 
-  EvidenceRecord 
+  EvidenceRecord,
+  QualificationConfig
 } from '../commercial-kernel';
 import { logger } from '../observability';
 
@@ -23,7 +24,8 @@ export class HubSpotSnapshotLoader {
   public async loadSnapshotFromRecord(
     recordRef: HubSpotRecordRef,
     organizationKey: string = 'org_default',
-    relationshipType: string = 'b2b'
+    relationshipType: string = 'b2b',
+    config?: QualificationConfig
   ): Promise<OpportunitySnapshot> {
     logger.info('Loading pure opportunity snapshot directly from HubSpot CRM', { objectType: recordRef.objectType, objectId: recordRef.objectId });
 
@@ -46,24 +48,34 @@ export class HubSpotSnapshotLoader {
       
       const subjectFacts = await this.hsAdapter.loadSubjectSnapshot(subject);
       Object.assign(facts, subjectFacts);
+
+      if (facts.automationSuppressed === true) {
+        logger.info('Automation suppressed on subject record', { subject });
+        facts.blocked = true;
+      }
       
       relationshipKey = (subjectFacts.relationshipKey as string) || (isCompany ? (subjectFacts.domain as string) : (subjectFacts.email as string)) || `rel_${recordRef.objectId}`;
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
       // Bootstrap or retrieve initial managed Lead for Contact/Company relationship
-      const managedLead = await this.hsAdapter.findOrCreateLeadForSubject(subject, relationshipKey, relationshipType);
+      const managedLead = await this.hsAdapter.findOrCreateLeadForSubject(subject, relationshipKey, relationshipType, config);
       if (managedLead) {
         opportunityType = (managedLead.coa_opportunity_type as OpportunityType) || 'MQL';
         cycleIndex = Number(managedLead.coa_cycle_index || 1);
         opportunityKey = managedLead.coa_opportunity_key || opportunityKey;
         if (managedLead.createdate) {
-          openedAt = new Date(Number(managedLead.createdate)).toISOString();
+          openedAt = parseHubSpotTimestamp(managedLead.createdate);
         }
         const stage = (managedLead.hs_pipeline_stage as string) || 'mql';
         if (stage === 'qualified') opportunityState = 'WON';
         else if (stage === 'disqualified') opportunityState = 'LOST';
         facts.stage = stage;
         facts.leadId = managedLead.id;
+
+        if (managedLead.coa_offering_keys) {
+          facts.offeringKeys = String(managedLead.coa_offering_keys).split(',');
+          facts.products = facts.offeringKeys;
+        }
       }
     } else if (recordRef.objectType === 'lead') {
       const leadProps = await this.hsAdapter.loadLeadSnapshot(recordRef.objectId);
@@ -73,7 +85,7 @@ export class HubSpotSnapshotLoader {
       opportunityKey = (leadProps.coa_opportunity_key as string) || `${relationshipKey}::LEAD::1`;
       predecessorOpportunityKey = leadProps.coa_predecessor_opportunity_key as string;
       if (leadProps.createdate) {
-        openedAt = new Date(Number(leadProps.createdate)).toISOString();
+        openedAt = parseHubSpotTimestamp(leadProps.createdate);
       }
 
       // Query associated Contact / Company to resolve subject identity
@@ -92,6 +104,10 @@ export class HubSpotSnapshotLoader {
       facts.stage = stage;
       facts.email = leadProps.email;
       facts.leadId = recordRef.objectId;
+      if (leadProps.coa_offering_keys) {
+        facts.offeringKeys = String(leadProps.coa_offering_keys).split(',');
+        facts.products = facts.offeringKeys;
+      }
     } else if (recordRef.objectType === 'deal') {
       const dealProps = await this.hsAdapter.loadDealSnapshot(recordRef.objectId);
       opportunityType = (dealProps.coa_opportunity_type as OpportunityType) || 'FTP';
@@ -99,9 +115,11 @@ export class HubSpotSnapshotLoader {
       relationshipKey = (dealProps.coa_relationship_key as string) || `rel_${recordRef.objectId}`;
       opportunityKey = (dealProps.coa_opportunity_key as string) || `${relationshipKey}::${opportunityType}::${cycleIndex}`;
       predecessorOpportunityKey = dealProps.coa_predecessor_opportunity_key as string;
-      predecessorCompletedAt = dealProps.coa_predecessor_completed_at as string;
+      if (dealProps.coa_predecessor_completed_at) {
+        predecessorCompletedAt = parseHubSpotTimestamp(dealProps.coa_predecessor_completed_at);
+      }
       if (dealProps.createdate) {
-        openedAt = new Date(Number(dealProps.createdate)).toISOString();
+        openedAt = parseHubSpotTimestamp(dealProps.createdate);
       }
 
       // Query associated Contact / Company

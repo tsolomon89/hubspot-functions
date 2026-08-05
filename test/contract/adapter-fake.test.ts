@@ -9,9 +9,11 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
 
     const searchMock = vi.fn().mockResolvedValue({ results: [] });
     const createLeadMock = vi.fn().mockResolvedValue({ id: 'lead_bootstrap_1', properties: { coa_opportunity_key: 'rel_acme::LEAD::1' } });
+    const assocMock = vi.fn().mockResolvedValue({ results: [{ toObjectId: 'cnt_assoc_1' }] });
 
     rawClient.crm.objects.leads.searchApi.doSearch = searchMock;
     rawClient.crm.objects.leads.basicApi.create = createLeadMock;
+    rawClient.crm.associations.v4.basicApi.getPage = assocMock;
 
     const lead = await adapter.findOrCreateLeadForSubject({ kind: 'COMPANY', key: 'comp_123' }, 'rel_acme', 'b2b');
 

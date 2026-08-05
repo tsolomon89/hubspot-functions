@@ -39,11 +39,20 @@ export interface GoalDefinition {
   universal?: boolean;
 }
 
+export interface HubSpotPipelineConfig {
+  leadPipelineId?: string;
+  dealPipelineId?: string;
+  leadStageIds?: Record<string, string>;
+  dealStageIds?: Record<string, string>;
+  dealStageProbabilities?: Record<string, number>;
+}
+
 export interface QualificationConfig {
   organizationKey: string;
   configVersion: string;
   relationshipType: string;
   goalsByOpportunityType: Record<OpportunityType, GoalDefinition[]>;
+  hubspotPipelines?: HubSpotPipelineConfig;
   featureFlags?: {
     automationSuppressed?: boolean;
     dryRunTransactions?: boolean;
@@ -68,7 +77,7 @@ export type TransitionIntent =
       targetObjectType?: 'contact' | 'company' | 'lead' | 'deal';
       details?: Record<string, unknown>;
     }
-  | { kind: 'CREATE_SUCCESSOR'; predecessorKey: string; successorKey: string; successorType: OpportunityType; cycleIndex: number }
+  | { kind: 'CREATE_SUCCESSOR'; predecessorKey: string; successorKey: string; successorType: OpportunityType; cycleIndex: number; subject?: CommercialSubjectRef }
   | { kind: 'PROJECT_LIFECYCLE_STAGE'; subject: CommercialSubjectRef; stage: string }
-  | { kind: 'CREATE_MANUAL_REVIEW'; opportunityKey: string; reason: string }
+  | { kind: 'CREATE_MANUAL_REVIEW'; opportunityKey: string; reason: string; subject?: CommercialSubjectRef }
   | { kind: 'NOOP'; reason: string };

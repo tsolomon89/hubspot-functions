@@ -36,11 +36,18 @@ export const EMBEDDED_INSTALLATIONS: Record<string, { organizationKey: string; d
 export const EMBEDDED_CONFIGS: Record<string, any> = ${JSON.stringify(configs, null, 2)};
 `;
 
-  fs.writeFileSync(outputPath, code, 'utf-8');
-  console.log('Successfully generated packages/domain/embedded-configs.ts', {
-    installations: Object.keys(installations),
-    configs: Object.keys(configs)
-  });
+  if (fs.existsSync(outputPath)) {
+    const existing = fs.readFileSync(outputPath, 'utf-8');
+    if (existing !== code) {
+      fs.writeFileSync(outputPath, code, 'utf-8');
+      console.log('Updated packages/domain/embedded-configs.ts from YAML configuration');
+    } else {
+      console.log('packages/domain/embedded-configs.ts is up to date');
+    }
+  } else {
+    fs.writeFileSync(outputPath, code, 'utf-8');
+    console.log('Generated packages/domain/embedded-configs.ts from YAML configuration');
+  }
 }
 
 if (require.main === module) {
