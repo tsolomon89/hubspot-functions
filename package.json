@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "description": "HubSpot Commercial Operations Automation Foundation",
-  "main": "src/custom-code-actions/reconcile-record.ts",
+  "main": "dist/hubspot-custom-code/reconcile-record.js",
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "tsc --noEmit && npm run build:custom-code",
+    "build:custom-code": "esbuild src/custom-code-actions/reconcile-record.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/hubspot-custom-code/reconcile-record.js --external:@hubspot/api-client",
     "test": "vitest run",
     "test:watch": "vitest",
     "schema:inspect": "ts-node packages/domain/schema-cli.ts inspect",
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3",
     "vitest": "^3.0.0"

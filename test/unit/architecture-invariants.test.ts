@@ -54,4 +54,17 @@ describe('Architecture Invariants & Negative Assertions', () => {
       }
     }
   });
+
+  it('should verify single-file deployable CommonJS JavaScript artifact in dist/hubspot-custom-code/reconcile-record.js', () => {
+    const artifactPath = path.join(rootDir, 'dist/hubspot-custom-code/reconcile-record.js');
+    expect(fs.existsSync(artifactPath)).toBe(true);
+
+    const code = fs.readFileSync(artifactPath, 'utf-8');
+    expect(code).toContain('main');
+    expect(code).toContain('require("@hubspot/api-client")');
+    expect(code).not.toContain('import {');
+    expect(code).not.toContain('export async function');
+    expect(code).not.toContain('require("./');
+    expect(code).not.toContain('require("../');
+  });
 });

@@ -9,8 +9,9 @@ export interface HubSpotCustomCodeEvent {
     actionDefinitionId?: number;
   };
   object?: {
-    id: number | string;
-    objectType?: string; // e.g. '0-1' for contact, '0-2' for company, '0-3' for deal
+    objectId?: number | string;
+    id?: number | string;
+    objectType?: string; // Documented HubSpot values: 'CONTACT', 'COMPANY', 'DEAL', 'LEAD'
   };
   inputFields?: {
     recordId?: string;
@@ -36,15 +37,38 @@ export async function processHubSpotCustomCodeAction(
 ): Promise<CustomCodeCallbackResult> {
   const portalId = event.origin?.portalId || process.env.HUBSPOT_PORTAL_ID || '149041124';
   
-  // Resolve Object Type
-  let objectType: 'contact' | 'company' | 'lead' | 'deal' = event.inputFields?.objectType || 'contact';
-  if (event.object?.objectType === '0-2') objectType = 'company';
-  else if (event.object?.objectType === '0-3') objectType = 'deal';
-
-  // Resolve Record ID
-  const objectId = String(event.inputFields?.recordId || event.object?.id || '0');
+  // Extract enrolled Record ID using documented event.object.objectId first!
+  const objectId = String(event.object?.objectId || event.object?.id || event.inputFields?.recordId || '0');
   if (!objectId || objectId === '0') {
     throw new Error('INVALID_ENROLLMENT: Missing valid record ID in HubSpot Custom Code Action event.');
+  }
+
+  // Extract enrolled Object Type using documented uppercase objectType strings ('CONTACT', 'COMPANY', 'DEAL', 'LEAD')
+  let objectType: 'contact' | 'company' | 'lead' | 'deal' = 'contact';
+  const rawType = String(event.object?.objectType || event.inputFields?.objectType || 'CONTACT').toUpperCase();
+
+  switch (rawType) {
+    case 'CONTACT':
+    case '0-1':
+      objectType = 'contact';
+      break;
+    case 'COMPANY':
+    case '0-2':
+      objectType = 'company';
+      break;
+    case 'DEAL':
+    case '0-3':
+      objectType = 'deal';
+      break;
+    case 'LEAD':
+    case '0-5':
+      objectType = 'lead';
+      break;
+    default:
+      if (event.inputFields?.objectType) {
+        objectType = event.inputFields.objectType;
+      }
+      break;
   }
 
   const token = accessToken || process.env.HUBSPOT_ACCESS_TOKEN || process.env.HUBSPOT_DEVELOPMENT_PERSONAL_ACCESS_KEY;
@@ -52,7 +76,7 @@ export async function processHubSpotCustomCodeAction(
   const configResolver = new OrganizationConfigResolver();
   const snapshotLoader = new HubSpotSnapshotLoader(hsAdapter);
 
-  // 1. Resolve Organization Configuration
+  // 1. Resolve Organization Configuration (Filesystem-free)
   const config = configResolver.resolveConfig({
     portalId,
     organizationKey: event.inputFields?.organizationKey,
@@ -101,7 +125,7 @@ export async function processHubSpotCustomCodeAction(
   };
 }
 
-// HubSpot Custom Code Action standard export
+// HubSpot Custom Code Action deployable entry point contract: exports.main
 export async function main(event: HubSpotCustomCodeEvent, callback?: (res: CustomCodeCallbackResult) => void) {
   try {
     const result = await processHubSpotCustomCodeAction(event);

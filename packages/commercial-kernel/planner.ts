@@ -91,32 +91,35 @@ export function planTransition(
   }
 
   // Opportunity is SATISFIED
-  const intents: TransitionIntent[] = [{
-    kind: 'UPDATE_OPPORTUNITY',
-    opportunityKey: snapshot.opportunityKey,
-    newState: 'WON',
-    qualificationState: 'SATISFIED'
-  }];
+  const intents: TransitionIntent[] = [];
 
-  // Derived Lifecycle Stage projection
-  const projectedStage = projectLifecycleStage(snapshot.opportunityType, 'SATISFIED');
-  intents.push({
-    kind: 'PROJECT_LIFECYCLE_STAGE',
-    subject: snapshot.subject,
-    stage: projectedStage
-  });
-
-  // Single Lead progression: MQL satisfied -> Lead advances to SQL stage (no successor Lead created).
-  // SQL satisfied -> Lead becomes Qualified AND creates first FTP Deal.
+  // Single Lead Progression: MQL satisfied -> Lead remains OPEN, advances stage to SQL, no successor Lead created.
   if (snapshot.opportunityType === 'MQL') {
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
       opportunityKey: snapshot.opportunityKey,
       newState: 'OPEN',
       qualificationState: 'SATISFIED',
-      details: { targetOpportunityType: 'SQL', targetLeadStage: 'sql' }
+      details: { targetOpportunityType: 'SQL', targetLeadStage: 'sql', mqlCompletedAt: new Date().toISOString() }
+    });
+    intents.push({
+      kind: 'PROJECT_LIFECYCLE_STAGE',
+      subject: snapshot.subject,
+      stage: 'marketingqualifiedlead'
     });
   } else if (snapshot.opportunityType === 'SQL') {
+    // SQL satisfied -> Lead closed WON/QUALIFIED and creates first FTP Deal
+    intents.push({
+      kind: 'UPDATE_OPPORTUNITY',
+      opportunityKey: snapshot.opportunityKey,
+      newState: 'WON',
+      qualificationState: 'SATISFIED'
+    });
+    intents.push({
+      kind: 'PROJECT_LIFECYCLE_STAGE',
+      subject: snapshot.subject,
+      stage: 'salesqualifiedlead'
+    });
     const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'FTP', 1);
     intents.push({
       kind: 'CREATE_SUCCESSOR',
@@ -126,6 +129,17 @@ export function planTransition(
       cycleIndex: 1
     });
   } else if (snapshot.opportunityType === 'FTP') {
+    intents.push({
+      kind: 'UPDATE_OPPORTUNITY',
+      opportunityKey: snapshot.opportunityKey,
+      newState: 'WON',
+      qualificationState: 'SATISFIED'
+    });
+    intents.push({
+      kind: 'PROJECT_LIFECYCLE_STAGE',
+      subject: snapshot.subject,
+      stage: 'customer'
+    });
     const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', 1);
     intents.push({
       kind: 'CREATE_SUCCESSOR',
@@ -135,6 +149,17 @@ export function planTransition(
       cycleIndex: 1
     });
   } else if (snapshot.opportunityType === 'RTP') {
+    intents.push({
+      kind: 'UPDATE_OPPORTUNITY',
+      opportunityKey: snapshot.opportunityKey,
+      newState: 'WON',
+      qualificationState: 'SATISFIED'
+    });
+    intents.push({
+      kind: 'PROJECT_LIFECYCLE_STAGE',
+      subject: snapshot.subject,
+      stage: 'customer'
+    });
     const nextCycleIndex = snapshot.cycleIndex + 1;
     const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', nextCycleIndex);
     intents.push({

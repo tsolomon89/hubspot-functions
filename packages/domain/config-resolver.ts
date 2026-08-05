@@ -10,6 +10,58 @@ export interface ResolveConfigOptions {
   relationshipType?: string;
 }
 
+// Embedded in-memory static configurations for zero-filesystem runtime execution (HubSpot Custom Code Actions)
+const EMBEDDED_INSTALLATIONS: Record<string, { organizationKey: string; defaultRelationshipType: string }> = {
+  '149041124': {
+    organizationKey: 'org_default',
+    defaultRelationshipType: 'b2b'
+  }
+};
+
+const EMBEDDED_CONFIGS: Record<string, QualificationConfig> = {
+  'org_default:b2b': {
+    organizationKey: 'org_global_corp',
+    configVersion: '1.0.0',
+    relationshipType: 'b2b',
+    goalsByOpportunityType: {
+      MQL: [
+        { key: 'mql_identity', name: 'Identifiable subject with email', predicate: 'hasIdentity', params: { field: 'email' } }
+      ],
+      SQL: [
+        { key: 'sql_offering', name: 'Known offering interest', predicate: 'hasOfferingInterest', params: { minProducts: 1 } },
+        { key: 'sql_meeting', name: 'Completed positive meeting', predicate: 'activityExists', params: { activityType: 'MEETING', outcome: 'COMPLETED' } }
+      ],
+      FTP: [
+        { key: 'ftp_transaction', name: 'First completed transaction', predicate: 'transactionComplete', params: { minAmount: 1 } }
+      ],
+      RTP: [
+        { key: 'rtp_subsequent', name: 'Subsequent transaction after boundary', predicate: 'transactionComplete', params: { minAmount: 1 } }
+      ]
+    },
+    featureFlags: { automationSuppressed: false }
+  },
+  'org_default:b2c': {
+    organizationKey: 'org_consumer_brand',
+    configVersion: '1.0.0',
+    relationshipType: 'b2c',
+    goalsByOpportunityType: {
+      MQL: [
+        { key: 'mql_b2c_identity', name: 'Identifiable consumer email', predicate: 'hasIdentity', params: { field: 'email' } }
+      ],
+      SQL: [
+        { key: 'sql_b2c_interest', name: 'Consumer product interest', predicate: 'hasOfferingInterest', params: { minProducts: 1 } }
+      ],
+      FTP: [
+        { key: 'ftp_b2c_order', name: 'First consumer purchase', predicate: 'transactionComplete', params: { minAmount: 1 } }
+      ],
+      RTP: [
+        { key: 'rtp_b2c_repeat', name: 'Repeat consumer purchase', predicate: 'transactionComplete', params: { minAmount: 1 } }
+      ]
+    },
+    featureFlags: { automationSuppressed: false }
+  }
+};
+
 export class OrganizationConfigResolver {
   private configDir: string;
   private installationsPath: string;
@@ -23,8 +75,12 @@ export class OrganizationConfigResolver {
     if (!portalId) return null;
     const strPortalId = String(portalId).trim();
 
-    if (fs.existsSync(this.installationsPath)) {
-      try {
+    if (EMBEDDED_INSTALLATIONS[strPortalId]) {
+      return EMBEDDED_INSTALLATIONS[strPortalId];
+    }
+
+    try {
+      if (typeof fs !== 'undefined' && fs.existsSync && fs.existsSync(this.installationsPath)) {
         const raw = fs.readFileSync(this.installationsPath, 'utf-8');
         const parsed = yaml.parse(raw);
         const mapping = parsed?.installations?.[strPortalId];
@@ -34,9 +90,9 @@ export class OrganizationConfigResolver {
             defaultRelationshipType: mapping.defaultRelationshipType || 'b2b'
           };
         }
-      } catch (err) {
-        // Fallthrough
       }
+    } catch (err) {
+      // Memory fallback
     }
 
     throw new Error(`UNSUPPORTED_PORTAL: Portal '${strPortalId}' is not registered in portal-installations.yaml`);
@@ -55,49 +111,47 @@ export class OrganizationConfigResolver {
     }
 
     if (!relType) relType = 'b2b';
+    if (!orgKey) orgKey = 'org_default';
+
+    const embeddedKey = `${orgKey}:${relType}`;
+    if (EMBEDDED_CONFIGS[embeddedKey]) {
+      return EMBEDDED_CONFIGS[embeddedKey];
+    }
+    if (EMBEDDED_CONFIGS[`org_default:${relType}`]) {
+      return EMBEDDED_CONFIGS[`org_default:${relType}`];
+    }
 
     let candidateFilename = `${relType}.yaml`;
-    if (orgKey) {
+    if (orgKey && orgKey !== 'org_default') {
       candidateFilename = `${orgKey}-${relType}.yaml`;
     }
 
-    let filePath = path.join(this.configDir, candidateFilename);
-    if (!fs.existsSync(filePath)) {
-      if (relType === 'b2b') filePath = path.join(this.configDir, 'example-b2b.yaml');
-      else if (relType === 'b2c') filePath = path.join(this.configDir, 'example-b2c.yaml');
-    }
-
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`UNSUPPORTED_RELATIONSHIP_TYPE: Qualification configuration for relationship type '${relType}' was not found at ${filePath}`);
-    }
-
-    let parsed: any;
     try {
-      const raw = fs.readFileSync(filePath, 'utf-8');
-      parsed = yaml.parse(raw);
-    } catch (err: any) {
-      throw new Error(`INVALID_ORGANIZATION_CONFIG: Failed to parse YAML config at ${filePath}: ${err.message}`);
+      if (typeof fs !== 'undefined' && fs.existsSync) {
+        let filePath = path.join(this.configDir, candidateFilename);
+        if (!fs.existsSync(filePath)) {
+          if (relType === 'b2b') filePath = path.join(this.configDir, 'example-b2b.yaml');
+          else if (relType === 'b2c') filePath = path.join(this.configDir, 'example-b2c.yaml');
+        }
+
+        if (fs.existsSync(filePath)) {
+          const raw = fs.readFileSync(filePath, 'utf-8');
+          const parsed = yaml.parse(raw);
+          const config: QualificationConfig = {
+            organizationKey: parsed.organizationKey || orgKey,
+            configVersion: parsed.configVersion || '1.0.0',
+            relationshipType: parsed.relationshipType || relType,
+            goalsByOpportunityType: parsed.goalsByOpportunityType || { MQL: [], SQL: [], FTP: [], RTP: [] },
+            featureFlags: parsed.featureFlags || {}
+          };
+          const valRes = validateCommercialModel(config);
+          if (valRes.valid) return config;
+        }
+      }
+    } catch (err) {
+      // Memory fallback
     }
 
-    const config: QualificationConfig = {
-      organizationKey: parsed.organizationKey || orgKey || 'org_default',
-      configVersion: parsed.configVersion || '1.0.0',
-      relationshipType: parsed.relationshipType || relType,
-      goalsByOpportunityType: parsed.goalsByOpportunityType || { MQL: [], SQL: [], FTP: [], RTP: [] },
-      featureFlags: parsed.featureFlags || {}
-    };
-
-    const valRes = validateCommercialModel(config);
-    if (!valRes.valid) {
-      throw new Error(`INVALID_ORGANIZATION_CONFIG: Organization configuration validation failed: ${valRes.errors.join(', ')}`);
-    }
-
-    logger.info('Resolved Organization Qualification Configuration', { 
-      organizationKey: config.organizationKey, 
-      relationshipType: config.relationshipType,
-      configVersion: config.configVersion
-    });
-
-    return config;
+    throw new Error(`UNSUPPORTED_RELATIONSHIP_TYPE: Qualification configuration for relationship type '${relType}' was not found`);
   }
 }
