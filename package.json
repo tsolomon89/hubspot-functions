@@ -15,7 +15,7 @@
     "schema:readback": "ts-node packages/domain/schema-cli.ts readback"
   },
   "dependencies": {
-    "@hubspot/api-client": "^14.0.0",
+    "@hubspot/api-client": "^10.1.0",
     "yaml": "^2.3.4"
   },
   "devDependencies": {
