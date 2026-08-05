@@ -5,11 +5,12 @@ import * as path from 'path';
 describe('Architecture Invariants & Negative Assertions', () => {
   const rootDir = path.join(__dirname, '../../');
 
-  it('should verify pg dependency is absent from package.json', () => {
+  it('should verify pg and fastify dependencies are absent from package.json', () => {
     const pkgRaw = fs.readFileSync(path.join(rootDir, 'package.json'), 'utf-8');
     const pkg = JSON.parse(pkgRaw);
     
     expect(pkg.dependencies?.pg).toBeUndefined();
+    expect(pkg.dependencies?.fastify).toBeUndefined();
     expect(pkg.devDependencies?.['@types/pg']).toBeUndefined();
   });
 
@@ -23,8 +24,34 @@ describe('Architecture Invariants & Negative Assertions', () => {
     expect(workerDirExists).toBe(false);
   });
 
-  it('should verify postgres integration test directory is deleted', () => {
-    const pgTestDirExists = fs.existsSync(path.join(rootDir, 'test/integration/postgres'));
-    expect(pgTestDirExists).toBe(false);
+  it('should verify services/api/ external API server directory is deleted', () => {
+    const apiDirExists = fs.existsSync(path.join(rootDir, 'services/api'));
+    expect(apiDirExists).toBe(false);
+  });
+
+  it('should verify src/app/webhooks/ directory is deleted', () => {
+    const webhooksDirExists = fs.existsSync(path.join(rootDir, 'src/app/webhooks'));
+    expect(webhooksDirExists).toBe(false);
+  });
+
+  it('should verify src/app/workflow-actions/ external action directory is deleted', () => {
+    const actionsDirExists = fs.existsSync(path.join(rootDir, 'src/app/workflow-actions'));
+    expect(actionsDirExists).toBe(false);
+  });
+
+  it('should verify no vercel.app URLs exist in project files', () => {
+    const filesToScan = [
+      'package.json',
+      'src/app/app-hsmeta.json',
+      'docs/architecture/hubspot-foundation.md'
+    ];
+
+    for (const relPath of filesToScan) {
+      const fullPath = path.join(rootDir, relPath);
+      if (fs.existsSync(fullPath)) {
+        const content = fs.readFileSync(fullPath, 'utf-8');
+        expect(content).not.toContain('vercel.app');
+      }
+    }
   });
 });
