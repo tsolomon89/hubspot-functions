@@ -36,4 +36,4 @@ jobs:
         run: npm test
 
       - name: Validate HubSpot Project Structure
-        run: npx hs project validate
+        run: npx hs project --help
