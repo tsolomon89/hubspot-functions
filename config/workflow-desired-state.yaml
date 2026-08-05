@@ -1,6 +1,8 @@
 version: "1.0.0"
 executionPortalId: 149041124
 accountRole: "developer-test"
+status: "BLOCKED_REQUIRES_MANUAL_PUBLISH"
+installationBlockerReason: "HubSpot API does not support programmatic creation of Automation Workflows with Custom Code Actions via Private App token; workflows must be created/published via HubSpot UI using the bundleHash dist/hubspot-custom-code/reconcile-record.js."
 
 workflows:
   - name: "COA Contact Bootstrap & Communication Reconciliation"

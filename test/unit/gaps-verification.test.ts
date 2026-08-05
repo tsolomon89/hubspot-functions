@@ -74,6 +74,7 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
       if (toType === 'contact') return { results: [{ toObjectId: 'cnt_1' }] };
       if (toType === 'company') return { results: [{ toObjectId: 'comp_1' }] };
       if (toType === 'line_item') return { results: [] };
+      if (toType === 'deal' || fromType === 'line_item') return { results: [{ toObjectId: 'deal_201' }] };
       return { results: [] };
     });
 
@@ -241,8 +242,14 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
         coa_opportunity_key: 'rel_acme::LEAD::1',
         coa_relationship_key: 'rel_acme',
         coa_relationship_type: 'b2b',
+        coa_opportunity_type: 'MQL',
+        coa_qualification_state: 'PENDING',
+        coa_cycle_index: '1',
         hs_pipeline: 'b2b_qualification_lead_pipeline',
-        coa_managed: 'true'
+        hs_pipeline_stage: 'mql',
+        coa_managed: 'true',
+        coa_config_version: '1.0.0',
+        coa_last_evaluated_at: new Date().toISOString()
       }
     });
 

@@ -54,7 +54,8 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
         'lead->company': [],
         'deal->contact': [],
         'deal->company': [],
-        'deal->line_item': []
+        'deal->line_item': [],
+        'line_item->deal': []
       } as Record<string, Array<{ from: string; to: string }>>
     };
 
@@ -184,21 +185,46 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
       results: [{ id: 'prod_100', properties: { name: 'prod_software', price: '100' } }]
     }));
 
-    // Mock Line Items API directly on rawClient.crm.lineItems
+    // Mock Line Items API with dynamic store for exact coa_line_item_key readback
+    const lineItemStore: Record<string, any> = {};
     Object.defineProperty(rawClient.crm, 'lineItems', {
       value: {
         basicApi: {
-          create: vi.fn().mockImplementation(async (b) => ({ id: `li_${Date.now()}`, properties: b.properties })),
-          getById: vi.fn().mockImplementation(async (id) => ({
-            id,
-            properties: {
-              hs_product_id: 'prod_100',
-              hs_sku: 'prod_software',
-              name: 'prod_software',
-              quantity: '1',
-              price: '100'
+          create: vi.fn().mockImplementation(async (b) => {
+            const newId = `li_${Date.now()}`;
+            const record = {
+              id: newId,
+              properties: {
+                hs_product_id: 'prod_100',
+                hs_sku: 'prod_software',
+                name: 'prod_software',
+                quantity: '1',
+                price: '100',
+                ...b.properties
+              }
+            };
+            lineItemStore[newId] = record;
+            if (b.associations) {
+              for (const assoc of b.associations) {
+                const targetId = assoc.to?.id;
+                if (targetId) crmStore.associations['line_item->deal'].push({ from: newId, to: targetId });
+              }
             }
-          }))
+            return record;
+          }),
+          getById: vi.fn().mockImplementation(async (id) => {
+            if (lineItemStore[id]) return lineItemStore[id];
+            return {
+              id,
+              properties: {
+                hs_product_id: 'prod_100',
+                hs_sku: 'prod_software',
+                name: 'prod_software',
+                quantity: '1',
+                price: '100'
+              }
+            };
+          })
         }
       },
       configurable: true

@@ -78,7 +78,15 @@ export async function processHubSpotCustomCodeAction(
     };
   }
 
-  if (objectType === 'contact' || objectType === '0-1' || objectType === 'company' || objectType === '0-2') {
+  // Pre-Lead creation check: missing Company or ambiguous primary contact/company MUST NOT create a Lead!
+  const needsManualReview = Boolean(
+    snapshot.facts.missingCompany === true ||
+    snapshot.facts.ambiguousPrimaryCompany === true ||
+    snapshot.facts.ambiguousPrimaryContact === true ||
+    snapshot.facts.manualReviewRequired === true
+  );
+
+  if ((objectType === 'contact' || objectType === '0-1' || objectType === 'company' || objectType === '0-2') && !needsManualReview) {
     const lead = await adapter.findOrCreateLeadForSubject(
       snapshot.subject,
       snapshot.relationshipKey,

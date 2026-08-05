@@ -15,8 +15,14 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
         coa_opportunity_key: 'rel_acme::LEAD::1',
         coa_relationship_key: 'rel_acme',
         coa_relationship_type: 'b2b',
+        coa_opportunity_type: 'MQL',
+        coa_qualification_state: 'PENDING',
+        coa_cycle_index: '1',
         hs_pipeline: 'b2b_qualification_lead_pipeline',
-        coa_managed: 'true'
+        hs_pipeline_stage: 'mql',
+        coa_managed: 'true',
+        coa_config_version: '1.0.0',
+        coa_last_evaluated_at: new Date().toISOString()
       }
     });
     const assocMock = vi.fn().mockResolvedValue({ results: [{ toObjectId: 'cnt_assoc_1' }] });

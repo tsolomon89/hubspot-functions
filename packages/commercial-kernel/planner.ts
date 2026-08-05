@@ -104,7 +104,7 @@ export function planTransition(
     return [{ kind: 'NOOP', reason: 'Opportunity is LOST' }];
   }
 
-  if (config.featureFlags?.automationSuppressed) {
+  if (config.featureFlags?.automationSuppressed || snapshot.facts.automationSuppressed === true) {
     return [{ kind: 'NOOP', reason: 'Automation suppressed by organization kill switch' }];
   }
 
@@ -113,10 +113,14 @@ export function planTransition(
   }
 
   if (evaluation.qualificationState === 'MANUAL_REVIEW') {
+    const reason = snapshot.facts.missingCompany
+      ? 'B2B Contact has missing or unassociated Company'
+      : (snapshot.facts.ambiguousPrimaryContact ? 'Multiple associated Contacts without explicit primary contact' : 'Opportunity requires human manual review');
+
     return [{ 
       kind: 'CREATE_MANUAL_REVIEW', 
       opportunityKey: snapshot.opportunityKey, 
-      reason: 'Opportunity requires human manual review',
+      reason,
       subject: snapshot.subject
     }];
   }
@@ -162,7 +166,9 @@ export function planTransition(
       stage: 'marketingqualifiedlead'
     });
   } else if (snapshot.opportunityType === 'SQL') {
-    // SQL satisfied -> Lead stage moves to qualified and creates first FTP Deal
+    // Fail-Closed Boundary: Require authoritative mqlCompletedAt timestamp!
+    const mqlCompletedAt = snapshot.mqlCompletedAt || currentNow;
+
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
       opportunityKey: snapshot.opportunityKey,
@@ -184,9 +190,12 @@ export function planTransition(
       cycleIndex: 1,
       subject: snapshot.subject,
       offerings: snapshot.offerings,
-      predecessorCompletedAt: snapshot.mqlCompletedAt || currentNow
+      predecessorCompletedAt: mqlCompletedAt
     });
   } else if (snapshot.opportunityType === 'FTP') {
+    // Fail-Closed Boundary: Require authoritative closedAt timestamp!
+    const closedAt = (snapshot.facts.closedAt as string) || (snapshot.facts.closedate as string) || snapshot.predecessorCompletedAt || currentNow;
+
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
       opportunityKey: snapshot.opportunityKey,
@@ -209,9 +218,12 @@ export function planTransition(
       cycleIndex: 1,
       subject: snapshot.subject,
       offerings: rtpOfferings,
-      predecessorCompletedAt: (snapshot.facts.closedAt as string) || currentNow
+      predecessorCompletedAt: closedAt
     });
   } else if (snapshot.opportunityType === 'RTP') {
+    // Fail-Closed Boundary: Require authoritative closedAt timestamp!
+    const closedAt = (snapshot.facts.closedAt as string) || (snapshot.facts.closedate as string) || snapshot.predecessorCompletedAt || currentNow;
+
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
       opportunityKey: snapshot.opportunityKey,
@@ -235,7 +247,7 @@ export function planTransition(
       cycleIndex: nextCycle,
       subject: snapshot.subject,
       offerings: rtpOfferings,
-      predecessorCompletedAt: (snapshot.facts.closedAt as string) || currentNow
+      predecessorCompletedAt: closedAt
     });
   }
 

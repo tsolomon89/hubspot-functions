@@ -26,7 +26,7 @@ export class HubSpotSnapshotLoader {
   }
 
   /**
-   * Bounded association pagination helper.
+   * Bounded association pagination helper with strict fail-closed error handling.
    * Pages through all associations matching fromObjectType -> toObjectType.
    */
   public async getAllAssociations(
@@ -54,8 +54,12 @@ export class HubSpotSnapshotLoader {
         }
         after = res.paging?.next?.after;
       } catch (err: any) {
-        if (err?.statusCode !== 404 || err?.status !== 404) break;
-        throw err;
+        const is404 = err?.statusCode === 404 || err?.status === 404 || err?.code === 404;
+        if (is404 && pageCount === 1) {
+          return [];
+        }
+        // Defect 9: Fail closed on all API errors to prevent returning partial relationship snapshots!
+        throw new Error(`ASSOCIATION_PAGINATION_FAILED: Failed to load associations for ${fromObjectType}:${fromObjectId} -> ${toObjectType} on page ${pageCount}: ${err.message || err}`);
       }
     } while (after && pageCount < maxPages);
 
@@ -91,7 +95,7 @@ export class HubSpotSnapshotLoader {
       }
     }
 
-    // Gate 7: Ambiguous primary contact - DO NOT select first contact! Return null.
+    // Defect 4: Ambiguous primary contact - DO NOT select first contact! Return null.
     return { primaryContactId: null, isAmbiguous: true };
   }
 
@@ -199,14 +203,14 @@ export class HubSpotSnapshotLoader {
         }
       }
 
-      // Gate 6 Canonical Anchor Contract:
+      // Defect 4 Canonical Anchor Contract:
       // B2B relationship anchor = stable Company ID (`comp_123`).
       // B2C relationship anchor = stable Contact ID (`cnt_456`).
       if (relationshipType === 'b2b') {
         if (companyKey) {
           relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', companyKey);
         } else {
-          // B2B Contact without associated Company cannot create temporary Contact-anchored key that later changes!
+          // B2B Contact without associated Company MUST NOT receive Contact-anchored B2B key!
           facts.missingCompany = true;
           facts.manualReviewRequired = true;
           relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', recordRef.objectId);
@@ -260,7 +264,7 @@ export class HubSpotSnapshotLoader {
       if (isAmbiguous) {
         facts.ambiguousPrimaryContact = true;
         facts.manualReviewRequired = true;
-        primaryContactId = undefined; // Gate 7: Do NOT select contactKeys[0] when ambiguous!
+        primaryContactId = undefined; // Defect 4: Do NOT select contactKeys[0] when ambiguous!
       } else {
         primaryContactId = resolvedPrimary || (contactKeys.length === 1 ? contactKeys[0] : undefined);
       }
@@ -281,7 +285,7 @@ export class HubSpotSnapshotLoader {
         }
       }
 
-      // Gate 6 Canonical Anchor Contract: B2B Company anchor = Company ID (e.g. recordRef.objectId)
+      // Canonical Anchor Contract: B2B Company anchor = Company ID
       relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', recordRef.objectId);
       opportunityKey = `${relationshipKey}::LEAD::1`;
 

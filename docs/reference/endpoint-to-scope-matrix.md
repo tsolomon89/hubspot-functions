@@ -10,7 +10,7 @@ This document maps all HubSpot API endpoints invoked by the runtime and schema C
 | `/crm/v3/objects/companies` | GET, POST, PATCH | `SnapshotLoader`, `Adapter`, `SchemaTool` | `crm.objects.companies.read`, `crm.objects.companies.write` | Load company properties, update lifecycle stage |
 | `/crm/v3/objects/leads` | GET, POST, PATCH | `SnapshotLoader`, `Adapter`, `SchemaTool` | `crm.objects.leads.read`, `crm.objects.leads.write` | Manage qualification Leads |
 | `/crm/v3/objects/deals` | GET, POST, PATCH | `SnapshotLoader`, `Adapter`, `SchemaTool` | `crm.objects.deals.read`, `crm.objects.deals.write` | Manage transaction Deals |
-| `/crm/v3/objects/products` | GET, POST | `SnapshotLoader`, `Adapter` | `crm.objects.line_items.read`, `crm.objects.line_items.write` | Resolve Product catalog items |
+| `/crm/v3/objects/products` | GET, POST | `SnapshotLoader`, `Adapter` | `crm.objects.products.read`, `crm.objects.products.write` | Resolve Product catalog items |
 | `/crm/v3/objects/line_items` | GET, POST, PATCH | `SnapshotLoader`, `Adapter` | `crm.objects.line_items.read`, `crm.objects.line_items.write` | Create and verify transaction Line Items parented to Deals |
 | `/crm/v3/objects/tasks` | GET, POST | `Adapter` | `crm.objects.contacts.write` / `automation` | Create Manual Review Tasks |
 | `/crm/v3/objects/meetings` | GET | `SnapshotLoader` | `crm.objects.contacts.read` | Read completed meeting evidence |

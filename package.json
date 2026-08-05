@@ -20,7 +20,7 @@
     "yaml": "^2.3.4"
   },
   "devDependencies": {
-    "@hubspot/cli": "^5.1.0",
+    "@hubspot/cli": "5.1.0",
     "@types/node": "^22.0.0",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
