@@ -189,7 +189,16 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
       value: {
         basicApi: {
           create: vi.fn().mockImplementation(async (b) => ({ id: `li_${Date.now()}`, properties: b.properties })),
-          getById: vi.fn().mockImplementation(async (id) => ({ id, properties: { hs_product_id: 'prod_100', hs_sku: 'prod_software', name: 'prod_software' } }))
+          getById: vi.fn().mockImplementation(async (id) => ({
+            id,
+            properties: {
+              hs_product_id: 'prod_100',
+              hs_sku: 'prod_software',
+              name: 'prod_software',
+              quantity: '1',
+              price: '100'
+            }
+          }))
         }
       },
       configurable: true
@@ -279,6 +288,8 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
 
     // STEP 4: Close FTP Deal (Closed Won) & Enroll FTP Deal -> Creates RTP1 Deal
     crmStore.deals[ftpDeal.id].properties.dealstage = 'closedwon';
+    crmStore.deals[ftpDeal.id].properties.closedAt = '2026-08-05T12:00:00.000Z';
+    crmStore.deals[ftpDeal.id].properties.coa_predecessor_completed_at = '2026-08-05T12:00:00.000Z';
 
     const step4Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
@@ -312,6 +323,8 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
     // STEP 6: Close RTP1 Deal (Closed Won) & Enroll RTP1 Deal -> Creates RTP2 Deal
     if (rtp1Deal) {
       crmStore.deals[rtp1Deal.id].properties.dealstage = 'closedwon';
+      crmStore.deals[rtp1Deal.id].properties.closedAt = '2026-08-05T13:00:00.000Z';
+      crmStore.deals[rtp1Deal.id].properties.coa_predecessor_completed_at = '2026-08-05T13:00:00.000Z';
 
       const step6Result = await processHubSpotCustomCodeAction({
         origin: { portalId: 149041124 },

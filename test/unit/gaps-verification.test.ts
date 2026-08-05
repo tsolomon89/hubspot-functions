@@ -3,6 +3,7 @@ import { HubspotAdapter, HubSpotSnapshotLoader } from '../../packages/hubspot-ad
 import { OrganizationConfigResolver } from '../../packages/domain/config-resolver';
 import { deriveRelationshipKey } from '../../packages/domain/identity';
 import { evaluateOpportunity, planTransition, TransitionIntent, OpportunitySnapshot } from '../../packages/commercial-kernel';
+import { processHubSpotCustomCodeAction } from '../../src/custom-code-actions/reconcile-record';
 
 describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
   it('1. Should resolve Product and create two replay-safe Deal-parented Line Items with readback verification', async () => {
@@ -44,9 +45,29 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
 
     const getLineItemMock = vi.fn().mockImplementation(async (id) => {
       if (id.includes('prod_sw')) {
-        return { id, properties: { name: 'prod_sw', hs_product_id: 'product_101', hs_sku: 'prod_sw', quantity: '1' } };
+        return {
+          id,
+          properties: {
+            name: 'prod_sw',
+            hs_product_id: 'product_101',
+            hs_sku: 'prod_sw',
+            coa_line_item_key: 'rel_org_global_corp_b2b_comp_acme::FTP::1::prod_sw',
+            quantity: '1',
+            price: '500'
+          }
+        };
       }
-      return { id, properties: { name: 'prod_hw', hs_product_id: 'product_102', hs_sku: 'prod_hw', quantity: '1' } };
+      return {
+        id,
+        properties: {
+          name: 'prod_hw',
+          hs_product_id: 'product_102',
+          hs_sku: 'prod_hw',
+          coa_line_item_key: 'rel_org_global_corp_b2b_comp_acme::FTP::1::prod_hw',
+          quantity: '1',
+          price: '1500'
+        }
+      };
     });
 
     const assocMock = vi.fn().mockImplementation(async (fromType, id, toType) => {
@@ -103,7 +124,8 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
       properties: {
         hs_task_subject: 'Manual Review Required: Needs review',
         hs_task_body: `Opportunity key rel_acme::LEAD::1 requires manual review. ${taskMarker}`,
-        hs_task_status: 'NOT_STARTED'
+        hs_task_status: 'NOT_STARTED',
+        hs_timestamp: new Date().toISOString()
       }
     });
 
@@ -132,15 +154,17 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
 
   it('3. Should isolate parallel B2B and B2C relationships on the same Contact via deriveRelationshipKey', () => {
     const contactKey = 'cnt_user_parallel';
-    const b2bRelKey = deriveRelationshipKey('org_global_corp', 'b2b', contactKey);
+    const companyKey = 'comp_user_b2b';
+
+    const b2bRelKey = deriveRelationshipKey('org_global_corp', 'b2b', companyKey);
     const b2cRelKey = deriveRelationshipKey('org_global_corp', 'b2c', contactKey);
 
-    expect(b2bRelKey).toBe('rel_org_global_corp_b2b_cnt_user_parallel');
+    expect(b2bRelKey).toBe('rel_org_global_corp_b2b_comp_user_b2b');
     expect(b2cRelKey).toBe('rel_org_global_corp_b2c_cnt_user_parallel');
     expect(b2bRelKey).not.toBe(b2cRelKey);
   });
 
-  it('4. Should detect ambiguous primary contacts when >1 contacts exist without a primary label', async () => {
+  it('4. Should detect ambiguous primary contacts when >1 contacts exist without a primary label and return MANUAL_REVIEW', async () => {
     const loader = new HubSpotSnapshotLoader('fake-token');
 
     const multiAssocs = [
@@ -158,9 +182,9 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
 
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_global_corp',
-      relationshipKey: 'rel_org_global_corp_b2b_cnt_phone_only',
+      relationshipKey: 'rel_org_global_corp_b2b_comp_phone_only',
       relationshipType: 'b2b',
-      opportunityKey: 'rel_org_global_corp_b2b_cnt_phone_only::LEAD::1',
+      opportunityKey: 'rel_org_global_corp_b2b_comp_phone_only::LEAD::1',
       opportunityType: 'MQL',
       opportunityState: 'OPEN',
       cycleIndex: 1,

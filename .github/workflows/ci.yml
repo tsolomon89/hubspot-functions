@@ -35,8 +35,5 @@ jobs:
       - name: Run Unit & Stateless Contract Tests
         run: npm test
 
-      - name: Setup HubSpot CLI
-        run: npm install -g @hubspot/cli@^6.0.0
-
       - name: Validate HubSpot Project Structure
         run: npx hs project validate

@@ -24,7 +24,8 @@ describe('Schema Tool Plan & Apply Determinism', () => {
         contacts: manifest.properties.contacts,
         companies: manifest.properties.companies,
         leads: manifest.properties.leads,
-        deals: manifest.properties.deals
+        deals: manifest.properties.deals,
+        line_items: manifest.properties.line_items
       },
       pipelines: {
         leads: (manifest.pipelines.leads || []).map((p: any) => ({

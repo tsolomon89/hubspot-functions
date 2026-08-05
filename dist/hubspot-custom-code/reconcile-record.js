@@ -1039,9 +1039,16 @@ var HubspotAdapter = class {
               "coa_config_version",
               "coa_last_evaluated_at",
               "coa_unsatisfied_goal_keys",
-              "coa_mql_completed_at"
+              "coa_mql_completed_at",
+              "coa_opportunity_type",
+              "coa_offering_keys"
             ]);
-            const verified = readback?.properties?.coa_qualification_state === intent.qualificationState && readback?.properties?.hs_pipeline_stage === targetStage && Boolean(readback?.properties?.coa_last_evaluated_at) && readback?.properties?.coa_config_version === (config?.configVersion || "1.0.0");
+            const readState = readback?.properties?.coa_qualification_state;
+            const readStage = readback?.properties?.hs_pipeline_stage;
+            const readUnsatisfied = readback?.properties?.coa_unsatisfied_goal_keys;
+            const readMqlTime = readback?.properties?.coa_mql_completed_at;
+            const readOppType = readback?.properties?.coa_opportunity_type;
+            const verified = readState === intent.qualificationState && readStage === targetStage && readUnsatisfied === unsatisfiedJson && Boolean(readback?.properties?.coa_last_evaluated_at) && readback?.properties?.coa_config_version === (config?.configVersion || "1.0.0") && (!intent.details?.targetOpportunityType || readOppType === intent.details.targetOpportunityType) && (!intent.details?.mqlCompletedAt || parseHubSpotTimestamp(readMqlTime) === parseHubSpotTimestamp(intent.details.mqlCompletedAt));
             receipts.push({
               intentKind: "UPDATE_OPPORTUNITY",
               objectType: "lead",
@@ -1065,9 +1072,11 @@ var HubspotAdapter = class {
               "coa_qualification_state",
               "dealstage",
               "coa_config_version",
-              "coa_last_evaluated_at"
+              "coa_last_evaluated_at",
+              "coa_unsatisfied_goal_keys",
+              "coa_offering_keys"
             ]);
-            const verified = readback?.properties?.coa_qualification_state === intent.qualificationState && readback?.properties?.dealstage === targetStage && Boolean(readback?.properties?.coa_last_evaluated_at) && readback?.properties?.coa_config_version === (config?.configVersion || "1.0.0");
+            const verified = readback?.properties?.coa_qualification_state === intent.qualificationState && readback?.properties?.dealstage === targetStage && readback?.properties?.coa_unsatisfied_goal_keys === unsatisfiedJson && Boolean(readback?.properties?.coa_last_evaluated_at) && readback?.properties?.coa_config_version === (config?.configVersion || "1.0.0");
             receipts.push({
               intentKind: "UPDATE_OPPORTUNITY",
               objectType: "deal",
@@ -1088,6 +1097,9 @@ var HubspotAdapter = class {
         appliedIntents++;
       } else if (intent.kind === "CREATE_SUCCESSOR") {
         logger.info("Applying CREATE_SUCCESSOR intent", { predecessor: intent.predecessorKey, successor: intent.successorKey, type: intent.successorType });
+        if (!intent.predecessorCompletedAt) {
+          throw new Error(`MISSING_PREDECESSOR_COMPLETION_TIMESTAMP: Predecessor completion timestamp is required to create successor Deal '${intent.successorKey}'`);
+        }
         if (config?.featureFlags?.dryRunTransactions) {
           logger.info("dryRunTransactions feature flag enabled; skipping real transaction creation", { successorKey: intent.successorKey });
           receipts.push({
@@ -1137,7 +1149,7 @@ var HubspotAdapter = class {
           }
           const relKey = intent.successorKey.split("::")[0];
           const pipelineId = config?.hubspotPipelines?.dealPipelineId || (config?.relationshipType === "b2c" ? "b2c_transaction_deal_pipeline" : "b2b_transaction_deal_pipeline");
-          const predecessorCompletedAt = intent.predecessorCompletedAt || (/* @__PURE__ */ new Date()).toISOString();
+          const predecessorCompletedAt = intent.predecessorCompletedAt;
           const offeringKeysStr = (intent.offerings || []).map((o) => o.offeringKey).join(",");
           let targetDealId = "";
           if (existingDeals.results.length === 0) {
@@ -1193,7 +1205,10 @@ var HubspotAdapter = class {
               "coa_config_version",
               "coa_qualification_state"
             ]);
-            const propVerified = readback?.properties?.dealname === `Transaction Deal - ${intent.successorKey}` && readback?.properties?.coa_opportunity_key === intent.successorKey && readback?.properties?.coa_opportunity_type === intent.successorType && readback?.properties?.coa_cycle_index === String(intent.cycleIndex) && readback?.properties?.pipeline === pipelineId && readback?.properties?.dealstage === "open" && readback?.properties?.coa_relationship_key === relKey && readback?.properties?.coa_relationship_type === (config?.relationshipType || "b2b") && readback?.properties?.coa_predecessor_opportunity_key === intent.predecessorKey && Boolean(parseHubSpotTimestamp(readback?.properties?.coa_predecessor_completed_at)) && readback?.properties?.coa_config_version === (config?.configVersion || "1.0.0") && readback?.properties?.coa_qualification_state === "PENDING" && readback?.properties?.coa_managed === "true";
+            const readbackPredTime = parseHubSpotTimestamp(readback?.properties?.coa_predecessor_completed_at);
+            const targetPredTime = parseHubSpotTimestamp(predecessorCompletedAt);
+            const predTimeExactMatch = Boolean(readbackPredTime && targetPredTime && new Date(readbackPredTime).getTime() === new Date(targetPredTime).getTime());
+            const propVerified = readback?.properties?.dealname === `Transaction Deal - ${intent.successorKey}` && readback?.properties?.coa_opportunity_key === intent.successorKey && readback?.properties?.coa_opportunity_type === intent.successorType && readback?.properties?.coa_cycle_index === String(intent.cycleIndex) && readback?.properties?.pipeline === pipelineId && readback?.properties?.dealstage === "open" && readback?.properties?.coa_relationship_key === relKey && readback?.properties?.coa_relationship_type === (config?.relationshipType || "b2b") && readback?.properties?.coa_predecessor_opportunity_key === intent.predecessorKey && predTimeExactMatch && readback?.properties?.coa_config_version === (config?.configVersion || "1.0.0") && readback?.properties?.coa_qualification_state === "PENDING" && readback?.properties?.coa_managed === "true";
             let assocVerified = true;
             if (expectedContactId) {
               const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage("deal", Number(newDeal.id) || newDeal.id, "contact");
@@ -1223,7 +1238,10 @@ var HubspotAdapter = class {
             const existingDeal = existingDeals.results[0];
             targetDealId = existingDeal.id;
             const props = existingDeal.properties || {};
-            const propVerified = (props.dealname === `Transaction Deal - ${intent.successorKey}` || Boolean(props.dealname)) && props.coa_opportunity_key === intent.successorKey && props.coa_opportunity_type === intent.successorType && props.coa_cycle_index === String(intent.cycleIndex) && props.pipeline === pipelineId && props.coa_relationship_key === relKey && props.coa_relationship_type === (config?.relationshipType || "b2b") && props.coa_predecessor_opportunity_key === intent.predecessorKey && Boolean(parseHubSpotTimestamp(props.coa_predecessor_completed_at)) && props.coa_config_version === (config?.configVersion || "1.0.0") && props.coa_managed === "true";
+            const readbackPredTime = parseHubSpotTimestamp(props.coa_predecessor_completed_at);
+            const targetPredTime = parseHubSpotTimestamp(predecessorCompletedAt);
+            const predTimeExactMatch = Boolean(readbackPredTime && targetPredTime && new Date(readbackPredTime).getTime() === new Date(targetPredTime).getTime());
+            const propVerified = (props.dealname === `Transaction Deal - ${intent.successorKey}` || Boolean(props.dealname)) && props.coa_opportunity_key === intent.successorKey && props.coa_opportunity_type === intent.successorType && props.coa_cycle_index === String(intent.cycleIndex) && props.pipeline === pipelineId && props.coa_relationship_key === relKey && props.coa_relationship_type === (config?.relationshipType || "b2b") && props.coa_predecessor_opportunity_key === intent.predecessorKey && predTimeExactMatch && props.coa_config_version === (config?.configVersion || "1.0.0") && props.coa_managed === "true";
             let assocVerified = true;
             if (expectedContactId) {
               const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage("deal", Number(existingDeal.id) || existingDeal.id, "contact");
@@ -1247,13 +1265,14 @@ var HubspotAdapter = class {
             const productKeyProp = config?.offeringPolicy?.productOfferingKeyProperty || "hs_sku";
             for (const offering of intent.offerings) {
               const product = await this.resolveProductForOfferingKey(offering.offeringKey, productKeyProp);
+              const lineItemKey = `${intent.successorKey}::${offering.offeringKey}`;
               let existingLineItemId = void 0;
               try {
                 const existingLIAssocs = await this.client.crm.associations.v4.basicApi.getPage("deal", Number(targetDealId) || targetDealId, "line_item");
                 for (const assoc of existingLIAssocs.results || []) {
-                  const liRecord = await this.client.crm.lineItems.basicApi.getById(String(assoc.toObjectId), ["name", "hs_sku", "hs_product_id"]);
+                  const liRecord = await this.client.crm.lineItems.basicApi.getById(String(assoc.toObjectId), ["name", "hs_sku", "hs_product_id", "coa_line_item_key", "quantity", "price"]);
                   const liProps = liRecord.properties || {};
-                  if (liProps.hs_sku === offering.offeringKey || liProps.name === offering.offeringKey || liProps.hs_product_id === product.id) {
+                  if (liProps.coa_line_item_key === lineItemKey || liProps.hs_sku === offering.offeringKey || liProps.name === offering.offeringKey || liProps.hs_product_id === product.id) {
                     existingLineItemId = liRecord.id;
                     break;
                   }
@@ -1261,13 +1280,24 @@ var HubspotAdapter = class {
               } catch (e) {
                 if (e?.statusCode !== 404 && e?.status !== 404) throw e;
               }
+              const expectedQuantity = String(offering.quantity || 1);
+              const expectedPrice = String(offering.unitPrice || product.price || 0);
               if (existingLineItemId) {
+                const liReadback = await this.client.crm.lineItems.basicApi.getById(existingLineItemId, [
+                  "name",
+                  "hs_product_id",
+                  "hs_sku",
+                  "quantity",
+                  "price",
+                  "coa_line_item_key"
+                ]);
+                const liVerified = (liReadback?.properties?.coa_line_item_key === lineItemKey || Boolean(liReadback?.properties?.hs_product_id)) && liReadback?.properties?.hs_product_id === product.id && String(liReadback?.properties?.quantity) === expectedQuantity;
                 receipts.push({
                   intentKind: "CREATE_LINE_ITEM",
                   objectType: "line_item",
                   objectId: existingLineItemId,
                   operation: "NOOP",
-                  verified: true
+                  verified: liVerified
                 });
               } else {
                 const newLineItem = await this.client.crm.lineItems.basicApi.create({
@@ -1275,8 +1305,9 @@ var HubspotAdapter = class {
                     name: offering.offeringKey,
                     hs_product_id: product.id,
                     hs_sku: offering.offeringKey,
-                    quantity: String(offering.quantity || 1),
-                    price: String(offering.unitPrice || product.price || 0)
+                    coa_line_item_key: lineItemKey,
+                    quantity: expectedQuantity,
+                    price: expectedPrice
                   },
                   associations: [{
                     to: { id: targetDealId },
@@ -1288,9 +1319,11 @@ var HubspotAdapter = class {
                   "name",
                   "hs_product_id",
                   "hs_sku",
-                  "quantity"
+                  "quantity",
+                  "price",
+                  "coa_line_item_key"
                 ]);
-                const liVerified = liReadback?.properties?.hs_product_id === product.id && (liReadback?.properties?.hs_sku === offering.offeringKey || liReadback?.properties?.name === offering.offeringKey);
+                const liVerified = (liReadback?.properties?.coa_line_item_key === lineItemKey || liReadback?.properties?.name === offering.offeringKey) && liReadback?.properties?.hs_product_id === product.id && String(liReadback?.properties?.quantity) === expectedQuantity && String(liReadback?.properties?.price) === expectedPrice;
                 receipts.push({
                   intentKind: "CREATE_LINE_ITEM",
                   objectType: "line_item",
@@ -1308,6 +1341,7 @@ var HubspotAdapter = class {
         const subjectId = intent.subject.key;
         const assocTypeId = intent.subject.kind === "CONTACT" ? 204 : 192;
         const taskMarker = `[COA_OPPORTUNITY_KEY:${intent.opportunityKey}]`;
+        const nowIso = (/* @__PURE__ */ new Date()).toISOString();
         let existingTaskId = void 0;
         try {
           const taskAssocs = await this.client.crm.associations.v4.basicApi.getPage(
@@ -1316,7 +1350,7 @@ var HubspotAdapter = class {
             "task"
           );
           for (const assoc of taskAssocs.results || []) {
-            const taskRecord = await tasksApi.basicApi.getById(String(assoc.toObjectId), ["hs_task_subject", "hs_task_body", "hs_task_status"]);
+            const taskRecord = await tasksApi.basicApi.getById(String(assoc.toObjectId), ["hs_task_subject", "hs_task_body", "hs_task_status", "hs_timestamp"]);
             const body = taskRecord.properties?.hs_task_body || "";
             const subjectStr = taskRecord.properties?.hs_task_subject || "";
             const statusStr = taskRecord.properties?.hs_task_status || "";
@@ -1346,12 +1380,13 @@ var HubspotAdapter = class {
               hs_task_subject: `Manual Review Required: ${intent.reason}`,
               hs_task_status: "NOT_STARTED",
               hs_task_priority: "HIGH",
-              hs_task_body: `Opportunity key ${intent.opportunityKey} requires manual review. Reason: ${intent.reason} ${taskMarker}`
+              hs_task_body: `Opportunity key ${intent.opportunityKey} requires manual review. Reason: ${intent.reason} ${taskMarker}`,
+              hs_timestamp: nowIso
             },
             associations
           });
-          const readback = await tasksApi.basicApi.getById(taskRes.id, ["hs_task_subject", "hs_task_status", "hs_task_body"]);
-          const verified = Boolean(readback?.properties?.hs_task_subject?.startsWith("Manual Review Required")) && Boolean(readback?.properties?.hs_task_body?.includes(taskMarker));
+          const readback = await tasksApi.basicApi.getById(taskRes.id, ["hs_task_subject", "hs_task_status", "hs_task_body", "hs_timestamp"]);
+          const verified = Boolean(readback?.properties?.hs_task_subject?.startsWith("Manual Review Required")) && Boolean(readback?.properties?.hs_task_body?.includes(taskMarker)) && Boolean(readback?.properties?.hs_timestamp);
           receipts.push({
             intentKind: "CREATE_MANUAL_REVIEW",
             objectType: "task",
@@ -1423,7 +1458,7 @@ var HubSpotSnapshotLoader = class {
         }
         after = res.paging?.next?.after;
       } catch (err) {
-        if (err?.statusCode === 404 || err?.status === 404) break;
+        if (err?.statusCode !== 404 || err?.status !== 404) break;
         throw err;
       }
     } while (after && pageCount < maxPages);
@@ -1433,7 +1468,7 @@ var HubSpotSnapshotLoader = class {
    * Explicit primary contact resolution from list of associated contact IDs.
    * If exactly 1 contact -> returns that contact ID.
    * If >1 contacts and 1 is designated primary -> returns primary contact ID.
-   * If >1 contacts without a clear primary -> returns null (ambiguous).
+   * If >1 contacts without a clear primary -> returns null and marks isAmbiguous = true.
    */
   async resolvePrimaryContactId(fromObjectType, fromObjectId, associationResults) {
     if (!associationResults || associationResults.length === 0) {
@@ -1452,6 +1487,27 @@ var HubSpotSnapshotLoader = class {
       }
     }
     return { primaryContactId: null, isAmbiguous: true };
+  }
+  /**
+   * Explicit primary company resolution from list of associated company IDs for Contact.
+   */
+  async resolvePrimaryCompanyId(contactId, companyAssocs) {
+    if (!companyAssocs || companyAssocs.length === 0) {
+      return { primaryCompanyId: null, isAmbiguous: false };
+    }
+    if (companyAssocs.length === 1) {
+      return { primaryCompanyId: String(companyAssocs[0].toObjectId), isAmbiguous: false };
+    }
+    for (const assoc of companyAssocs) {
+      const types = assoc.associationTypes || [];
+      for (const t of types) {
+        const label = String(t.label || t.type || "").toLowerCase();
+        if (label.includes("primary") || t.associationTypeId === 1) {
+          return { primaryCompanyId: String(assoc.toObjectId), isAmbiguous: false };
+        }
+      }
+    }
+    return { primaryCompanyId: null, isAmbiguous: true };
   }
   async loadSnapshotFromRecord(recordRef, organizationKey = "org_global_corp", relationshipType = "b2b") {
     return this.loadPureSnapshotFromHubSpot(recordRef, organizationKey, relationshipType);
@@ -1494,8 +1550,13 @@ var HubSpotSnapshotLoader = class {
       const cProps = contact.properties || {};
       let companySuppressed = false;
       const companyAssocs = await this.getAllAssociations("contact", recordRef.objectId, "company");
-      if (companyAssocs.length > 0) {
-        companyKey = String(companyAssocs[0].toObjectId);
+      const { primaryCompanyId, isAmbiguous: isCompanyAmbiguous } = await this.resolvePrimaryCompanyId(recordRef.objectId, companyAssocs);
+      if (isCompanyAmbiguous) {
+        facts.ambiguousPrimaryCompany = true;
+        facts.manualReviewRequired = true;
+      }
+      companyKey = primaryCompanyId || void 0;
+      if (companyKey) {
         try {
           const compRecord = await this.client.crm.companies.basicApi.getById(companyKey, [
             "coa_relationship_key",
@@ -1506,11 +1567,21 @@ var HubSpotSnapshotLoader = class {
           if (err?.statusCode !== 404 && err?.status !== 404) throw err;
         }
       }
-      const anchor = companyKey ? companyKey : cProps.email ? cProps.email.trim().toLowerCase() : cProps.phone ? sanitizeKey(cProps.phone) : recordRef.objectId;
-      relationshipKey = deriveRelationshipKey(organizationKey, relationshipType, anchor);
+      if (relationshipType === "b2b") {
+        if (companyKey) {
+          relationshipKey = deriveRelationshipKey(organizationKey, "b2b", companyKey);
+        } else {
+          facts.missingCompany = true;
+          facts.manualReviewRequired = true;
+          relationshipKey = deriveRelationshipKey(organizationKey, "b2b", recordRef.objectId);
+        }
+      } else {
+        relationshipKey = deriveRelationshipKey(organizationKey, "b2c", recordRef.objectId);
+      }
       opportunityKey = `${relationshipKey}::LEAD::1`;
       const contactSuppressed = cProps.coa_automation_suppressed === "true" || cProps.coa_automation_suppressed === "1";
       facts = {
+        ...facts,
         email: cProps.email || void 0,
         contactEmail: cProps.email || void 0,
         phone: cProps.phone || void 0,
@@ -1545,8 +1616,10 @@ var HubSpotSnapshotLoader = class {
       if (isAmbiguous) {
         facts.ambiguousPrimaryContact = true;
         facts.manualReviewRequired = true;
+        primaryContactId = void 0;
+      } else {
+        primaryContactId = resolvedPrimary || (contactKeys.length === 1 ? contactKeys[0] : void 0);
       }
-      primaryContactId = resolvedPrimary || (contactKeys.length > 0 ? contactKeys[0] : void 0);
       if (primaryContactId) {
         try {
           const primaryContact = await this.client.crm.contacts.basicApi.getById(primaryContactId, [
@@ -1562,11 +1635,11 @@ var HubSpotSnapshotLoader = class {
           if (err?.statusCode !== 404 && err?.status !== 404) throw err;
         }
       }
-      const anchor = compProps.domain ? compProps.domain.trim().toLowerCase() : compProps.name ? sanitizeKey(compProps.name) : recordRef.objectId;
-      relationshipKey = deriveRelationshipKey(organizationKey, relationshipType, anchor);
+      relationshipKey = deriveRelationshipKey(organizationKey, "b2b", recordRef.objectId);
       opportunityKey = `${relationshipKey}::LEAD::1`;
       const compSuppressed = compProps.coa_automation_suppressed === "true" || compProps.coa_automation_suppressed === "1";
       facts = {
+        ...facts,
         domain: compProps.domain || void 0,
         companyName: compProps.name || void 0,
         email: contactEmail,
@@ -1597,8 +1670,13 @@ var HubSpotSnapshotLoader = class {
       if (cAssocs.length > 0) {
         const { primaryContactId: resContact, isAmbiguous } = await this.resolvePrimaryContactId("lead", recordRef.objectId, cAssocs);
         contactKeys = cAssocs.map((r) => String(r.toObjectId));
-        primaryContactId = resContact || contactKeys[0];
-        if (isAmbiguous) facts.ambiguousPrimaryContact = true;
+        if (isAmbiguous) {
+          facts.ambiguousPrimaryContact = true;
+          facts.manualReviewRequired = true;
+          primaryContactId = void 0;
+        } else {
+          primaryContactId = resContact || (contactKeys.length === 1 ? contactKeys[0] : void 0);
+        }
       }
       const compAssocs = await this.getAllAssociations("lead", recordRef.objectId, "company");
       if (compAssocs.length > 0) {
@@ -1639,6 +1717,7 @@ var HubSpotSnapshotLoader = class {
         "amount",
         "dealstage",
         "pipeline",
+        "closedate",
         "coa_opportunity_key",
         "coa_relationship_key",
         "coa_relationship_type",
@@ -1656,8 +1735,13 @@ var HubSpotSnapshotLoader = class {
       if (cAssocs.length > 0) {
         const { primaryContactId: resContact, isAmbiguous } = await this.resolvePrimaryContactId("deal", recordRef.objectId, cAssocs);
         contactKeys = cAssocs.map((r) => String(r.toObjectId));
-        primaryContactId = resContact || contactKeys[0];
-        if (isAmbiguous) facts.ambiguousPrimaryContact = true;
+        if (isAmbiguous) {
+          facts.ambiguousPrimaryContact = true;
+          facts.manualReviewRequired = true;
+          primaryContactId = void 0;
+        } else {
+          primaryContactId = resContact || (contactKeys.length === 1 ? contactKeys[0] : void 0);
+        }
       }
       const compAssocs = await this.getAllAssociations("deal", recordRef.objectId, "company");
       if (compAssocs.length > 0) {
@@ -1676,9 +1760,11 @@ var HubSpotSnapshotLoader = class {
       cycleIndex = Number(dProps.coa_cycle_index) || 1;
       opportunityKey = dProps.coa_opportunity_key || `${relationshipKey}::${opportunityType}::${cycleIndex}`;
       const stage = (dProps.dealstage || "open").toLowerCase();
+      openedAt = parseHubSpotTimestamp(dProps.createdate) || openedAt;
       if (stage === "closedwon") {
         opportunityState = "WON";
         facts.transactionCompleted = true;
+        facts.closedAt = parseHubSpotTimestamp(dProps.closedate || dProps.closedAt || dProps.coa_predecessor_completed_at) || openedAt;
       } else if (stage === "closedlost") {
         opportunityState = "LOST";
       } else {
@@ -1694,7 +1780,8 @@ var HubSpotSnapshotLoader = class {
               "quantity",
               "price",
               "hs_product_id",
-              "hs_sku"
+              "hs_sku",
+              "coa_line_item_key"
             ]);
             const liProps = li.properties || {};
             const key = liProps.hs_sku || liProps.name;
@@ -1718,7 +1805,6 @@ var HubSpotSnapshotLoader = class {
         facts.offeringKeys = rawKeys;
         offerings = rawKeys.map((k) => ({ offeringKey: k, quantity: 1 }));
       }
-      openedAt = parseHubSpotTimestamp(dProps.createdate) || openedAt;
       predecessorCompletedAt = parseHubSpotTimestamp(dProps.coa_predecessor_completed_at) || void 0;
       mqlCompletedAt = parseHubSpotTimestamp(dProps.coa_mql_completed_at) || void 0;
     } else {

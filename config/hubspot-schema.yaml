@@ -4,7 +4,7 @@ project: "hubspot-functions"
 propertyGroups:
   - name: "commercial_operations_automation"
     label: "Commercial Operations Automation"
-    objectTypes: ["companies", "deals", "contacts", "leads"]
+    objectTypes: ["companies", "deals", "contacts", "leads", "line_items"]
 
 properties:
   contacts:
@@ -338,6 +338,15 @@ properties:
       fieldType: "booleancheckbox"
       groupName: "commercial_operations_automation"
       description: "Master kill switch for Commercial Operations Automation."
+
+  line_items:
+    - name: "coa_line_item_key"
+      label: "Line Item Key"
+      type: "string"
+      fieldType: "text"
+      groupName: "commercial_operations_automation"
+      hasUniqueValue: true
+      description: "Deterministic identity key for parented Deal Line Item."
 
 pipelines:
   leads:

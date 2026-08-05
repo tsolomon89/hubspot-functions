@@ -2,10 +2,8 @@ import { Client } from '@hubspot/api-client';
 import { 
   TransitionIntent, 
   QualificationConfig, 
-  CommercialSubjectRef,
-  OfferingRef
+  CommercialSubjectRef
 } from '../commercial-kernel';
-import { deriveRelationshipKey } from '../domain/identity';
 import { logger } from '../observability';
 
 export function parseHubSpotTimestamp(val?: string | number | null): string | null {
@@ -115,7 +113,7 @@ export class HubspotAdapter {
           properties: { coa_offering_keys: offeringKeys.trim() }
         });
         
-        // Post-write readback verification for existing Lead offering update!
+        // Exact Readback verification for existing Lead offering update!
         const readbackUpdate = await this.leadsApi.basicApi.getById(existingLead.id, ['coa_offering_keys']);
         if (readbackUpdate?.properties?.coa_offering_keys !== offeringKeys.trim()) {
           throw new Error(`ACTION_UNVERIFIED: Existing Lead ${existingLead.id} offering keys update readback failed`);
@@ -246,7 +244,7 @@ export class HubspotAdapter {
       });
 
       if (!searchRes.results || searchRes.results.length === 0) {
-        // Fallback search by Product name if custom property SKU search has no match
+        // Fallback search by Product name if SKU search yields 0
         const nameSearch = await this.client.crm.products.searchApi.doSearch({
           filterGroups: [{ filters: [{ propertyName: 'name', operator: 'EQ' as any, value: offeringKey }] }],
           sorts: [], properties: ['name', 'price', offeringKeyProperty], limit: 2, after: 0
@@ -387,18 +385,31 @@ export class HubspotAdapter {
 
             await this.leadsApi.basicApi.update(targetId, { properties: updateProps });
             
+            // Exact Field-Level Readback Verification for every written property
             const readback = await this.leadsApi.basicApi.getById(targetId, [
               'coa_qualification_state', 
               'hs_pipeline_stage',
               'coa_config_version',
               'coa_last_evaluated_at',
               'coa_unsatisfied_goal_keys',
-              'coa_mql_completed_at'
+              'coa_mql_completed_at',
+              'coa_opportunity_type',
+              'coa_offering_keys'
             ]);
-            const verified = readback?.properties?.coa_qualification_state === intent.qualificationState &&
-                             readback?.properties?.hs_pipeline_stage === targetStage &&
+
+            const readState = readback?.properties?.coa_qualification_state;
+            const readStage = readback?.properties?.hs_pipeline_stage;
+            const readUnsatisfied = readback?.properties?.coa_unsatisfied_goal_keys;
+            const readMqlTime = readback?.properties?.coa_mql_completed_at;
+            const readOppType = readback?.properties?.coa_opportunity_type;
+
+            const verified = readState === intent.qualificationState &&
+                             readStage === targetStage &&
+                             readUnsatisfied === unsatisfiedJson &&
                              Boolean(readback?.properties?.coa_last_evaluated_at) &&
-                             readback?.properties?.coa_config_version === (config?.configVersion || '1.0.0');
+                             readback?.properties?.coa_config_version === (config?.configVersion || '1.0.0') &&
+                             (!intent.details?.targetOpportunityType || readOppType === intent.details.targetOpportunityType) &&
+                             (!intent.details?.mqlCompletedAt || parseHubSpotTimestamp(readMqlTime) === parseHubSpotTimestamp(intent.details.mqlCompletedAt));
 
             receipts.push({
               intentKind: 'UPDATE_OPPORTUNITY',
@@ -427,10 +438,14 @@ export class HubspotAdapter {
               'coa_qualification_state', 
               'dealstage',
               'coa_config_version',
-              'coa_last_evaluated_at'
+              'coa_last_evaluated_at',
+              'coa_unsatisfied_goal_keys',
+              'coa_offering_keys'
             ]);
+
             const verified = readback?.properties?.coa_qualification_state === intent.qualificationState &&
                              readback?.properties?.dealstage === targetStage &&
+                             readback?.properties?.coa_unsatisfied_goal_keys === unsatisfiedJson &&
                              Boolean(readback?.properties?.coa_last_evaluated_at) &&
                              readback?.properties?.coa_config_version === (config?.configVersion || '1.0.0');
 
@@ -454,6 +469,11 @@ export class HubspotAdapter {
         appliedIntents++;
       } else if (intent.kind === 'CREATE_SUCCESSOR') {
         logger.info('Applying CREATE_SUCCESSOR intent', { predecessor: intent.predecessorKey, successor: intent.successorKey, type: intent.successorType });
+
+        // Gate 8: Fail closed if planner did not supply required predecessor completion boundary!
+        if (!intent.predecessorCompletedAt) {
+          throw new Error(`MISSING_PREDECESSOR_COMPLETION_TIMESTAMP: Predecessor completion timestamp is required to create successor Deal '${intent.successorKey}'`);
+        }
 
         if (config?.featureFlags?.dryRunTransactions) {
           logger.info('dryRunTransactions feature flag enabled; skipping real transaction creation', { successorKey: intent.successorKey });
@@ -506,8 +526,7 @@ export class HubspotAdapter {
 
           const relKey = intent.successorKey.split('::')[0];
           const pipelineId = config?.hubspotPipelines?.dealPipelineId || (config?.relationshipType === 'b2c' ? 'b2c_transaction_deal_pipeline' : 'b2b_transaction_deal_pipeline');
-          // Gap 10: Use authoritative predecessor completion timestamp passed by planner!
-          const predecessorCompletedAt = intent.predecessorCompletedAt || new Date().toISOString();
+          const predecessorCompletedAt = intent.predecessorCompletedAt;
           const offeringKeysStr = (intent.offerings || []).map(o => o.offeringKey).join(',');
 
           let targetDealId = '';
@@ -555,7 +574,7 @@ export class HubspotAdapter {
             });
             targetDealId = newDeal.id;
 
-            // Comprehensive Readback verification including predecessorCompletedAt, dealname & qualification_state!
+            // Comprehensive Readback verification including exact predecessorCompletedAt timestamp match!
             const readback = await this.client.crm.deals.basicApi.getById(newDeal.id, [
               'dealname',
               'pipeline',
@@ -571,6 +590,11 @@ export class HubspotAdapter {
               'coa_config_version',
               'coa_qualification_state'
             ]);
+
+            const readbackPredTime = parseHubSpotTimestamp(readback?.properties?.coa_predecessor_completed_at);
+            const targetPredTime = parseHubSpotTimestamp(predecessorCompletedAt);
+            const predTimeExactMatch = Boolean(readbackPredTime && targetPredTime && new Date(readbackPredTime).getTime() === new Date(targetPredTime).getTime());
+
             const propVerified = readback?.properties?.dealname === `Transaction Deal - ${intent.successorKey}` &&
                                  readback?.properties?.coa_opportunity_key === intent.successorKey &&
                                  readback?.properties?.coa_opportunity_type === intent.successorType &&
@@ -580,7 +604,7 @@ export class HubspotAdapter {
                                  readback?.properties?.coa_relationship_key === relKey &&
                                  readback?.properties?.coa_relationship_type === (config?.relationshipType || 'b2b') &&
                                  readback?.properties?.coa_predecessor_opportunity_key === intent.predecessorKey &&
-                                 Boolean(parseHubSpotTimestamp(readback?.properties?.coa_predecessor_completed_at)) &&
+                                 predTimeExactMatch &&
                                  readback?.properties?.coa_config_version === (config?.configVersion || '1.0.0') &&
                                  readback?.properties?.coa_qualification_state === 'PENDING' &&
                                  readback?.properties?.coa_managed === 'true';
@@ -617,6 +641,10 @@ export class HubspotAdapter {
             targetDealId = existingDeal.id;
             const props = existingDeal.properties || {};
 
+            const readbackPredTime = parseHubSpotTimestamp(props.coa_predecessor_completed_at);
+            const targetPredTime = parseHubSpotTimestamp(predecessorCompletedAt);
+            const predTimeExactMatch = Boolean(readbackPredTime && targetPredTime && new Date(readbackPredTime).getTime() === new Date(targetPredTime).getTime());
+
             const propVerified = (props.dealname === `Transaction Deal - ${intent.successorKey}` || Boolean(props.dealname)) &&
                                  props.coa_opportunity_key === intent.successorKey &&
                                  props.coa_opportunity_type === intent.successorType &&
@@ -625,7 +653,7 @@ export class HubspotAdapter {
                                  props.coa_relationship_key === relKey &&
                                  props.coa_relationship_type === (config?.relationshipType || 'b2b') &&
                                  props.coa_predecessor_opportunity_key === intent.predecessorKey &&
-                                 Boolean(parseHubSpotTimestamp(props.coa_predecessor_completed_at)) &&
+                                 predTimeExactMatch &&
                                  props.coa_config_version === (config?.configVersion || '1.0.0') &&
                                  props.coa_managed === 'true';
 
@@ -650,21 +678,22 @@ export class HubspotAdapter {
             });
           }
 
-          // Gap 2: Native Product resolution & Deal-parented Line Item creation, association and readback!
+          // Gate 5: Schema-backed deterministic Line Item key `<successorKey>::<offeringKey>`!
           if (intent.offerings && intent.offerings.length > 0 && targetDealId) {
             const productKeyProp = config?.offeringPolicy?.productOfferingKeyProperty || 'hs_sku';
 
             for (const offering of intent.offerings) {
               const product = await this.resolveProductForOfferingKey(offering.offeringKey, productKeyProp);
+              const lineItemKey = `${intent.successorKey}::${offering.offeringKey}`;
 
-              // Check existing Line Items parented to this Deal for replay safety
+              // Search existing Line Items on Deal using schema-backed coa_line_item_key for concurrency safety!
               let existingLineItemId: string | undefined = undefined;
               try {
                 const existingLIAssocs = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(targetDealId) || (targetDealId as any), 'line_item');
                 for (const assoc of existingLIAssocs.results || []) {
-                  const liRecord = await this.client.crm.lineItems.basicApi.getById(String(assoc.toObjectId), ['name', 'hs_sku', 'hs_product_id']);
+                  const liRecord = await this.client.crm.lineItems.basicApi.getById(String(assoc.toObjectId), ['name', 'hs_sku', 'hs_product_id', 'coa_line_item_key', 'quantity', 'price']);
                   const liProps = liRecord.properties || {};
-                  if (liProps.hs_sku === offering.offeringKey || liProps.name === offering.offeringKey || liProps.hs_product_id === product.id) {
+                  if (liProps.coa_line_item_key === lineItemKey || liProps.hs_sku === offering.offeringKey || liProps.name === offering.offeringKey || liProps.hs_product_id === product.id) {
                     existingLineItemId = liRecord.id;
                     break;
                   }
@@ -673,23 +702,41 @@ export class HubspotAdapter {
                 if (e?.statusCode !== 404 && e?.status !== 404) throw e;
               }
 
+              const expectedQuantity = String(offering.quantity || 1);
+              const expectedPrice = String(offering.unitPrice || product.price || 0);
+
               if (existingLineItemId) {
+                // Verify existing Line Item readback fields
+                const liReadback = await this.client.crm.lineItems.basicApi.getById(existingLineItemId, [
+                  'name',
+                  'hs_product_id',
+                  'hs_sku',
+                  'quantity',
+                  'price',
+                  'coa_line_item_key'
+                ]);
+
+                const liVerified = (liReadback?.properties?.coa_line_item_key === lineItemKey || Boolean(liReadback?.properties?.hs_product_id)) &&
+                                   liReadback?.properties?.hs_product_id === product.id &&
+                                   String(liReadback?.properties?.quantity) === expectedQuantity;
+
                 receipts.push({
                   intentKind: 'CREATE_LINE_ITEM',
                   objectType: 'line_item',
                   objectId: existingLineItemId,
                   operation: 'NOOP',
-                  verified: true
+                  verified: liVerified
                 });
               } else {
-                // Create native Line Item parented to this Deal
+                // Create native Line Item parented to this Deal with schema-backed coa_line_item_key
                 const newLineItem = await this.client.crm.lineItems.basicApi.create({
                   properties: {
                     name: offering.offeringKey,
                     hs_product_id: product.id,
                     hs_sku: offering.offeringKey,
-                    quantity: String(offering.quantity || 1),
-                    price: String(offering.unitPrice || product.price || 0)
+                    coa_line_item_key: lineItemKey,
+                    quantity: expectedQuantity,
+                    price: expectedPrice
                   },
                   associations: [{
                     to: { id: targetDealId },
@@ -697,16 +744,20 @@ export class HubspotAdapter {
                   }]
                 });
 
-                // Readback verification for Line Item creation
+                // Exact Field-Level Readback Verification for Line Item creation
                 const liReadback = await this.client.crm.lineItems.basicApi.getById(newLineItem.id, [
                   'name',
                   'hs_product_id',
                   'hs_sku',
-                  'quantity'
+                  'quantity',
+                  'price',
+                  'coa_line_item_key'
                 ]);
 
-                const liVerified = liReadback?.properties?.hs_product_id === product.id &&
-                                   (liReadback?.properties?.hs_sku === offering.offeringKey || liReadback?.properties?.name === offering.offeringKey);
+                const liVerified = (liReadback?.properties?.coa_line_item_key === lineItemKey || liReadback?.properties?.name === offering.offeringKey) &&
+                                   liReadback?.properties?.hs_product_id === product.id &&
+                                   String(liReadback?.properties?.quantity) === expectedQuantity &&
+                                   String(liReadback?.properties?.price) === expectedPrice;
 
                 receipts.push({
                   intentKind: 'CREATE_LINE_ITEM',
@@ -726,8 +777,9 @@ export class HubspotAdapter {
         const subjectId = intent.subject.key;
         const assocTypeId = intent.subject.kind === 'CONTACT' ? 204 : 192; // Task -> Contact = 204, Task -> Company = 192
 
-        // Gap 9: Replay-safe Manual Review Tasks! Check existing open tasks for this opportunity key
+        // Gate 4 & 9: Replay-safe Manual Review Tasks with hs_timestamp
         const taskMarker = `[COA_OPPORTUNITY_KEY:${intent.opportunityKey}]`;
+        const nowIso = new Date().toISOString();
         let existingTaskId: string | undefined = undefined;
 
         try {
@@ -737,7 +789,7 @@ export class HubspotAdapter {
             'task'
           );
           for (const assoc of taskAssocs.results || []) {
-            const taskRecord = await tasksApi.basicApi.getById(String(assoc.toObjectId), ['hs_task_subject', 'hs_task_body', 'hs_task_status']);
+            const taskRecord = await tasksApi.basicApi.getById(String(assoc.toObjectId), ['hs_task_subject', 'hs_task_body', 'hs_task_status', 'hs_timestamp']);
             const body = taskRecord.properties?.hs_task_body || '';
             const subjectStr = taskRecord.properties?.hs_task_subject || '';
             const statusStr = taskRecord.properties?.hs_task_status || '';
@@ -770,14 +822,17 @@ export class HubspotAdapter {
               hs_task_subject: `Manual Review Required: ${intent.reason}`,
               hs_task_status: 'NOT_STARTED',
               hs_task_priority: 'HIGH',
-              hs_task_body: `Opportunity key ${intent.opportunityKey} requires manual review. Reason: ${intent.reason} ${taskMarker}`
+              hs_task_body: `Opportunity key ${intent.opportunityKey} requires manual review. Reason: ${intent.reason} ${taskMarker}`,
+              hs_timestamp: nowIso
             },
             associations
           });
 
-          const readback = await tasksApi.basicApi.getById(taskRes.id, ['hs_task_subject', 'hs_task_status', 'hs_task_body']);
+          // Gate 4: Readback verification including hs_timestamp
+          const readback = await tasksApi.basicApi.getById(taskRes.id, ['hs_task_subject', 'hs_task_status', 'hs_task_body', 'hs_timestamp']);
           const verified = Boolean(readback?.properties?.hs_task_subject?.startsWith('Manual Review Required')) &&
-                           Boolean(readback?.properties?.hs_task_body?.includes(taskMarker));
+                           Boolean(readback?.properties?.hs_task_body?.includes(taskMarker)) &&
+                           Boolean(readback?.properties?.hs_timestamp);
 
           receipts.push({
             intentKind: 'CREATE_MANUAL_REVIEW',

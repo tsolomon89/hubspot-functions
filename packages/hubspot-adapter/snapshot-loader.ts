@@ -54,7 +54,7 @@ export class HubSpotSnapshotLoader {
         }
         after = res.paging?.next?.after;
       } catch (err: any) {
-        if (err?.statusCode === 404 || err?.status === 404) break;
+        if (err?.statusCode !== 404 || err?.status !== 404) break;
         throw err;
       }
     } while (after && pageCount < maxPages);
@@ -66,7 +66,7 @@ export class HubSpotSnapshotLoader {
    * Explicit primary contact resolution from list of associated contact IDs.
    * If exactly 1 contact -> returns that contact ID.
    * If >1 contacts and 1 is designated primary -> returns primary contact ID.
-   * If >1 contacts without a clear primary -> returns null (ambiguous).
+   * If >1 contacts without a clear primary -> returns null and marks isAmbiguous = true.
    */
   public async resolvePrimaryContactId(
     fromObjectType: string,
@@ -91,8 +91,35 @@ export class HubSpotSnapshotLoader {
       }
     }
 
-    // Multiple contacts exist without explicit primary label
+    // Gate 7: Ambiguous primary contact - DO NOT select first contact! Return null.
     return { primaryContactId: null, isAmbiguous: true };
+  }
+
+  /**
+   * Explicit primary company resolution from list of associated company IDs for Contact.
+   */
+  public async resolvePrimaryCompanyId(
+    contactId: string,
+    companyAssocs: any[]
+  ): Promise<{ primaryCompanyId: string | null; isAmbiguous: boolean }> {
+    if (!companyAssocs || companyAssocs.length === 0) {
+      return { primaryCompanyId: null, isAmbiguous: false };
+    }
+    if (companyAssocs.length === 1) {
+      return { primaryCompanyId: String(companyAssocs[0].toObjectId), isAmbiguous: false };
+    }
+
+    for (const assoc of companyAssocs) {
+      const types = assoc.associationTypes || [];
+      for (const t of types) {
+        const label = String(t.label || t.type || '').toLowerCase();
+        if (label.includes('primary') || t.associationTypeId === 1) {
+          return { primaryCompanyId: String(assoc.toObjectId), isAmbiguous: false };
+        }
+      }
+    }
+
+    return { primaryCompanyId: null, isAmbiguous: true };
   }
 
   public async loadSnapshotFromRecord(
@@ -150,10 +177,17 @@ export class HubSpotSnapshotLoader {
       const cProps = contact.properties || {};
 
       let companySuppressed = false;
-
       const companyAssocs = await this.getAllAssociations('contact', recordRef.objectId, 'company');
-      if (companyAssocs.length > 0) {
-        companyKey = String(companyAssocs[0].toObjectId);
+      const { primaryCompanyId, isAmbiguous: isCompanyAmbiguous } = await this.resolvePrimaryCompanyId(recordRef.objectId, companyAssocs);
+
+      if (isCompanyAmbiguous) {
+        facts.ambiguousPrimaryCompany = true;
+        facts.manualReviewRequired = true;
+      }
+
+      companyKey = primaryCompanyId || undefined;
+
+      if (companyKey) {
         try {
           const compRecord = await this.client.crm.companies.basicApi.getById(companyKey, [
             'coa_relationship_key',
@@ -165,13 +199,27 @@ export class HubSpotSnapshotLoader {
         }
       }
 
-      // Use deriveRelationshipKey contract for strict namespaced relationship identity
-      const anchor = companyKey ? companyKey : (cProps.email ? cProps.email.trim().toLowerCase() : (cProps.phone ? sanitizeKey(cProps.phone) : recordRef.objectId));
-      relationshipKey = deriveRelationshipKey(organizationKey, relationshipType, anchor);
+      // Gate 6 Canonical Anchor Contract:
+      // B2B relationship anchor = stable Company ID (`comp_123`).
+      // B2C relationship anchor = stable Contact ID (`cnt_456`).
+      if (relationshipType === 'b2b') {
+        if (companyKey) {
+          relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', companyKey);
+        } else {
+          // B2B Contact without associated Company cannot create temporary Contact-anchored key that later changes!
+          facts.missingCompany = true;
+          facts.manualReviewRequired = true;
+          relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', recordRef.objectId);
+        }
+      } else {
+        relationshipKey = deriveRelationshipKey(organizationKey, 'b2c', recordRef.objectId);
+      }
+
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
       const contactSuppressed = cProps.coa_automation_suppressed === 'true' || cProps.coa_automation_suppressed === '1';
       facts = {
+        ...facts,
         email: cProps.email || undefined,
         contactEmail: cProps.email || undefined,
         phone: cProps.phone || undefined,
@@ -212,9 +260,10 @@ export class HubSpotSnapshotLoader {
       if (isAmbiguous) {
         facts.ambiguousPrimaryContact = true;
         facts.manualReviewRequired = true;
+        primaryContactId = undefined; // Gate 7: Do NOT select contactKeys[0] when ambiguous!
+      } else {
+        primaryContactId = resolvedPrimary || (contactKeys.length === 1 ? contactKeys[0] : undefined);
       }
-
-      primaryContactId = resolvedPrimary || (contactKeys.length > 0 ? contactKeys[0] : undefined);
 
       if (primaryContactId) {
         try {
@@ -232,12 +281,13 @@ export class HubSpotSnapshotLoader {
         }
       }
 
-      const anchor = compProps.domain ? compProps.domain.trim().toLowerCase() : (compProps.name ? sanitizeKey(compProps.name) : recordRef.objectId);
-      relationshipKey = deriveRelationshipKey(organizationKey, relationshipType, anchor);
+      // Gate 6 Canonical Anchor Contract: B2B Company anchor = Company ID (e.g. recordRef.objectId)
+      relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', recordRef.objectId);
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
       const compSuppressed = compProps.coa_automation_suppressed === 'true' || compProps.coa_automation_suppressed === '1';
       facts = {
+        ...facts,
         domain: compProps.domain || undefined,
         companyName: compProps.name || undefined,
         email: contactEmail,
@@ -270,8 +320,13 @@ export class HubSpotSnapshotLoader {
       if (cAssocs.length > 0) {
         const { primaryContactId: resContact, isAmbiguous } = await this.resolvePrimaryContactId('lead', recordRef.objectId, cAssocs);
         contactKeys = cAssocs.map(r => String(r.toObjectId));
-        primaryContactId = resContact || contactKeys[0];
-        if (isAmbiguous) facts.ambiguousPrimaryContact = true;
+        if (isAmbiguous) {
+          facts.ambiguousPrimaryContact = true;
+          facts.manualReviewRequired = true;
+          primaryContactId = undefined;
+        } else {
+          primaryContactId = resContact || (contactKeys.length === 1 ? contactKeys[0] : undefined);
+        }
       }
 
       const compAssocs = await this.getAllAssociations('lead', recordRef.objectId, 'company');
@@ -319,6 +374,7 @@ export class HubSpotSnapshotLoader {
         'amount',
         'dealstage',
         'pipeline',
+        'closedate',
         'coa_opportunity_key',
         'coa_relationship_key',
         'coa_relationship_type',
@@ -337,8 +393,13 @@ export class HubSpotSnapshotLoader {
       if (cAssocs.length > 0) {
         const { primaryContactId: resContact, isAmbiguous } = await this.resolvePrimaryContactId('deal', recordRef.objectId, cAssocs);
         contactKeys = cAssocs.map(r => String(r.toObjectId));
-        primaryContactId = resContact || contactKeys[0];
-        if (isAmbiguous) facts.ambiguousPrimaryContact = true;
+        if (isAmbiguous) {
+          facts.ambiguousPrimaryContact = true;
+          facts.manualReviewRequired = true;
+          primaryContactId = undefined;
+        } else {
+          primaryContactId = resContact || (contactKeys.length === 1 ? contactKeys[0] : undefined);
+        }
       }
 
       const compAssocs = await this.getAllAssociations('deal', recordRef.objectId, 'company');
@@ -361,9 +422,12 @@ export class HubSpotSnapshotLoader {
       opportunityKey = dProps.coa_opportunity_key || `${relationshipKey}::${opportunityType}::${cycleIndex}`;
 
       const stage = (dProps.dealstage || 'open').toLowerCase();
+      openedAt = parseHubSpotTimestamp(dProps.createdate) || openedAt;
+
       if (stage === 'closedwon') {
         opportunityState = 'WON';
         facts.transactionCompleted = true;
+        facts.closedAt = parseHubSpotTimestamp(dProps.closedate || dProps.closedAt || dProps.coa_predecessor_completed_at) || openedAt;
       } else if (stage === 'closedlost') {
         opportunityState = 'LOST';
       } else {
@@ -381,7 +445,8 @@ export class HubSpotSnapshotLoader {
               'quantity',
               'price',
               'hs_product_id',
-              'hs_sku'
+              'hs_sku',
+              'coa_line_item_key'
             ]);
             const liProps = li.properties || {};
             const key = liProps.hs_sku || liProps.name;
@@ -406,7 +471,6 @@ export class HubSpotSnapshotLoader {
         offerings = rawKeys.map(k => ({ offeringKey: k, quantity: 1 }));
       }
 
-      openedAt = parseHubSpotTimestamp(dProps.createdate) || openedAt;
       predecessorCompletedAt = parseHubSpotTimestamp(dProps.coa_predecessor_completed_at) || undefined;
       mqlCompletedAt = parseHubSpotTimestamp(dProps.coa_mql_completed_at) || undefined;
     } else {

@@ -41,6 +41,7 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
     const adapter = new HubspotAdapter('fake-token');
     const rawClient = adapter.getRawClient();
 
+    const predTime = new Date().toISOString();
     const searchMock = vi.fn().mockResolvedValue({ results: [] });
     const createDealMock = vi.fn().mockResolvedValue({ id: 'deal_456' });
     const getByIdMock = vi.fn().mockResolvedValue({
@@ -56,7 +57,7 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
         coa_qualification_state: 'PENDING',
         coa_cycle_index: '1',
         coa_predecessor_opportunity_key: 'rel_acme::LEAD::1',
-        coa_predecessor_completed_at: new Date().toISOString(),
+        coa_predecessor_completed_at: predTime,
         coa_config_version: '1.0.0',
         coa_managed: 'true'
       }
@@ -71,7 +72,8 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
       predecessorKey: 'rel_acme::LEAD::1',
       successorKey: 'rel_acme::FTP::1',
       successorType: 'FTP',
-      cycleIndex: 1
+      cycleIndex: 1,
+      predecessorCompletedAt: predTime
     }];
 
     const result = await adapter.applyTransitionIntents(intents, 'trans_456');
@@ -116,7 +118,8 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
       predecessorKey: 'rel_acme::LEAD::1',
       successorKey: 'rel_acme::FTP::1',
       successorType: 'FTP',
-      cycleIndex: 1
+      cycleIndex: 1,
+      predecessorCompletedAt: '2026-08-05T12:00:00.000Z'
     }];
 
     const result = await adapter.applyTransitionIntents(intents, 'trans_no_pred_time');
@@ -135,7 +138,8 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
       properties: {
         hs_task_subject: 'Manual Review Required: MQL qualification blocked by missing information',
         hs_task_status: 'NOT_STARTED',
-        hs_task_body: '[COA_OPPORTUNITY_KEY:rel_acme::LEAD::1]'
+        hs_task_body: '[COA_OPPORTUNITY_KEY:rel_acme::LEAD::1]',
+        hs_timestamp: new Date().toISOString()
       }
     });
 
