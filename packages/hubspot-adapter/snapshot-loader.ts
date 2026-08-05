@@ -1,6 +1,7 @@
 import { Client } from '@hubspot/api-client';
-import { OpportunitySnapshot, EvidenceRecord } from '../commercial-kernel/types';
+import { OpportunitySnapshot, EvidenceRecord, OfferingRef } from '../commercial-kernel/types';
 import { parseHubSpotTimestamp, HubspotAdapter } from './adapter';
+import { deriveRelationshipKey, sanitizeKey } from '../domain/identity';
 import { logger } from '../observability';
 
 export interface HubSpotRecordRef {
@@ -24,9 +25,79 @@ export class HubSpotSnapshotLoader {
     return (this.client.crm.objects as any).leads || (this.client.crm as any).objects?.leads;
   }
 
+  /**
+   * Bounded association pagination helper.
+   * Pages through all associations matching fromObjectType -> toObjectType.
+   */
+  public async getAllAssociations(
+    fromObjectType: string,
+    fromObjectId: string | number,
+    toObjectType: string,
+    maxPages: number = 10
+  ): Promise<any[]> {
+    const results: any[] = [];
+    let after: string | undefined = undefined;
+    let pageCount = 0;
+
+    do {
+      pageCount++;
+      try {
+        const res = await this.client.crm.associations.v4.basicApi.getPage(
+          fromObjectType,
+          Number(fromObjectId) || (fromObjectId as any),
+          toObjectType,
+          after,
+          100
+        );
+        if (res.results && res.results.length > 0) {
+          results.push(...res.results);
+        }
+        after = res.paging?.next?.after;
+      } catch (err: any) {
+        if (err?.statusCode === 404 || err?.status === 404) break;
+        throw err;
+      }
+    } while (after && pageCount < maxPages);
+
+    return results;
+  }
+
+  /**
+   * Explicit primary contact resolution from list of associated contact IDs.
+   * If exactly 1 contact -> returns that contact ID.
+   * If >1 contacts and 1 is designated primary -> returns primary contact ID.
+   * If >1 contacts without a clear primary -> returns null (ambiguous).
+   */
+  public async resolvePrimaryContactId(
+    fromObjectType: string,
+    fromObjectId: string,
+    associationResults: any[]
+  ): Promise<{ primaryContactId: string | null; isAmbiguous: boolean }> {
+    if (!associationResults || associationResults.length === 0) {
+      return { primaryContactId: null, isAmbiguous: false };
+    }
+    if (associationResults.length === 1) {
+      return { primaryContactId: String(associationResults[0].toObjectId), isAmbiguous: false };
+    }
+
+    // Inspect association type labels to find Primary association label or type
+    for (const assoc of associationResults) {
+      const types = assoc.associationTypes || [];
+      for (const t of types) {
+        const label = String(t.label || t.type || '').toLowerCase();
+        if (label.includes('primary') || t.associationTypeId === 1) {
+          return { primaryContactId: String(assoc.toObjectId), isAmbiguous: false };
+        }
+      }
+    }
+
+    // Multiple contacts exist without explicit primary label
+    return { primaryContactId: null, isAmbiguous: true };
+  }
+
   public async loadSnapshotFromRecord(
     recordRef: HubSpotRecordRef,
-    organizationKey: string = 'org_default',
+    organizationKey: string = 'org_global_corp',
     relationshipType: string = 'b2b'
   ): Promise<OpportunitySnapshot> {
     return this.loadPureSnapshotFromHubSpot(recordRef, organizationKey, relationshipType);
@@ -34,7 +105,7 @@ export class HubSpotSnapshotLoader {
 
   public async loadPureSnapshotFromHubSpot(
     recordRef: HubSpotRecordRef,
-    organizationKey: string = 'org_default',
+    organizationKey: string = 'org_global_corp',
     relationshipType: string = 'b2b'
   ): Promise<OpportunitySnapshot> {
     const rawType = (recordRef.objectType || '').toLowerCase();
@@ -43,9 +114,11 @@ export class HubSpotSnapshotLoader {
     let subjectKey = '';
     let contactKeys: string[] = [];
     let companyKey: string | undefined = undefined;
+    let primaryContactId: string | undefined = undefined;
 
     let facts: Record<string, unknown> = {};
     let evidence: EvidenceRecord[] = [];
+    let offerings: OfferingRef[] = [];
 
     let opportunityKey = '';
     let opportunityType: 'MQL' | 'SQL' | 'FTP' | 'RTP' = 'MQL';
@@ -53,15 +126,20 @@ export class HubSpotSnapshotLoader {
     let cycleIndex = 1;
     let openedAt = new Date().toISOString();
     let predecessorCompletedAt: string | undefined = undefined;
+    let mqlCompletedAt: string | undefined = undefined;
     let relationshipKey = '';
 
     if (rawType === 'contact' || rawType === '0-1') {
       subjectKind = 'CONTACT';
       subjectKey = recordRef.objectId;
       contactKeys = [recordRef.objectId];
+      primaryContactId = recordRef.objectId;
 
       const contact = await this.client.crm.contacts.basicApi.getById(recordRef.objectId, [
         'email',
+        'phone',
+        'firstname',
+        'lastname',
         'lifecyclestage',
         'coa_relationship_key',
         'coa_relationship_type',
@@ -72,64 +150,41 @@ export class HubSpotSnapshotLoader {
       const cProps = contact.properties || {};
 
       let companySuppressed = false;
-      let compRelKey = '';
 
-      try {
-        const companyAssocs = await this.client.crm.associations.v4.basicApi.getPage(
-          'contact',
-          Number(recordRef.objectId) || (recordRef.objectId as any),
-          'company'
-        );
-        if (companyAssocs.results && companyAssocs.results.length > 0) {
-          companyKey = String(companyAssocs.results[0].toObjectId);
-          
-          // Hydrate associated Company details for suppression aggregation & B2B canonical key check
-          try {
-            const compRecord = await this.client.crm.companies.basicApi.getById(companyKey, [
-              'coa_relationship_key',
-              'coa_automation_suppressed'
-            ]);
-            compRelKey = compRecord.properties?.coa_relationship_key || '';
-            companySuppressed = compRecord.properties?.coa_automation_suppressed === 'true' || compRecord.properties?.coa_automation_suppressed === '1';
-          } catch (err: any) {
-            if (err?.statusCode !== 404 && err?.status !== 404) throw err;
-          }
+      const companyAssocs = await this.getAllAssociations('contact', recordRef.objectId, 'company');
+      if (companyAssocs.length > 0) {
+        companyKey = String(companyAssocs[0].toObjectId);
+        try {
+          const compRecord = await this.client.crm.companies.basicApi.getById(companyKey, [
+            'coa_relationship_key',
+            'coa_automation_suppressed'
+          ]);
+          companySuppressed = compRecord.properties?.coa_automation_suppressed === 'true' || compRecord.properties?.coa_automation_suppressed === '1';
+        } catch (err: any) {
+          if (err?.statusCode !== 404 && err?.status !== 404) throw err;
         }
-      } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      // B2B Canonical Relationship Resolution & Mismatch Fail-Closed Gate
-      const contactRelKey = cProps.coa_relationship_key || '';
-      let relationshipMismatch = false;
-
-      if (relationshipType === 'b2b' && contactRelKey && compRelKey && contactRelKey !== compRelKey) {
-        relationshipMismatch = true;
-        logger.error('B2B Relationship Key Mismatch between Contact and associated Company', { contactRelKey, compRelKey });
-      }
-
-      if (relationshipType === 'b2b' && compRelKey) {
-        relationshipKey = compRelKey;
-      } else {
-        relationshipKey = contactRelKey || compRelKey || (companyKey ? `comp_${companyKey}` : `cnt_${recordRef.objectId}`);
-      }
-
+      // Use deriveRelationshipKey contract for strict namespaced relationship identity
+      const anchor = companyKey ? companyKey : (cProps.email ? cProps.email.trim().toLowerCase() : (cProps.phone ? sanitizeKey(cProps.phone) : recordRef.objectId));
+      relationshipKey = deriveRelationshipKey(organizationKey, relationshipType, anchor);
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
       const contactSuppressed = cProps.coa_automation_suppressed === 'true' || cProps.coa_automation_suppressed === '1';
       facts = {
         email: cProps.email || undefined,
         contactEmail: cProps.email || undefined,
+        phone: cProps.phone || undefined,
         lifecycleStage: cProps.lifecyclestage || undefined,
         marketingConsent: cProps.coa_marketing_consent === 'true' || cProps.coa_marketing_consent === '1',
-        automationSuppressed: Boolean(contactSuppressed || companySuppressed || relationshipMismatch),
-        relationshipKeyMismatch: relationshipMismatch
+        automationSuppressed: Boolean(contactSuppressed || companySuppressed)
       };
       openedAt = parseHubSpotTimestamp(cProps.createdate) || openedAt;
 
     } else if (rawType === 'company' || rawType === '0-2') {
       subjectKind = 'COMPANY';
       subjectKey = recordRef.objectId;
+      companyKey = recordRef.objectId;
 
       const company = await this.client.crm.companies.basicApi.getById(recordRef.objectId, [
         'domain',
@@ -145,44 +200,40 @@ export class HubSpotSnapshotLoader {
 
       let contactSuppressed = false;
       let contactEmail: string | undefined = undefined;
-      let contactRelKey = '';
+      let contactPhone: string | undefined = undefined;
 
-      try {
-        const contactAssocs = await this.client.crm.associations.v4.basicApi.getPage(
-          'company',
-          Number(recordRef.objectId) || (recordRef.objectId as any),
-          'contact'
-        );
-        if (contactAssocs.results && contactAssocs.results.length > 0) {
-          contactKeys = contactAssocs.results.map(r => String(r.toObjectId));
-          
-          // Hydrate primary Contact details for suppression aggregation & email
-          try {
-            const primaryContact = await this.client.crm.contacts.basicApi.getById(contactKeys[0], [
-              'email',
-              'coa_relationship_key',
-              'coa_automation_suppressed'
-            ]);
-            contactEmail = primaryContact.properties?.email || undefined;
-            contactRelKey = primaryContact.properties?.coa_relationship_key || '';
-            contactSuppressed = primaryContact.properties?.coa_automation_suppressed === 'true' || primaryContact.properties?.coa_automation_suppressed === '1';
-          } catch (err: any) {
-            if (err?.statusCode !== 404 && err?.status !== 404) throw err;
-          }
+      const contactAssocs = await this.getAllAssociations('company', recordRef.objectId, 'contact');
+      const { primaryContactId: resolvedPrimary, isAmbiguous } = await this.resolvePrimaryContactId('company', recordRef.objectId, contactAssocs);
+
+      if (contactAssocs.length > 0) {
+        contactKeys = contactAssocs.map(r => String(r.toObjectId));
+      }
+
+      if (isAmbiguous) {
+        facts.ambiguousPrimaryContact = true;
+        facts.manualReviewRequired = true;
+      }
+
+      primaryContactId = resolvedPrimary || (contactKeys.length > 0 ? contactKeys[0] : undefined);
+
+      if (primaryContactId) {
+        try {
+          const primaryContact = await this.client.crm.contacts.basicApi.getById(primaryContactId, [
+            'email',
+            'phone',
+            'coa_relationship_key',
+            'coa_automation_suppressed'
+          ]);
+          contactEmail = primaryContact.properties?.email || undefined;
+          contactPhone = primaryContact.properties?.phone || undefined;
+          contactSuppressed = primaryContact.properties?.coa_automation_suppressed === 'true' || primaryContact.properties?.coa_automation_suppressed === '1';
+        } catch (err: any) {
+          if (err?.statusCode !== 404 && err?.status !== 404) throw err;
         }
-      } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      const compRelKey = compProps.coa_relationship_key || '';
-      let relationshipMismatch = false;
-
-      if (relationshipType === 'b2b' && compRelKey && contactRelKey && compRelKey !== contactRelKey) {
-        relationshipMismatch = true;
-        logger.error('B2B Relationship Key Mismatch between Company and primary Contact', { compRelKey, contactRelKey });
-      }
-
-      relationshipKey = compRelKey || contactRelKey || `comp_${recordRef.objectId}`;
+      const anchor = compProps.domain ? compProps.domain.trim().toLowerCase() : (compProps.name ? sanitizeKey(compProps.name) : recordRef.objectId);
+      relationshipKey = deriveRelationshipKey(organizationKey, relationshipType, anchor);
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
       const compSuppressed = compProps.coa_automation_suppressed === 'true' || compProps.coa_automation_suppressed === '1';
@@ -191,10 +242,11 @@ export class HubSpotSnapshotLoader {
         companyName: compProps.name || undefined,
         email: contactEmail,
         contactEmail: contactEmail,
+        phone: contactPhone,
         lifecycleStage: compProps.lifecyclestage || undefined,
         marketingConsent: compProps.coa_marketing_consent === 'true' || compProps.coa_marketing_consent === '1',
-        automationSuppressed: Boolean(compSuppressed || contactSuppressed || relationshipMismatch),
-        relationshipKeyMismatch: relationshipMismatch
+        automationSuppressed: Boolean(compSuppressed || contactSuppressed),
+        ambiguousPrimaryContact: isAmbiguous
       };
       openedAt = parseHubSpotTimestamp(compProps.createdate) || openedAt;
 
@@ -202,48 +254,41 @@ export class HubSpotSnapshotLoader {
       const lead = await this.leadsApi.basicApi.getById(recordRef.objectId, [
         'coa_opportunity_key',
         'coa_relationship_key',
+        'coa_relationship_type',
         'coa_opportunity_type',
         'coa_cycle_index',
         'hs_pipeline_stage',
         'coa_qualification_state',
         'coa_predecessor_opportunity_key',
+        'coa_mql_completed_at',
         'coa_offering_keys',
         'createdate'
       ]);
       const lProps = lead.properties || {};
 
-      let assocContactId: string | undefined = undefined;
-      let assocCompanyId: string | undefined = undefined;
-
-      try {
-        const cAssoc = await this.client.crm.associations.v4.basicApi.getPage('lead', Number(recordRef.objectId) || (recordRef.objectId as any), 'contact');
-        if (cAssoc.results && cAssoc.results.length > 0) {
-          assocContactId = String(cAssoc.results[0].toObjectId);
-          contactKeys.push(assocContactId);
-        }
-      } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      const cAssocs = await this.getAllAssociations('lead', recordRef.objectId, 'contact');
+      if (cAssocs.length > 0) {
+        const { primaryContactId: resContact, isAmbiguous } = await this.resolvePrimaryContactId('lead', recordRef.objectId, cAssocs);
+        contactKeys = cAssocs.map(r => String(r.toObjectId));
+        primaryContactId = resContact || contactKeys[0];
+        if (isAmbiguous) facts.ambiguousPrimaryContact = true;
       }
 
-      try {
-        const compAssoc = await this.client.crm.associations.v4.basicApi.getPage('lead', Number(recordRef.objectId) || (recordRef.objectId as any), 'company');
-        if (compAssoc.results && compAssoc.results.length > 0) {
-          assocCompanyId = String(compAssoc.results[0].toObjectId);
-          companyKey = assocCompanyId;
-        }
-      } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      const compAssocs = await this.getAllAssociations('lead', recordRef.objectId, 'company');
+      if (compAssocs.length > 0) {
+        companyKey = String(compAssocs[0].toObjectId);
       }
 
-      if (assocCompanyId) {
+      if (companyKey) {
         subjectKind = 'COMPANY';
-        subjectKey = assocCompanyId;
-      } else if (assocContactId) {
+        subjectKey = companyKey;
+      } else if (primaryContactId) {
         subjectKind = 'CONTACT';
-        subjectKey = assocContactId;
+        subjectKey = primaryContactId;
       }
 
-      relationshipKey = lProps.coa_relationship_key || (subjectKey ? `${subjectKind.toLowerCase()}_${subjectKey}` : `rel_lead_${recordRef.objectId}`);
+      const anchor = companyKey || primaryContactId || recordRef.objectId;
+      relationshipKey = lProps.coa_relationship_key || deriveRelationshipKey(organizationKey, relationshipType, anchor);
       opportunityKey = lProps.coa_opportunity_key || `${relationshipKey}::LEAD::1`;
 
       const stage = (lProps.hs_pipeline_stage || 'mql').toLowerCase();
@@ -259,9 +304,12 @@ export class HubSpotSnapshotLoader {
       }
 
       if (lProps.coa_offering_keys) {
-        facts.offeringKeys = String(lProps.coa_offering_keys).split(',').map(s => s.trim());
+        const rawKeys = String(lProps.coa_offering_keys).split(',').map(s => s.trim()).filter(Boolean);
+        facts.offeringKeys = rawKeys;
+        offerings = rawKeys.map(k => ({ offeringKey: k, quantity: 1 }));
       }
 
+      mqlCompletedAt = parseHubSpotTimestamp(lProps.coa_mql_completed_at) || undefined;
       cycleIndex = Number(lProps.coa_cycle_index) || 1;
       openedAt = parseHubSpotTimestamp(lProps.createdate) || openedAt;
 
@@ -273,48 +321,41 @@ export class HubSpotSnapshotLoader {
         'pipeline',
         'coa_opportunity_key',
         'coa_relationship_key',
+        'coa_relationship_type',
         'coa_opportunity_type',
         'coa_cycle_index',
         'coa_qualification_state',
         'coa_predecessor_opportunity_key',
         'coa_predecessor_completed_at',
+        'coa_mql_completed_at',
         'coa_offering_keys',
         'createdate'
       ]);
       const dProps = deal.properties || {};
 
-      let assocContactId: string | undefined = undefined;
-      let assocCompanyId: string | undefined = undefined;
-
-      try {
-        const cAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(recordRef.objectId) || (recordRef.objectId as any), 'contact');
-        if (cAssoc.results && cAssoc.results.length > 0) {
-          assocContactId = String(cAssoc.results[0].toObjectId);
-          contactKeys.push(assocContactId);
-        }
-      } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      const cAssocs = await this.getAllAssociations('deal', recordRef.objectId, 'contact');
+      if (cAssocs.length > 0) {
+        const { primaryContactId: resContact, isAmbiguous } = await this.resolvePrimaryContactId('deal', recordRef.objectId, cAssocs);
+        contactKeys = cAssocs.map(r => String(r.toObjectId));
+        primaryContactId = resContact || contactKeys[0];
+        if (isAmbiguous) facts.ambiguousPrimaryContact = true;
       }
 
-      try {
-        const compAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(recordRef.objectId) || (recordRef.objectId as any), 'company');
-        if (compAssoc.results && compAssoc.results.length > 0) {
-          assocCompanyId = String(compAssoc.results[0].toObjectId);
-          companyKey = assocCompanyId;
-        }
-      } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      const compAssocs = await this.getAllAssociations('deal', recordRef.objectId, 'company');
+      if (compAssocs.length > 0) {
+        companyKey = String(compAssocs[0].toObjectId);
       }
 
-      if (assocCompanyId) {
+      if (companyKey) {
         subjectKind = 'COMPANY';
-        subjectKey = assocCompanyId;
-      } else if (assocContactId) {
+        subjectKey = companyKey;
+      } else if (primaryContactId) {
         subjectKind = 'CONTACT';
-        subjectKey = assocContactId;
+        subjectKey = primaryContactId;
       }
 
-      relationshipKey = dProps.coa_relationship_key || (subjectKey ? `${subjectKind.toLowerCase()}_${subjectKey}` : `rel_deal_${recordRef.objectId}`);
+      const anchor = companyKey || primaryContactId || recordRef.objectId;
+      relationshipKey = dProps.coa_relationship_key || deriveRelationshipKey(organizationKey, relationshipType, anchor);
       opportunityType = (dProps.coa_opportunity_type as any) || 'FTP';
       cycleIndex = Number(dProps.coa_cycle_index) || 1;
       opportunityKey = dProps.coa_opportunity_key || `${relationshipKey}::${opportunityType}::${cycleIndex}`;
@@ -329,21 +370,55 @@ export class HubSpotSnapshotLoader {
         opportunityState = 'OPEN';
       }
 
-      if (dProps.coa_offering_keys) {
-        facts.offeringKeys = String(dProps.coa_offering_keys).split(',').map(s => s.trim());
+      // Load parented Line Items parented to this Deal!
+      const lineItemAssocs = await this.getAllAssociations('deal', recordRef.objectId, 'line_item');
+      if (lineItemAssocs.length > 0) {
+        const loadedOfferings: OfferingRef[] = [];
+        for (const lineAssoc of lineItemAssocs) {
+          try {
+            const li = await this.client.crm.lineItems.basicApi.getById(String(lineAssoc.toObjectId), [
+              'name',
+              'quantity',
+              'price',
+              'hs_product_id',
+              'hs_sku'
+            ]);
+            const liProps = li.properties || {};
+            const key = liProps.hs_sku || liProps.name;
+            if (key) {
+              loadedOfferings.push({
+                offeringKey: key,
+                quantity: Number(liProps.quantity || 1),
+                unitPrice: Number(liProps.price || 0)
+              });
+            }
+          } catch (e: any) {
+            if (e?.statusCode !== 404 && e?.status !== 404) throw e;
+          }
+        }
+        if (loadedOfferings.length > 0) {
+          offerings = loadedOfferings;
+          facts.offeringKeys = loadedOfferings.map(o => o.offeringKey);
+        }
+      } else if (dProps.coa_offering_keys) {
+        const rawKeys = String(dProps.coa_offering_keys).split(',').map(s => s.trim()).filter(Boolean);
+        facts.offeringKeys = rawKeys;
+        offerings = rawKeys.map(k => ({ offeringKey: k, quantity: 1 }));
       }
 
       openedAt = parseHubSpotTimestamp(dProps.createdate) || openedAt;
       predecessorCompletedAt = parseHubSpotTimestamp(dProps.coa_predecessor_completed_at) || undefined;
+      mqlCompletedAt = parseHubSpotTimestamp(dProps.coa_mql_completed_at) || undefined;
     } else {
       throw new Error(`INVALID_ENROLLMENT: Unsupported objectType '${recordRef.objectType}'`);
     }
 
-    // Hydrate subject contact & company suppression for Lead/Deal enrollment
-    if (contactKeys.length > 0) {
+    // Hydrate primary contact properties (email, phone, suppression, consent)
+    if (primaryContactId) {
       try {
-        const primaryContact = await this.client.crm.contacts.basicApi.getById(contactKeys[0], [
+        const primaryContact = await this.client.crm.contacts.basicApi.getById(primaryContactId, [
           'email',
+          'phone',
           'lifecyclestage',
           'coa_marketing_consent',
           'coa_automation_suppressed'
@@ -351,6 +426,7 @@ export class HubSpotSnapshotLoader {
         const pcProps = primaryContact.properties || {};
         facts.email = pcProps.email || facts.email;
         facts.contactEmail = pcProps.email || facts.contactEmail;
+        facts.phone = pcProps.phone || facts.phone;
         if (pcProps.coa_marketing_consent === 'true' || pcProps.coa_marketing_consent === '1') {
           facts.marketingConsent = true;
         }
@@ -373,12 +449,12 @@ export class HubSpotSnapshotLoader {
       }
     }
 
-    // Load meetings evidence associated with primary contact
-    if (contactKeys.length > 0) {
+    // Load meeting evidence associated with primary contact using bounded pagination
+    if (primaryContactId) {
       try {
         const lowerTime = predecessorCompletedAt ? new Date(predecessorCompletedAt).getTime() : new Date(openedAt).getTime();
-        const meetingAssocs = await this.client.crm.associations.v4.basicApi.getPage('contact', Number(contactKeys[0]) || (contactKeys[0] as any), 'meeting');
-        for (const assoc of meetingAssocs.results || []) {
+        const meetingAssocs = await this.getAllAssociations('contact', primaryContactId, 'meeting');
+        for (const assoc of meetingAssocs) {
           const meetingId = String(assoc.toObjectId);
           const meeting = await (this.client.crm as any).objects.meetings.basicApi.getById(meetingId, [
             'hs_meeting_outcome',
@@ -386,6 +462,13 @@ export class HubSpotSnapshotLoader {
           ]);
           const parsedTime = parseHubSpotTimestamp(meeting.properties.hs_timestamp);
           if (parsedTime && new Date(parsedTime).getTime() > lowerTime) {
+            const rawOutcome = String(meeting.properties.hs_meeting_outcome || '').toUpperCase();
+            let outcome = 'HELD';
+            if (rawOutcome === 'COMPLETED') outcome = 'COMPLETED';
+            else if (rawOutcome === 'RESCHEDULED') outcome = 'RESCHEDULED';
+            else if (rawOutcome === 'NO_SHOW') outcome = 'NO_SHOW';
+            else if (rawOutcome === 'CANCELED') outcome = 'CANCELED';
+
             evidence.push({
               id: meeting.id,
               predicate: 'activityExists',
@@ -393,7 +476,7 @@ export class HubSpotSnapshotLoader {
               occurredAt: parsedTime,
               data: {
                 activityType: 'MEETING',
-                outcome: meeting.properties.hs_meeting_outcome === 'COMPLETED' ? 'COMPLETED' : 'HELD'
+                outcome
               }
             });
           }
@@ -413,11 +496,15 @@ export class HubSpotSnapshotLoader {
       cycleIndex,
       openedAt,
       predecessorCompletedAt,
+      mqlCompletedAt,
+      offerings,
       subject: {
         kind: subjectKind,
         key: subjectKey,
         contactKeys,
-        companyKey
+        companyKey,
+        phone: facts.phone as string | undefined,
+        email: facts.email as string | undefined
       },
       facts,
       evidence

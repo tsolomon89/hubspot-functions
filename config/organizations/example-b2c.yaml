@@ -37,4 +37,4 @@ goalsByOpportunityType:
 
 featureFlags:
   automationSuppressed: false
-  dryRunTransactions: true
+  dryRunTransactions: false

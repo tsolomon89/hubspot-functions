@@ -9,10 +9,20 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
 
     const searchMock = vi.fn().mockResolvedValue({ results: [] });
     const createLeadMock = vi.fn().mockResolvedValue({ id: 'lead_bootstrap_1', properties: { coa_opportunity_key: 'rel_acme::LEAD::1' } });
+    const getLeadMock = vi.fn().mockResolvedValue({
+      id: 'lead_bootstrap_1',
+      properties: {
+        coa_opportunity_key: 'rel_acme::LEAD::1',
+        coa_relationship_key: 'rel_acme',
+        coa_relationship_type: 'b2b',
+        hs_pipeline: 'b2b_qualification_lead_pipeline',
+        coa_managed: 'true'
+      }
+    });
     const assocMock = vi.fn().mockResolvedValue({ results: [{ toObjectId: 'cnt_assoc_1' }] });
 
     Object.defineProperty(rawClient.crm.objects, 'leads', {
-      value: { searchApi: { doSearch: searchMock }, basicApi: { create: createLeadMock } },
+      value: { searchApi: { doSearch: searchMock }, basicApi: { create: createLeadMock, getById: getLeadMock } },
       configurable: true
     });
     rawClient.crm.associations.v4.basicApi.getPage = assocMock;
@@ -124,7 +134,8 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
       id: 'task_manual_99',
       properties: {
         hs_task_subject: 'Manual Review Required: MQL qualification blocked by missing information',
-        hs_task_status: 'NOT_STARTED'
+        hs_task_status: 'NOT_STARTED',
+        hs_task_body: '[COA_OPPORTUNITY_KEY:rel_acme::LEAD::1]'
       }
     });
 
@@ -132,6 +143,7 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
       value: { basicApi: { create: createTaskMock, getById: getTaskMock } },
       configurable: true
     });
+    rawClient.crm.associations.v4.basicApi.getPage = vi.fn().mockResolvedValue({ results: [] });
 
     const intents: TransitionIntent[] = [{
       kind: 'CREATE_MANUAL_REVIEW',

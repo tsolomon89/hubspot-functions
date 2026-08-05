@@ -27,8 +27,7 @@ jobs:
         run: npm audit --audit-level=high
 
       - name: Validate Organization Configurations against JSON Schema
-        run: |
-          npx ajv-cli validate -s config/schema/commercial-model.schema.json -d "config/organizations/*.yaml" --parser yaml
+        run: npm run config:validate
 
       - name: TypeScript Build Check
         run: npm run build
@@ -37,7 +36,7 @@ jobs:
         run: npm test
 
       - name: Setup HubSpot CLI
-        run: npm install -g @hubspot/cli@latest
+        run: npm install -g @hubspot/cli@^6.0.0
 
       - name: Validate HubSpot Project Structure
-        run: hs project validate
+        run: npx hs project validate
