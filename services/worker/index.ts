@@ -1,17 +1,18 @@
 import { Pool } from 'pg';
 import { logger } from '../../packages/observability';
-import { HubspotClientWrapper } from '../../packages/hubspot-client';
+import { HubspotAdapter, normalizeHubSpotWebhookPayload } from '../../packages/hubspot-adapter';
 import { 
-  resolveIdentity, 
-  createInitialProductDeal, 
-  validateProductKey,
-  createAmbiguousProductReviewTask,
-  requiresActivationTask, 
-  createActivationTask,
-  CompanyInput,
-  ContactInput,
-  ManualReviewTask
+  resolveSubjectIdentity, 
+  ContactRef, 
+  CompanyRef, 
+  CommercialSubject 
 } from '../../packages/domain';
+import { 
+  evaluateOpportunity, 
+  planTransition, 
+  QualificationConfig, 
+  OpportunitySnapshot 
+} from '../../packages/commercial-kernel';
 
 export const dbPool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/hubspot_automation',
@@ -19,11 +20,12 @@ export const dbPool = new Pool({
 });
 
 export interface IntakeJobPayload {
-  company: CompanyInput;
-  contact: ContactInput;
-  products: string[];
-  pipeline?: 'b2b_pipeline' | 'partnership_pipeline';
-  role?: 'Decision Maker' | 'End User' | 'Influencer';
+  organizationKey?: string;
+  relationshipType?: string;
+  company?: CompanyRef;
+  contact?: ContactRef;
+  products?: string[];
+  facts?: Record<string, unknown>;
 }
 
 export interface JobRecord {
@@ -36,17 +38,17 @@ export interface JobRecord {
 }
 
 export class ReconciliationWorker {
-  private hsClient: HubspotClientWrapper;
+  private hsAdapter: HubspotAdapter;
   private isRunning: boolean = false;
   private pollIntervalMs: number = 1000;
   private pollTimer?: NodeJS.Timeout;
 
   constructor(accessToken?: string, pollIntervalMs: number = 1000) {
-    this.hsClient = new HubspotClientWrapper(accessToken);
+    this.hsAdapter = new HubspotAdapter(accessToken);
     this.pollIntervalMs = pollIntervalMs;
   }
 
-  // Lease next available job, reclaiming crashed processing jobs whose lease expired
+  // Atomic Job Lease using FOR UPDATE SKIP LOCKED with expired-lease recovery
   public async leaseNextJob(): Promise<JobRecord | null> {
     const client = await dbPool.connect();
     try {
@@ -96,6 +98,8 @@ export class ReconciliationWorker {
         result = await this.processWebhookEventJob(correlationId, rawPayload);
       } else if (job.job_type === 'RECONCILE_RECORD') {
         result = await this.processReconcileRecordJob(correlationId, job.record_id, rawPayload);
+      } else {
+        throw new Error(`UNSUPPORTED_JOB_TYPE: Job type '${job.job_type}' is not recognized by commercial worker.`);
       }
 
       // Mark Job Completed
@@ -123,14 +127,14 @@ export class ReconciliationWorker {
       const errorMessage = err.message || String(err);
       logger.error('Job processing failed', err, { jobId: job.id, attempt: job.attempts });
 
-      if (job.attempts >= job.max_attempts) {
+      if (job.attempts >= job.max_attempts || errorMessage.startsWith('UNSUPPORTED_JOB_TYPE')) {
         // Move to Dead Letters
         await dbPool.query(
           `UPDATE hubspot_jobs SET status = 'DEAD_LETTER', last_error = $1, leased_until = NULL, updated_at = NOW() WHERE id = $2`,
           [errorMessage, job.id]
         );
         await dbPool.query(
-          `INSERT INTO hubspot_dead_letters (job_id, reason, payload) VALUES ($1, $2, $3)`,
+          `INSERT INTO hubspot_dead_letters (job_id, reason, payload) VALUES ($1, $2, $3) ON CONFLICT (job_id) DO NOTHING`,
           [job.id, errorMessage, JSON.stringify(job.payload)]
         );
         await dbPool.query(
@@ -149,123 +153,72 @@ export class ReconciliationWorker {
     }
   }
 
-  public async processWebhookEventJob(correlationId: string, event: any): Promise<any> {
-    const objectId = event.objectId;
-    const subscriptionType = (event.subscriptionType || '').toLowerCase();
-
-    if (subscriptionType.startsWith('contact')) {
-      const contact = await this.hsClient.getContactById(objectId);
-      if (contact && contact.properties?.email) {
-        const email = contact.properties.email;
-        const companyName = contact.properties.company || email.split('@')[1] || 'Unknown Company';
-        return await this.processIntakeJob(correlationId, {
-          company: { name: companyName, domain: email.split('@')[1] },
-          contact: { email, firstName: contact.properties.firstname, lastName: contact.properties.lastname },
-          products: ['jurnii_360']
-        });
-      }
-    } else if (subscriptionType.startsWith('company')) {
-      const company = await this.hsClient.getCompanyById(objectId);
-      if (company && company.properties?.company_key) {
-        logger.info('Reconciled company from webhook event', { companyKey: company.properties.company_key });
-        return { reconciledCompany: company.properties.company_key };
-      }
+  public async processWebhookEventJob(correlationId: string, rawEvent: any): Promise<any> {
+    const normalizedEvents = normalizeHubSpotWebhookPayload(rawEvent);
+    if (normalizedEvents.length === 0) {
+      return { processed: 0 };
     }
 
-    return { processedEvent: event.eventId, subscriptionType };
+    const event = normalizedEvents[0];
+    logger.info('Processing normalized webhook event', { stableKey: event.stableInboxKey, eventType: event.eventType });
+
+    return { processedEventId: event.eventId, stableKey: event.stableInboxKey };
   }
 
   public async processReconcileRecordJob(correlationId: string, recordId: string, payload: any): Promise<any> {
-    logger.info('Executing workflow action record reconciliation', { recordId });
-    return { reconciledRecordId: recordId, payload };
+    logger.info('Executing record reconciliation command', { recordId });
+    return { reconciledRecordId: recordId, status: 'RECONCILED' };
   }
 
-  public async processIntakeJob(correlationId: string, payload: IntakeJobPayload): Promise<{ success: boolean; createdDeals: string[]; taskCreated: boolean }> {
-    // 1. Resolve Contact & Company identity
-    const resolvedIdentity = resolveIdentity(payload.company, payload.contact);
+  public async processIntakeJob(correlationId: string, payload: IntakeJobPayload): Promise<{ success: boolean; subjectKey: string; opportunityKey: string; qualificationState: string }> {
+    // 1. Resolve Universal Subject Identity
+    const subject = resolveSubjectIdentity(payload.contact, payload.company);
+    const relationshipType = payload.relationshipType || (subject.kind === 'CONTACT' ? 'b2c' : 'b2b');
+    const organizationKey = payload.organizationKey || 'org_default';
 
-    // 2. Race-Safe Upsert Company and Contact records
-    const companyId = await this.hsClient.upsertCompany(resolvedIdentity);
-    const contactId = await this.hsClient.upsertContact(resolvedIdentity);
+    const relationshipKey = `${organizationKey}_${relationshipType}_${subject.subjectKey}`;
+    const opportunityKey = `${relationshipKey}::MQL::1`;
 
-    // Associate Contact to Company
-    await this.hsClient.associateContactToCompany(contactId, companyId);
+    const config: QualificationConfig = {
+      organizationKey,
+      configVersion: '1.0.0',
+      relationshipType,
+      goalsByOpportunityType: { MQL: [], SQL: [], FTP: [], RTP: [] }
+    };
 
-    const createdDeals: string[] = [];
-    const ambiguousProductDeals: string[] = [];
+    const snapshot: OpportunitySnapshot = {
+      organizationKey,
+      relationshipKey,
+      relationshipType,
+      opportunityKey,
+      opportunityType: 'MQL',
+      cycleIndex: 1,
+      openedAt: new Date().toISOString(),
+      subject: subject.kind === 'CONTACT' 
+        ? { kind: 'CONTACT', key: subject.subjectKey }
+        : { kind: 'COMPANY', key: subject.subjectKey },
+      facts: {
+        email: subject.contact?.email,
+        companyName: subject.company?.name,
+        products: payload.products || [],
+        ...(payload.facts || {})
+      },
+      evidence: []
+    };
 
-    // 3. For each product of interest, validate and create/upsert Deal
-    for (const rawProduct of payload.products) {
-      const validation = validateProductKey(rawProduct);
+    // Evaluate commercial kernel
+    const evaluation = evaluateOpportunity(snapshot, config);
+    const intents = planTransition(snapshot, evaluation, config);
 
-      if (validation.ambiguous) {
-        ambiguousProductDeals.push(rawProduct);
-        const reviewTask = createAmbiguousProductReviewTask({
-          companyKey: resolvedIdentity.companyKey,
-          companyName: resolvedIdentity.companyName,
-          productKey: rawProduct,
-          contactEmail: resolvedIdentity.contactEmail
-        }, rawProduct);
+    // Apply intents via adapter
+    await this.hsAdapter.applyTransitionIntents(intents, `transition_${opportunityKey}`);
 
-        await this.hsClient.createManualReviewTask(reviewTask, contactId);
-        logger.warn('Raised manual review task for ambiguous product', { rawProduct, contactEmail: resolvedIdentity.contactEmail });
-        continue;
-      }
-
-      const initialDeal = createInitialProductDeal({
-        companyKey: resolvedIdentity.companyKey,
-        companyName: resolvedIdentity.companyName,
-        productKey: rawProduct,
-        contactEmail: resolvedIdentity.contactEmail,
-        pipeline: payload.pipeline,
-        role: payload.role
-      });
-
-      const dealId = await this.hsClient.upsertProductDeal(initialDeal, companyId);
-      createdDeals.push(dealId);
-
-      // Associate Contact to Deal
-      if (payload.role) {
-        await this.hsClient.associateContactToDeal(contactId, dealId, payload.role);
-      }
-    }
-
-    // 4. Sequence Activation Gate Logic (B2B Pipeline only)
-    let taskCreated = false;
-
-    if (payload.pipeline !== 'partnership_pipeline' && payload.role === 'Decision Maker') {
-      if (createdDeals.length > 1) {
-        // Multi-Product Ambiguity for Decision Maker: Raise multi_product_sequence_ambiguous review task
-        const reviewTask: ManualReviewTask = {
-          subject: `[Manual Review] Multi-product sequence ambiguous for ${resolvedIdentity.companyName}`,
-          taskCode: 'multi_product_sequence_ambiguous',
-          dealKey: resolvedIdentity.companyKey,
-          contactEmail: resolvedIdentity.contactEmail,
-          reason: `Decision maker registered with ${createdDeals.length} valid product deals. Human rep must select primary sequence target.`
-        };
-        await this.hsClient.createManualReviewTask(reviewTask, contactId);
-        taskCreated = true;
-        logger.warn('Raised multi_product_sequence_ambiguous task for multi-product decision maker', { contactEmail: resolvedIdentity.contactEmail });
-      } else if (createdDeals.length === 1) {
-        // Single Deal: Check activation gate
-        const sequenceState = {
-          contactEmail: resolvedIdentity.contactEmail,
-          dealKey: createdDeals[0],
-          role: payload.role,
-          sequenceActivatedAt: null
-        };
-
-        if (requiresActivationTask(sequenceState)) {
-          const contactName = `${resolvedIdentity.contactFirstName || ''} ${resolvedIdentity.contactLastName || ''}`.trim() || resolvedIdentity.contactEmail;
-          const activationTask = createActivationTask(resolvedIdentity.contactEmail, contactName, sequenceState.dealKey);
-          await this.hsClient.createActivationTask(activationTask, contactId, createdDeals[0]);
-          taskCreated = true;
-          logger.info('Raised sequence activation task', { contactEmail: resolvedIdentity.contactEmail, taskCode: activationTask.taskCode });
-        }
-      }
-    }
-
-    return { success: true, createdDeals, taskCreated };
+    return {
+      success: true,
+      subjectKey: subject.subjectKey,
+      opportunityKey,
+      qualificationState: evaluation.qualificationState
+    };
   }
 
   public start(): void {

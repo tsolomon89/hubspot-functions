@@ -1,45 +1,80 @@
-export interface CompanyInput {
-  name: string;
-  domain?: string;
-  companyKey?: string;
-}
+export type SubjectKind = 'CONTACT' | 'COMPANY' | 'COMPANY_CONTACTS';
 
-export interface ContactInput {
+export interface ContactRef {
   email: string;
   firstName?: string;
   lastName?: string;
   phone?: string;
+}
+
+export interface CompanyRef {
   companyKey?: string;
-}
-
-export interface ResolvedIdentity {
-  companyKey: string;
-  companyName: string;
+  name: string;
   domain?: string;
-  contactEmail: string;
-  contactFirstName?: string;
-  contactLastName?: string;
-  contactPhone?: string;
 }
 
-export function normalizeCompanyKey(name: string, domain?: string): string {
-  if (domain && domain.trim().length > 0) {
-    return domain.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+export interface CommercialSubject {
+  kind: SubjectKind;
+  subjectKey: string;
+  contact?: ContactRef;
+  company?: CompanyRef;
+  associatedContactEmails?: string[];
+}
+
+export function sanitizeKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '_');
+}
+
+export function resolveSubjectIdentity(
+  contactInput?: ContactRef,
+  companyInput?: CompanyRef
+): CommercialSubject {
+  if (companyInput && companyInput.name) {
+    const rawCompanyKey = companyInput.companyKey || companyInput.domain || companyInput.name;
+    const companyKey = sanitizeKey(rawCompanyKey);
+    const company: CompanyRef = {
+      companyKey,
+      name: companyInput.name.trim(),
+      domain: companyInput.domain ? companyInput.domain.trim().toLowerCase() : undefined
+    };
+
+    if (contactInput && contactInput.email) {
+      const email = contactInput.email.trim().toLowerCase();
+      const subjectKey = `b2b_${companyKey}_${sanitizeKey(email)}`;
+      return {
+        kind: 'COMPANY_CONTACTS',
+        subjectKey,
+        company,
+        contact: {
+          email,
+          firstName: contactInput.firstName ? contactInput.firstName.trim() : undefined,
+          lastName: contactInput.lastName ? contactInput.lastName.trim() : undefined,
+          phone: contactInput.phone ? contactInput.phone.trim() : undefined
+        },
+        associatedContactEmails: [email]
+      };
+    }
+
+    return {
+      kind: 'COMPANY',
+      subjectKey: `company_${companyKey}`,
+      company
+    };
   }
-  return name.trim().toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-}
 
-export function resolveIdentity(companyInput: CompanyInput, contactInput: ContactInput): ResolvedIdentity {
-  const email = contactInput.email.trim().toLowerCase();
-  const companyKey = companyInput.companyKey || normalizeCompanyKey(companyInput.name, companyInput.domain);
+  if (contactInput && contactInput.email) {
+    const email = contactInput.email.trim().toLowerCase();
+    return {
+      kind: 'CONTACT',
+      subjectKey: `b2c_${sanitizeKey(email)}`,
+      contact: {
+        email,
+        firstName: contactInput.firstName ? contactInput.firstName.trim() : undefined,
+        lastName: contactInput.lastName ? contactInput.lastName.trim() : undefined,
+        phone: contactInput.phone ? contactInput.phone.trim() : undefined
+      }
+    };
+  }
 
-  return {
-    companyKey,
-    companyName: companyInput.name.trim(),
-    domain: companyInput.domain?.trim().toLowerCase(),
-    contactEmail: email,
-    contactFirstName: contactInput.firstName?.trim(),
-    contactLastName: contactInput.lastName?.trim(),
-    contactPhone: contactInput.phone?.trim()
-  };
+  throw new Error('Invalid subject input: Must provide either a valid Contact email or Company name');
 }

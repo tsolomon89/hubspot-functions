@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CommercialModelConfig",
+  "type": "object",
+  "required": [
+    "organizationKey",
+    "configVersion",
+    "relationshipType",
+    "hubspotPipelines",
+    "goalsByOpportunityType"
+  ],
+  "properties": {
+    "organizationKey": { "type": "string" },
+    "configVersion": { "type": "string" },
+    "relationshipType": { "type": "string" },
+    "hubspotPipelines": {
+      "type": "object",
+      "required": ["leadPipelineId", "dealPipelineId", "dealStageProbabilities"],
+      "properties": {
+        "leadPipelineId": { "type": "string" },
+        "dealPipelineId": { "type": "string" },
+        "dealStageProbabilities": {
+          "type": "object",
+          "additionalProperties": { "type": "number" }
+        }
+      }
+    },
+    "goalsByOpportunityType": {
+      "type": "object",
+      "required": ["MQL", "SQL", "FTP", "RTP"],
+      "properties": {
+        "MQL": { "type": "array" },
+        "SQL": { "type": "array" },
+        "FTP": { "type": "array" },
+        "RTP": { "type": "array" }
+      }
+    },
+    "featureFlags": {
+      "type": "object",
+      "properties": {
+        "automationSuppressed": { "type": "boolean" },
+        "dryRunTransactions": { "type": "boolean" }
+      }
+    }
+  }
+}

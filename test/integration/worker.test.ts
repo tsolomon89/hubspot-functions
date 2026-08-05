@@ -1,60 +1,71 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { validateProductKey, createInitialProductDeal, requiresActivationTask } from '../../packages/domain';
+import { describe, it, expect } from 'vitest';
+import { ReconciliationWorker } from '../../services/worker';
+import { resolveSubjectIdentity } from '../../packages/domain';
+import { evaluateOpportunity, QualificationConfig, OpportunitySnapshot } from '../../packages/commercial-kernel';
 
-describe('Worker Queue Engine & Domain Integration Suite', () => {
-  it('should validate canonical base product keys strictly', () => {
-    expect(validateProductKey('jurnii_360').valid).toBe(true);
-    expect(validateProductKey('jurnii_ux').valid).toBe(true);
-    expect(validateProductKey('jurnii_cortex').valid).toBe(true);
-    
-    // Invalid/unrecognized product keys return ambiguous: true
-    expect(validateProductKey('unrecognized_product_xyz').ambiguous).toBe(true);
-    expect(validateProductKey('').ambiguous).toBe(true);
-  });
-
-  it('should create initial product deal with deal_key = companyKey::productKey', () => {
-    const deal = createInitialProductDeal({
-      companyKey: 'globex.com',
-      companyName: 'Globex Corp',
-      productKey: 'jurnii_360',
-      contactEmail: 'alice@globex.com',
-      role: 'Decision Maker'
+describe('Worker Queue Engine & Universal Commercial Kernel Integration Suite', () => {
+  it('should process B2C Contact intake job via ReconciliationWorker', async () => {
+    const worker = new ReconciliationWorker();
+    const result = await worker.processIntakeJob('test_corr_1', {
+      contact: { email: 'alice@example.com', firstName: 'Alice', lastName: 'Smith' },
+      organizationKey: 'org_test',
+      relationshipType: 'b2c'
     });
 
-    expect(deal.dealKey).toBe('globex.com::jurnii_360');
-    expect(deal.pipeline).toBe('b2b_pipeline');
-    expect(deal.opportunityStage).toBe('marketing_consent');
-    expect(deal.automationSuppressed).toBe(false);
+    expect(result.success).toBe(true);
+    expect(result.subjectKey).toBe('b2c_alice_example.com');
+    expect(result.opportunityKey).toBe('org_test_b2c_b2c_alice_example.com::MQL::1');
+    expect(result.qualificationState).toBe('SATISFIED'); // B2C MQL satisfied by communication channel (email)
   });
 
-  it('should suppress B2B automation for partnership pipeline deals', () => {
-    const deal = createInitialProductDeal({
-      companyKey: 'partner.com',
-      companyName: 'Partner Co',
-      productKey: 'jurnii_ux',
-      contactEmail: 'partner@partner.com',
-      pipeline: 'partnership_pipeline'
+  it('should process B2B Company + Contact intake job via ReconciliationWorker', async () => {
+    const worker = new ReconciliationWorker();
+    const result = await worker.processIntakeJob('test_corr_2', {
+      company: { name: 'Acme Corp', domain: 'acme.com' },
+      contact: { email: 'bob@acme.com', firstName: 'Bob' },
+      organizationKey: 'org_test',
+      relationshipType: 'b2b'
     });
 
-    expect(deal.pipeline).toBe('partnership_pipeline');
-    expect(deal.automationSuppressed).toBe(true);
+    expect(result.success).toBe(true);
+    expect(result.subjectKey).toBe('b2b_acme.com_bob_acme.com');
+    expect(result.opportunityKey).toBe('org_test_b2b_b2b_acme.com_bob_acme.com::MQL::1');
+    expect(result.qualificationState).toBe('SATISFIED');
   });
 
-  it('should check activation task requirements accurately', () => {
-    const stateActive = {
-      contactEmail: 'alice@globex.com',
-      dealKey: 'globex.com::jurnii_360',
-      role: 'Decision Maker',
-      sequenceActivatedAt: '2026-08-05T00:00:00Z'
+  it('should evaluate B2B SQL goal requirement deterministically', () => {
+    const config: QualificationConfig = {
+      organizationKey: 'org_test',
+      configVersion: '1.0.0',
+      relationshipType: 'b2b',
+      goalsByOpportunityType: {
+        MQL: [],
+        SQL: [{
+          key: 'meeting_goal',
+          name: 'Positive meeting',
+          predicate: 'activityExists',
+          params: { activityType: 'MEETING', outcome: 'COMPLETED' }
+        }],
+        FTP: [],
+        RTP: []
+      }
     };
-    expect(requiresActivationTask(stateActive)).toBe(false);
 
-    const stateUnactivated = {
-      contactEmail: 'alice@globex.com',
-      dealKey: 'globex.com::jurnii_360',
-      role: 'Decision Maker',
-      sequenceActivatedAt: null
+    const snapshot: OpportunitySnapshot = {
+      organizationKey: 'org_test',
+      relationshipKey: 'rel_acme',
+      relationshipType: 'b2b',
+      opportunityKey: 'rel_acme::SQL::1',
+      opportunityType: 'SQL',
+      cycleIndex: 1,
+      openedAt: '2026-08-05T00:00:00Z',
+      subject: { kind: 'COMPANY', key: 'acme.com' },
+      facts: { email: 'bob@acme.com', products: ['prod_software'] },
+      evidence: [] // No meeting evidence -> pending
     };
-    expect(requiresActivationTask(stateUnactivated)).toBe(true);
+
+    const evalRes = evaluateOpportunity(snapshot, config);
+    expect(evalRes.qualificationState).toBe('PENDING');
+    expect(evalRes.unsatisfiedGoalKeys).toContain('meeting_goal');
   });
 });

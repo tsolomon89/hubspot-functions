@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
-import { HubspotClientWrapper } from '../hubspot-client';
+import { HubspotAdapter } from '../hubspot-adapter';
 import { logger } from '../observability';
 
 export interface SchemaDiff {
@@ -23,14 +23,14 @@ export class SchemaTool {
     return yaml.parse(raw);
   }
 
-  public async inspect(hsClient?: HubspotClientWrapper): Promise<any> {
-    if (!hsClient) {
+  public async inspect(hsAdapter?: HubspotAdapter): Promise<any> {
+    if (!hsAdapter) {
       logger.warn('SchemaTool.inspect running without authenticated client; returning empty state.');
       return { propertyGroups: [], properties: {}, associationLabels: [], pipelines: [] };
     }
 
     try {
-      const rawClient = hsClient.getRawClient();
+      const rawClient = hsAdapter.getRawClient();
       const companiesProps = await rawClient.crm.properties.coreApi.getAll('companies');
       const dealsProps = await rawClient.crm.properties.coreApi.getAll('deals');
       const contactsProps = await rawClient.crm.properties.coreApi.getAll('contacts');
@@ -100,15 +100,15 @@ export class SchemaTool {
     };
   }
 
-  public async apply(diff: SchemaDiff, hsClient?: HubspotClientWrapper): Promise<{ applied: boolean; count: number; errors: string[] }> {
-    if (!hsClient) {
+  public async apply(diff: SchemaDiff, hsAdapter?: HubspotAdapter): Promise<{ applied: boolean; count: number; errors: string[] }> {
+    if (!hsAdapter) {
       logger.warn('SchemaTool.apply called without authenticated HubSpot client; returning unapplied diff count.');
       return { applied: false, count: 0, errors: ['No authenticated HubSpot client provided'] };
     }
 
     let appliedCount = 0;
     const errors: string[] = [];
-    const rawClient = hsClient.getRawClient();
+    const rawClient = hsAdapter.getRawClient();
 
     // 1. Create Property Groups
     for (const group of diff.propertyGroupsToCreate) {
@@ -153,8 +153,8 @@ export class SchemaTool {
     return { applied, count: appliedCount, errors };
   }
 
-  public async readback(hsClient?: HubspotClientWrapper): Promise<{ verified: boolean; diffAfterApply: SchemaDiff }> {
-    const inspected = await this.inspect(hsClient);
+  public async readback(hsAdapter?: HubspotAdapter): Promise<{ verified: boolean; diffAfterApply: SchemaDiff }> {
+    const inspected = await this.inspect(hsAdapter);
     const diffAfterApply = this.plan(inspected);
     const verified = diffAfterApply.propertiesToCreate.length === 0;
 
@@ -169,18 +169,18 @@ if (require.main === module) {
   const mode = process.argv[2] || 'plan';
   const tool = new SchemaTool();
   const token = process.env.HUBSPOT_DEVELOPMENT_PERSONAL_ACCESS_KEY || process.env.HUBSPOT_ACCESS_TOKEN;
-  const hsClient = token ? new HubspotClientWrapper(token) : undefined;
+  const hsAdapter = token ? new HubspotAdapter(token) : undefined;
 
   if (mode === 'inspect') {
-    tool.inspect(hsClient).then(res => {
+    tool.inspect(hsAdapter).then(res => {
       console.log('Schema Inspection Result:', JSON.stringify(res, null, 2));
     }).catch(err => {
       console.error('Inspection failed:', err);
       process.exit(1);
     });
   } else if (mode === 'plan') {
-    if (hsClient) {
-      tool.inspect(hsClient).then(inspected => {
+    if (hsAdapter) {
+      tool.inspect(hsAdapter).then(inspected => {
         const diff = tool.plan(inspected);
         console.log('Schema Plan Diff against Account:', JSON.stringify(diff, null, 2));
       });
@@ -190,14 +190,14 @@ if (require.main === module) {
     }
   } else if (mode === 'apply') {
     const diff = tool.plan();
-    tool.apply(diff, hsClient).then(result => {
+    tool.apply(diff, hsAdapter).then(result => {
       console.log('Schema Apply Result:', JSON.stringify(result, null, 2));
       if (!result.applied && result.errors.length > 0) {
         process.exit(1);
       }
     });
   } else if (mode === 'readback') {
-    tool.readback(hsClient).then(result => {
+    tool.readback(hsAdapter).then(result => {
       console.log('Schema Readback Result:', JSON.stringify(result, null, 2));
       if (!result.verified) {
         process.exit(1);

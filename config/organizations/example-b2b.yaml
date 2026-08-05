@@ -1,0 +1,46 @@
+organizationKey: "org_global_corp"
+configVersion: "1.0.0"
+relationshipType: "b2b"
+
+hubspotPipelines:
+  leadPipelineId: "b2b_qualification_lead_pipeline"
+  dealPipelineId: "b2b_transaction_deal_pipeline"
+  dealStageProbabilities:
+    open: 0.20
+    closedwon: 1.00
+    closedlost: 0.00
+
+goalsByOpportunityType:
+  MQL:
+    - key: "b2b_marketing_consent"
+      name: "Explicit marketing consent"
+      predicate: "property"
+      scope: "relationship"
+      params:
+        property: "marketingConsent"
+        equals: true
+
+  SQL:
+    - key: "b2b_positive_meeting"
+      name: "Completed positive meeting outcome"
+      predicate: "activityExists"
+      scope: "opportunity"
+      params:
+        activityType: "MEETING"
+        outcome: "COMPLETED"
+
+  FTP:
+    - key: "b2b_contract_signed"
+      name: "First B2B transaction contract signed"
+      predicate: "transactionExists"
+      scope: "opportunity"
+
+  RTP:
+    - key: "b2b_renewal_order"
+      name: "Subsequent B2B transaction order"
+      predicate: "transactionExists"
+      scope: "sincePredecessorCompletion"
+
+featureFlags:
+  automationSuppressed: false
+  dryRunTransactions: true

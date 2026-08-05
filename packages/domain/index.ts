@@ -1,8 +1,6 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 
 export * from './identity';
-export * from './deal-engine';
-export * from './activation-gate';
 
 export interface WebhookEventPayload {
   eventId: number | string;
@@ -31,31 +29,26 @@ export function validateHubspotSignatureV3(
     return false;
   }
 
-  // Reject stale request timestamps (> 5 mins drift)
   const currentTimestamp = Date.now();
   const requestTimestamp = parseInt(timestampHeader, 10);
   if (isNaN(requestTimestamp) || Math.abs(currentTimestamp - requestTimestamp) > maxDriftMs) {
     return false;
   }
 
-  // Decode URI safely per HubSpot Signature v3 specification
   let formattedUrl = requestUrl;
   try {
     formattedUrl = decodeURIComponent(requestUrl);
   } catch (err) {
-    // If malformed URI, proceed with original string
+    // Fallback if malformed URI
   }
 
-  // Construct source string: METHOD + URL + RAW_BODY + TIMESTAMP
   const rawBodyString = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf-8');
   const sourceString = `${httpMethod.toUpperCase()}${formattedUrl}${rawBodyString}${timestampHeader}`;
 
-  // Compute HMAC SHA-256
   const hash = createHmac('sha256', clientSecret)
     .update(sourceString, 'utf-8')
     .digest('base64');
 
-  // Constant-time comparison using timingSafeEqual
   const signatureBuffer = Buffer.from(signatureHeader, 'utf-8');
   const hashBuffer = Buffer.from(hash, 'utf-8');
 
@@ -66,13 +59,16 @@ export function validateHubspotSignatureV3(
   return timingSafeEqual(signatureBuffer, hashBuffer);
 }
 
-export function computeDealKey(companyKey: string, productKey: string): string {
-  return `${companyKey}::${productKey}`;
+export function computeOpportunityKey(relationshipKey: string, opportunityType: string, cycleIndex: number = 1): string {
+  return `${relationshipKey}::${opportunityType}::${cycleIndex}`;
 }
 
 export function buildTransitionKey(
-  transitionType: 'AcqCW' | 'ExpCW' | 'RenCW' | 'RenCL',
-  wonQuoteId: string | number
+  organizationKey: string,
+  opportunityKey: string,
+  opportunityType: string,
+  cycleIndex: number,
+  configVersion: string
 ): string {
-  return `Lifecycle:${transitionType}:${wonQuoteId}`;
+  return `complete::${organizationKey}::${opportunityKey}::${opportunityType}::${cycleIndex}::${configVersion}`;
 }

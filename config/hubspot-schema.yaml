@@ -2,42 +2,50 @@ version: "2026.03"
 project: "hubspot-functions"
 
 propertyGroups:
-  - name: "commercial_operations"
-    label: "Commercial Operations"
+  - name: "commercial_operations_automation"
+    label: "Commercial Operations Automation"
     objectTypes: ["companies", "deals", "contacts"]
 
 properties:
   companies:
-    - name: "company_key"
-      label: "Company Key"
+    - name: "coa_relationship_key"
+      label: "Relationship Key"
       type: "string"
       fieldType: "text"
-      groupName: "commercial_operations"
-      hasUniqueValue: true
-      description: "Canonical identity key for Company."
+      groupName: "commercial_operations_automation"
+      hasUniqueValue: false
+      description: "Canonical identity key for Commercial Relationship."
+
+    - name: "coa_relationship_type"
+      label: "Relationship Type"
+      type: "string"
+      fieldType: "text"
+      groupName: "commercial_operations_automation"
+      hasUniqueValue: false
+      description: "Relationship Type category (b2b, b2c, partnership, reseller)."
 
   deals:
-    - name: "deal_key"
-      label: "Deal Key"
+    - name: "coa_opportunity_key"
+      label: "Opportunity Key"
       type: "string"
       fieldType: "text"
-      groupName: "commercial_operations"
+      groupName: "commercial_operations_automation"
       hasUniqueValue: true
-      description: "Canonical identity key for Company x Product Deal (companyKey::productKey)."
+      description: "Canonical identity key for Opportunity."
 
-    - name: "product_key"
-      label: "Product Key"
+    - name: "coa_relationship_key"
+      label: "Relationship Key"
       type: "string"
       fieldType: "text"
-      groupName: "commercial_operations"
+      groupName: "commercial_operations_automation"
       hasUniqueValue: false
-      description: "Product key/SKU associated with this Deal."
+      description: "Canonical relationship key."
 
-    - name: "opportunity_type"
+    - name: "coa_opportunity_type"
       label: "Opportunity Type"
       type: "enumeration"
       fieldType: "select"
-      groupName: "commercial_operations"
+      groupName: "commercial_operations_automation"
       options:
         - label: "MQL"
           value: "MQL"
@@ -47,98 +55,89 @@ properties:
           value: "FTP"
         - label: "RTP"
           value: "RTP"
-      description: "High-level pipeline bucket (MQL, SQL, FTP, RTP)."
+      description: "Universal Opportunity Type (MQL, SQL, FTP, RTP)."
 
-    - name: "opportunity_state"
-      label: "Opportunity State"
+    - name: "coa_cycle_index"
+      label: "Cycle Index"
+      type: "number"
+      fieldType: "number"
+      groupName: "commercial_operations_automation"
+      description: "Cycle sequence index for RTP opportunities."
+
+    - name: "coa_predecessor_opportunity_key"
+      label: "Predecessor Opportunity Key"
+      type: "string"
+      fieldType: "text"
+      groupName: "commercial_operations_automation"
+      description: "Opportunity key of preceding completed opportunity."
+
+    - name: "coa_qualification_state"
+      label: "Qualification State"
       type: "enumeration"
       fieldType: "select"
-      groupName: "commercial_operations"
+      groupName: "commercial_operations_automation"
       options:
-        - label: "Open"
-          value: "Open"
-        - label: "Lost"
-          value: "Lost"
-      description: "Commercial viability state (Open or Lost only; Deals never persist as Won)."
+        - label: "PENDING"
+          value: "PENDING"
+        - label: "SATISFIED"
+          value: "SATISFIED"
+        - label: "BLOCKED"
+          value: "BLOCKED"
+        - label: "MANUAL_REVIEW"
+          value: "MANUAL_REVIEW"
+      description: "Current qualification state evaluated by commercial kernel."
 
-    - name: "opportunity_status"
-      label: "Opportunity Status"
-      type: "enumeration"
-      fieldType: "select"
-      groupName: "commercial_operations"
-      options:
-        - label: "New"
-          value: "New"
-        - label: "Working"
-          value: "Working"
-        - label: "Closed"
-          value: "Closed"
-      description: "Activity status (New, Working, Closed)."
+    - name: "coa_unsatisfied_goal_keys"
+      label: "Unsatisfied Goal Keys"
+      type: "string"
+      fieldType: "textarea"
+      groupName: "commercial_operations_automation"
+      description: "JSON array of unsatisfied goal keys."
 
-    - name: "automation_suppressed"
-      label: "Automation Suppressed"
+    - name: "coa_last_evaluated_at"
+      label: "Last Evaluated At"
+      type: "datetime"
+      fieldType: "date"
+      groupName: "commercial_operations_automation"
+      description: "Timestamp of last commercial kernel evaluation."
+
+    - name: "coa_config_version"
+      label: "Config Version"
+      type: "string"
+      fieldType: "text"
+      groupName: "commercial_operations_automation"
+      description: "Version of Organization config evaluated."
+
+    - name: "coa_managed"
+      label: "COA Managed"
       type: "bool"
       fieldType: "booleancheckbox"
-      groupName: "commercial_operations"
+      groupName: "commercial_operations_automation"
       options:
         - label: "True"
           value: "true"
         - label: "False"
           value: "false"
-      description: "Master kill switch for Deal automation."
+      description: "Whether record is managed by Commercial Operations Automation."
 
-associationLabels:
-  - fromObjectType: "deals"
-    toObjectType: "contacts"
-    category: "HUBSPOT_DEFINED"
-    labels:
-      - name: "Decision Maker"
-      - name: "End User"
-      - name: "Influencer"
-
-pipelines:
-  deals:
-    - name: "B2B Pipeline"
-      pipelineId: "b2b_pipeline"
-      displayOrder: 1
-      stages:
-        - label: "Marketing Consent"
-          stageId: "marketing_consent"
-          displayOrder: 1
-        - label: "Demo Booking"
-          stageId: "demo_booking"
-          displayOrder: 2
-        - label: "Demo Confirmation"
-          stageId: "demo_confirmation"
-          displayOrder: 3
-        - label: "Demo Hosted"
-          stageId: "demo_hosted"
-          displayOrder: 4
-        - label: "Proposal Preparation"
-          stageId: "proposal_preparation"
-          displayOrder: 5
-        - label: "Commercial Agreement"
-          stageId: "commercial_agreement"
-          displayOrder: 6
-        - label: "Onboarding"
-          stageId: "onboarding"
-          displayOrder: 7
-        - label: "Renewal"
-          stageId: "renewal"
-          displayOrder: 8
+    - name: "coa_automation_suppressed"
+      label: "Automation Suppressed"
+      type: "bool"
+      fieldType: "booleancheckbox"
+      groupName: "commercial_operations_automation"
+      options:
+        - label: "True"
+          value: "true"
+        - label: "False"
+          value: "false"
+      description: "Master kill switch for Commercial Operations Automation."
 
 webhooks:
   targetUrl: "/webhooks/hubspot"
   subscriptions:
+    - subscriptionType: "contact.creation"
+      enabled: true
     - subscriptionType: "company.creation"
       enabled: true
-    - subscriptionType: "company.propertyChange"
-      propertyName: "company_key"
-      enabled: true
     - subscriptionType: "deal.creation"
-      enabled: true
-    - subscriptionType: "deal.propertyChange"
-      propertyName: "deal_key"
-      enabled: true
-    - subscriptionType: "contact.creation"
       enabled: true

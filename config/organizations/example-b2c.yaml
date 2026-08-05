@@ -1,0 +1,36 @@
+organizationKey: "org_consumer_brand"
+configVersion: "1.0.0"
+relationshipType: "b2c"
+
+hubspotPipelines:
+  leadPipelineId: "b2c_qualification_lead_pipeline"
+  dealPipelineId: "b2c_transaction_deal_pipeline"
+  dealStageProbabilities:
+    open: 0.50
+    closedwon: 1.00
+    closedlost: 0.00
+
+goalsByOpportunityType:
+  MQL: []
+
+  SQL:
+    - key: "b2c_cart_interest"
+      name: "B2C cart interest or offering proposition"
+      predicate: "offeringKnown"
+      scope: "opportunity"
+
+  FTP:
+    - key: "b2c_checkout_payment"
+      name: "First B2C checkout order payment"
+      predicate: "transactionExists"
+      scope: "opportunity"
+
+  RTP:
+    - key: "b2c_repeat_checkout"
+      name: "Repeat B2C checkout order payment"
+      predicate: "transactionExists"
+      scope: "sincePredecessorCompletion"
+
+featureFlags:
+  automationSuppressed: false
+  dryRunTransactions: true
