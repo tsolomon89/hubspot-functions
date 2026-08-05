@@ -37,16 +37,25 @@ server.get('/ready', async (request: FastifyRequest, reply: FastifyReply) => {
   }
 });
 
+function getCompleteUrl(request: FastifyRequest): string {
+  const proto = (request.headers['x-forwarded-proto'] as string) || 'https';
+  const host = (request.headers['x-forwarded-host'] as string) || (request.headers['host'] as string) || request.hostname;
+  return `${proto}://${host}${request.raw.url}`;
+}
+
 server.post('/webhooks/hubspot', async (request: FastifyRequest, reply: FastifyReply) => {
   const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
+  
+  if (!clientSecret && process.env.NODE_ENV === 'production') {
+    logger.error('HUBSPOT_CLIENT_SECRET missing in production environment');
+    return reply.status(500).send({ error: 'Internal Server Error: Security configuration missing' });
+  }
+
   const signature = request.headers['x-hubspot-signature-v3'] as string;
   const timestamp = request.headers['x-hubspot-request-timestamp'] as string;
   const rawBodyBuffer = (request as any).rawBodyBuffer || Buffer.from(JSON.stringify(request.body));
-  
-  // Construct complete received request URL (protocol + host + url)
-  const completeUrl = `${request.protocol}://${request.hostname}${request.raw.url}`;
+  const completeUrl = getCompleteUrl(request);
 
-  // Strict Signature v3 Verification (No fallback secret, no bypass)
   if (clientSecret) {
     const isValid = validateHubspotSignatureV3(
       clientSecret,
@@ -106,7 +115,6 @@ server.post('/webhooks/hubspot', async (request: FastifyRequest, reply: FastifyR
   } catch (err: any) {
     await client.query('ROLLBACK');
     logger.error('Failed to transactionally persist webhook events', err);
-    // Return 500 on DB failure so HubSpot retries delivery
     return reply.status(500).send({ error: 'Internal Server Error: Ingress persistence failed' });
   } finally {
     client.release();
@@ -123,7 +131,7 @@ server.post('/workflow-actions/reconcile', async (request: FastifyRequest, reply
   const signature = request.headers['x-hubspot-signature-v3'] as string;
   const timestamp = request.headers['x-hubspot-request-timestamp'] as string;
   const rawBodyBuffer = (request as any).rawBodyBuffer || Buffer.from(JSON.stringify(request.body));
-  const completeUrl = `${request.protocol}://${request.hostname}${request.raw.url}`;
+  const completeUrl = getCompleteUrl(request);
 
   if (clientSecret) {
     const isValid = validateHubspotSignatureV3(

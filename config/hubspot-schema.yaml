@@ -77,7 +77,7 @@ properties:
 
     - name: "automation_suppressed"
       label: "Automation Suppressed"
-      type: "boolean"
+      type: "bool"
       fieldType: "booleancheckbox"
       groupName: "commercial_operations"
       options:
@@ -90,7 +90,7 @@ properties:
 associationLabels:
   - fromObjectType: "deals"
     toObjectType: "contacts"
-    category: "USER_DEFINED"
+    category: "HUBSPOT_DEFINED"
     labels:
       - name: "Decision Maker"
       - name: "End User"

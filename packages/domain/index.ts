@@ -22,7 +22,7 @@ export function validateHubspotSignatureV3(
   clientSecret: string,
   signatureHeader: string,
   httpMethod: string,
-  requestUri: string,
+  requestUrl: string,
   rawBody: Buffer | string,
   timestampHeader: string,
   maxDriftMs: number = 300000
@@ -38,19 +38,24 @@ export function validateHubspotSignatureV3(
     return false;
   }
 
-  // Ensure URI is properly formatted and decoded if necessary
-  const formattedUri = decodeURIComponent(requestUri);
+  // Decode URI safely per HubSpot Signature v3 specification
+  let formattedUrl = requestUrl;
+  try {
+    formattedUrl = decodeURIComponent(requestUrl);
+  } catch (err) {
+    // If malformed URI, proceed with original string
+  }
 
-  // Construct exact source string: METHOD + URI + RAW_BODY + TIMESTAMP
+  // Construct source string: METHOD + URL + RAW_BODY + TIMESTAMP
   const rawBodyString = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf-8');
-  const sourceString = `${httpMethod.toUpperCase()}${formattedUri}${rawBodyString}${timestampHeader}`;
+  const sourceString = `${httpMethod.toUpperCase()}${formattedUrl}${rawBodyString}${timestampHeader}`;
 
-  // Compute HMAC SHA256
+  // Compute HMAC SHA-256
   const hash = createHmac('sha256', clientSecret)
     .update(sourceString, 'utf-8')
     .digest('base64');
 
-  // Constant-time comparison using timingSafeEqual to prevent timing side-channel attacks
+  // Constant-time comparison using timingSafeEqual
   const signatureBuffer = Buffer.from(signatureHeader, 'utf-8');
   const hashBuffer = Buffer.from(hash, 'utf-8');
 

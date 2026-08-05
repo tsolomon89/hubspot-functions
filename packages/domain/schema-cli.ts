@@ -26,7 +26,7 @@ export class SchemaTool {
   public async inspect(hsClient?: HubspotClientWrapper): Promise<any> {
     if (!hsClient) {
       logger.warn('SchemaTool.inspect running without authenticated client; returning empty state.');
-      return { properties: {}, associationLabels: [], pipelines: [] };
+      return { propertyGroups: [], properties: {}, associationLabels: [], pipelines: [] };
     }
 
     try {
@@ -34,6 +34,7 @@ export class SchemaTool {
       const companiesProps = await rawClient.crm.properties.coreApi.getAll('companies');
       const dealsProps = await rawClient.crm.properties.coreApi.getAll('deals');
       const contactsProps = await rawClient.crm.properties.coreApi.getAll('contacts');
+      const pipelines = await rawClient.crm.pipelines.pipelinesApi.getAll('deals');
 
       return {
         properties: {
@@ -42,10 +43,10 @@ export class SchemaTool {
           contacts: contactsProps.results || []
         },
         associationLabels: [],
-        pipelines: []
+        pipelines: pipelines.results || []
       };
     } catch (err: any) {
-      logger.error('SchemaTool.inspect failed to query CRM Properties API', err);
+      logger.error('SchemaTool.inspect failed to query CRM API', err);
       throw err;
     }
   }
@@ -82,6 +83,13 @@ export class SchemaTool {
           }
         }
       }
+
+      for (const pipe of (manifest.pipelines?.deals || [])) {
+        const existingPipes = currentAccountSchema.pipelines || [];
+        if (!existingPipes.some((e: any) => e.id === pipe.pipelineId || e.label === pipe.name)) {
+          pipelinesToCreate.push(pipe);
+        }
+      }
     }
 
     return {
@@ -92,15 +100,35 @@ export class SchemaTool {
     };
   }
 
-  public async apply(diff: SchemaDiff, hsClient?: HubspotClientWrapper): Promise<{ applied: boolean; count: number }> {
+  public async apply(diff: SchemaDiff, hsClient?: HubspotClientWrapper): Promise<{ applied: boolean; count: number; errors: string[] }> {
     if (!hsClient) {
       logger.warn('SchemaTool.apply called without authenticated HubSpot client; returning unapplied diff count.');
-      return { applied: false, count: 0 };
+      return { applied: false, count: 0, errors: ['No authenticated HubSpot client provided'] };
     }
 
     let appliedCount = 0;
+    const errors: string[] = [];
     const rawClient = hsClient.getRawClient();
 
+    // 1. Create Property Groups
+    for (const group of diff.propertyGroupsToCreate) {
+      for (const objType of group.objectTypes || ['deals', 'companies']) {
+        try {
+          await rawClient.crm.properties.groupsApi.create(objType, {
+            name: group.name,
+            label: group.label,
+            displayOrder: 1
+          });
+          appliedCount++;
+        } catch (err: any) {
+          if (err.statusCode !== 409 && err.code !== 409) {
+            errors.push(`Failed to create property group ${group.name} on ${objType}: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    // 2. Create Properties
     for (const prop of diff.propertiesToCreate) {
       try {
         await rawClient.crm.properties.coreApi.create(prop.objectType, {
@@ -115,14 +143,14 @@ export class SchemaTool {
         } as any);
         appliedCount++;
       } catch (err: any) {
-        logger.info(`Property ${prop.name} already exists or error occurred: ${err.message}`);
+        if (err.statusCode !== 409 && err.code !== 409) {
+          errors.push(`Failed to create property ${prop.name} on ${prop.objectType}: ${err.message}`);
+        }
       }
     }
 
-    return {
-      applied: true,
-      count: appliedCount
-    };
+    const applied = errors.length === 0;
+    return { applied, count: appliedCount, errors };
   }
 
   public async readback(hsClient?: HubspotClientWrapper): Promise<{ verified: boolean; diffAfterApply: SchemaDiff }> {
@@ -164,10 +192,16 @@ if (require.main === module) {
     const diff = tool.plan();
     tool.apply(diff, hsClient).then(result => {
       console.log('Schema Apply Result:', JSON.stringify(result, null, 2));
+      if (!result.applied && result.errors.length > 0) {
+        process.exit(1);
+      }
     });
   } else if (mode === 'readback') {
     tool.readback(hsClient).then(result => {
       console.log('Schema Readback Result:', JSON.stringify(result, null, 2));
+      if (!result.verified) {
+        process.exit(1);
+      }
     });
   } else {
     console.log(`Unknown mode: ${mode}`);
