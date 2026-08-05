@@ -47,7 +47,7 @@ export class SchemaTool {
       };
     } catch (err: any) {
       logger.error('SchemaTool.inspect failed to query CRM API', err);
-      throw err;
+      throw new Error(`SCHEMA_INSPECTION_FAILED: Failed to inspect CRM schema from HubSpot: ${err.message}`);
     }
   }
 
@@ -78,7 +78,8 @@ export class SchemaTool {
       for (const [objType, props] of Object.entries(manifest.properties || {})) {
         const existingProps = currentAccountSchema.properties[objType] || [];
         for (const p of (props as any[])) {
-          if (!existingProps.some((e: any) => e.name === p.name)) {
+          const existing = existingProps.find((e: any) => e.name === p.name);
+          if (!existing || existing.type !== p.type) {
             propertiesToCreate.push({ objectType: objType, ...p });
           }
         }
@@ -86,7 +87,8 @@ export class SchemaTool {
 
       for (const pipe of (manifest.pipelines?.deals || [])) {
         const existingPipes = currentAccountSchema.pipelines || [];
-        if (!existingPipes.some((e: any) => e.id === pipe.pipelineId || e.label === pipe.name)) {
+        const existing = existingPipes.find((e: any) => e.id === pipe.pipelineId || e.label === pipe.name);
+        if (!existing) {
           pipelinesToCreate.push(pipe);
         }
       }

@@ -1,6 +1,8 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 
 export * from './identity';
+export * from './config-resolver';
+export * from './schema-cli';
 
 export interface WebhookEventPayload {
   eventId: number | string;

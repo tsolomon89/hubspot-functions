@@ -1,20 +1,14 @@
-import * as fs from 'fs';
-import * as path from 'path';
-import * as yaml from 'yaml';
 import { Pool } from 'pg';
 import { logger } from '../../packages/observability';
-import { HubspotAdapter, normalizeHubSpotWebhookPayload } from '../../packages/hubspot-adapter';
+import { HubspotAdapter, normalizeHubSpotWebhookPayload, HubSpotSnapshotLoader } from '../../packages/hubspot-adapter';
 import { 
   resolveSubjectIdentity, 
+  OrganizationConfigResolver, 
   ContactRef, 
   CompanyRef 
 } from '../../packages/domain';
-import { 
-  evaluateOpportunity, 
-  planTransition, 
-  QualificationConfig, 
-  OpportunitySnapshot 
-} from '../../packages/commercial-kernel';
+import { evaluateOpportunity, planTransition, OpportunitySnapshot } from '../../packages/commercial-kernel';
+import { TransitionLedger } from './transition-ledger';
 
 export const dbPool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/hubspot_automation',
@@ -39,38 +33,20 @@ export interface JobRecord {
   max_attempts: number;
 }
 
-export function loadOrganizationConfig(relationshipType: string = 'b2b'): QualificationConfig {
-  const configPath = relationshipType === 'b2c' 
-    ? path.join(__dirname, '../../config/organizations/example-b2c.yaml')
-    : path.join(__dirname, '../../config/organizations/example-b2b.yaml');
-
-  if (fs.existsSync(configPath)) {
-    const raw = fs.readFileSync(configPath, 'utf-8');
-    const parsed = yaml.parse(raw);
-    return {
-      organizationKey: parsed.organizationKey || 'org_default',
-      configVersion: parsed.configVersion || '1.0.0',
-      relationshipType: parsed.relationshipType || relationshipType,
-      goalsByOpportunityType: parsed.goalsByOpportunityType || { MQL: [], SQL: [], FTP: [], RTP: [] }
-    };
-  }
-
-  return {
-    organizationKey: 'org_default',
-    configVersion: '1.0.0',
-    relationshipType,
-    goalsByOpportunityType: { MQL: [], SQL: [], FTP: [], RTP: [] }
-  };
-}
-
 export class ReconciliationWorker {
   private hsAdapter: HubspotAdapter;
+  private configResolver: OrganizationConfigResolver;
+  private snapshotLoader: HubSpotSnapshotLoader;
+  private transitionLedger: TransitionLedger;
   private isRunning: boolean = false;
   private pollIntervalMs: number = 1000;
   private pollTimer?: NodeJS.Timeout;
 
   constructor(accessToken?: string, pollIntervalMs: number = 1000) {
     this.hsAdapter = new HubspotAdapter(accessToken);
+    this.configResolver = new OrganizationConfigResolver();
+    this.snapshotLoader = new HubSpotSnapshotLoader(this.hsAdapter);
+    this.transitionLedger = new TransitionLedger(dbPool, this.hsAdapter);
     this.pollIntervalMs = pollIntervalMs;
   }
 
@@ -158,10 +134,9 @@ export class ReconciliationWorker {
       const errorMessage = err.message || String(err);
       logger.error('Job processing failed', err, { jobId: job.id, attempt: job.attempts });
 
-      // Calculate exponential backoff next_attempt_at: NOW() + (1s * 2^attempts)
       const backoffSeconds = Math.pow(2, job.attempts);
 
-      if (job.attempts >= job.max_attempts || errorMessage.startsWith('UNSUPPORTED_JOB_TYPE')) {
+      if (job.attempts >= job.max_attempts || errorMessage.startsWith('UNSUPPORTED_JOB_TYPE') || errorMessage.startsWith('MALFORMED_WEBHOOK')) {
         // Move to Dead Letters
         await dbPool.query(
           `UPDATE hubspot_jobs SET status = 'DEAD_LETTER', last_error = $1, leased_until = NULL, updated_at = NOW() WHERE id = $2`,
@@ -198,47 +173,79 @@ export class ReconciliationWorker {
     const event = normalizedEvents[0];
     logger.info('Processing normalized webhook event', { stableKey: event.stableInboxKey, eventType: event.eventType, objectId: event.objectId });
 
-    // Perform real CRM snapshot load and commercial evaluation
-    const subject = resolveSubjectIdentity({ email: `event_${event.objectId}@example.com` });
-    const config = loadOrganizationConfig('b2b');
+    // Map objectTypeId ('0-1' contact, '0-2' company, '0-3' deal) to target objectType
+    let targetObjectType: 'contact' | 'company' | 'lead' | 'deal' = 'contact';
+    if (event.objectTypeId === '0-2') targetObjectType = 'company';
+    else if (event.objectTypeId === '0-3') targetObjectType = 'deal';
 
-    const relationshipKey = `${config.organizationKey}_b2b_${subject.subjectKey}`;
-    const opportunityKey = `${relationshipKey}::MQL::1`;
+    // 1. Load pure OpportunitySnapshot directly from HubSpot CRM (Zero PostgreSQL commercial state!)
+    const snapshot = await this.snapshotLoader.loadSnapshotFromRecord(
+      { objectType: targetObjectType, objectId: event.objectId },
+      'org_default',
+      'b2b'
+    );
 
-    const snapshot: OpportunitySnapshot = {
-      organizationKey: config.organizationKey,
-      relationshipKey,
-      relationshipType: 'b2b',
-      opportunityKey,
-      opportunityType: 'MQL',
-      opportunityState: 'OPEN',
-      cycleIndex: 1,
-      openedAt: new Date().toISOString(),
-      subject: { kind: 'CONTACT', key: subject.subjectKey },
-      facts: { email: subject.contact?.email },
-      evidence: []
-    };
+    // 2. Resolve organization qualification config
+    const config = this.configResolver.resolveConfig({
+      portalId: event.portalId,
+      relationshipType: snapshot.relationshipType
+    });
 
+    // 3. Evaluate Commercial Kernel goals & plan transition intents
     const evaluation = evaluateOpportunity(snapshot, config);
     const intents = planTransition(snapshot, evaluation, config);
 
-    await this.hsAdapter.applyTransitionIntents(intents, `webhook_${event.eventId}`);
+    // 4. Reserve transition key in operational ledger & apply intents to HubSpot CRM
+    const transitionKey = `wb_${event.eventId}_${snapshot.opportunityKey}`;
+    const reservation = await this.transitionLedger.reserveTransition(transitionKey, snapshot.opportunityKey);
 
-    return { processedEventId: event.eventId, stableKey: event.stableInboxKey, state: evaluation.qualificationState };
+    if (reservation.action === 'ALREADY_APPLIED' || reservation.action === 'RECOVERED_APPLIED') {
+      return { processedEventId: event.eventId, stableKey: event.stableInboxKey, status: 'SKIPPED_ALREADY_APPLIED' };
+    }
+
+    const applyRes = await this.hsAdapter.applyTransitionIntents(intents, transitionKey);
+    await this.transitionLedger.confirmApplied(transitionKey, targetObjectType, event.objectId);
+
+    return { 
+      processedEventId: event.eventId, 
+      stableKey: event.stableInboxKey, 
+      qualificationState: evaluation.qualificationState,
+      appliedIntents: applyRes.appliedIntents
+    };
   }
 
   public async processReconcileRecordJob(correlationId: string, recordId: string, payload: any): Promise<any> {
     logger.info('Executing record reconciliation command', { recordId });
-    const config = loadOrganizationConfig(payload.relationshipType || 'b2b');
-    const snapshot = await this.hsAdapter.loadLeadSnapshot(recordId);
+    const targetObjectType = payload.objectType || 'deal';
+    const snapshot = await this.snapshotLoader.loadSnapshotFromRecord(
+      { objectType: targetObjectType, objectId: recordId },
+      payload.organizationKey || 'org_default',
+      payload.relationshipType || 'b2b'
+    );
 
-    return { reconciledRecordId: recordId, status: 'RECONCILED', snapshot };
+    const config = this.configResolver.resolveConfig({
+      organizationKey: payload.organizationKey,
+      relationshipType: snapshot.relationshipType
+    });
+
+    const evaluation = evaluateOpportunity(snapshot, config);
+    const intents = planTransition(snapshot, evaluation, config);
+
+    const transitionKey = `reconcile_${recordId}_${snapshot.opportunityKey}`;
+    await this.transitionLedger.reserveTransition(transitionKey, snapshot.opportunityKey);
+    const applyRes = await this.hsAdapter.applyTransitionIntents(intents, transitionKey);
+    await this.transitionLedger.confirmApplied(transitionKey, targetObjectType, recordId);
+
+    return { reconciledRecordId: recordId, status: 'RECONCILED', qualificationState: evaluation.qualificationState };
   }
 
   public async processIntakeJob(correlationId: string, payload: IntakeJobPayload): Promise<{ success: boolean; subjectKey: string; opportunityKey: string; qualificationState: string }> {
     const subject = resolveSubjectIdentity(payload.contact, payload.company);
     const relationshipType = payload.relationshipType || (subject.kind === 'CONTACT' ? 'b2c' : 'b2b');
-    const config = loadOrganizationConfig(relationshipType);
+    const config = this.configResolver.resolveConfig({
+      organizationKey: payload.organizationKey,
+      relationshipType
+    });
 
     const relationshipKey = `${config.organizationKey}_${relationshipType}_${subject.subjectKey}`;
     const opportunityKey = `${relationshipKey}::MQL::1`;
@@ -267,7 +274,10 @@ export class ReconciliationWorker {
     const evaluation = evaluateOpportunity(snapshot, config);
     const intents = planTransition(snapshot, evaluation, config);
 
-    await this.hsAdapter.applyTransitionIntents(intents, `transition_${opportunityKey}`);
+    const transitionKey = `intake_${opportunityKey}`;
+    await this.transitionLedger.reserveTransition(transitionKey, opportunityKey);
+    await this.hsAdapter.applyTransitionIntents(intents, transitionKey);
+    await this.transitionLedger.confirmApplied(transitionKey, 'contact', subject.subjectKey);
 
     return {
       success: true,

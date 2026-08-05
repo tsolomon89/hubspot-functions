@@ -2,7 +2,7 @@
   "uid": "reconcile_record_action",
   "type": "workflow-action",
   "config": {
-    "actionUrl": "https://api.example.com/workflow-actions/reconcile",
+    "actionUrl": "https://hubspot-functions.vercel.app/workflow-actions/reconcile",
     "isPublished": false,
     "supportedClients": [
       {

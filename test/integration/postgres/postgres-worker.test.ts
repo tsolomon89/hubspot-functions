@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Pool } from 'pg';
+import { describe, it, expect, beforeAll } from 'vitest';
 import { ReconciliationWorker, dbPool } from '../../../services/worker';
+import { TransitionLedger } from '../../../services/worker/transition-ledger';
+import { HubspotAdapter } from '../../../packages/hubspot-adapter';
 
 describe('Real PostgreSQL Worker Integration & Queue Durability Test Suite', () => {
   const isPostgresAvailable = process.env.DATABASE_URL !== undefined;
@@ -9,7 +10,7 @@ describe('Real PostgreSQL Worker Integration & Queue Durability Test Suite', () 
     if (!isPostgresAvailable) return;
     const client = await dbPool.connect();
     try {
-      // Run table initialization
+      // Run operational table initialization (matching migration 003)
       await client.query(`
         CREATE TABLE IF NOT EXISTS hubspot_jobs (
           id SERIAL PRIMARY KEY,
@@ -53,6 +54,17 @@ describe('Real PostgreSQL Worker Integration & Queue Durability Test Suite', () 
           details JSONB NOT NULL,
           created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS hubspot_transition_keys (
+          transition_key VARCHAR(255) PRIMARY KEY,
+          opportunity_key VARCHAR(255) NOT NULL,
+          status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+          hubspot_object_type VARCHAR(64),
+          hubspot_object_id VARCHAR(64),
+          last_error TEXT,
+          created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+        );
       `);
     } finally {
       client.release();
@@ -68,7 +80,6 @@ describe('Real PostgreSQL Worker Integration & Queue Durability Test Suite', () 
 
     const client = await dbPool.connect();
     try {
-      // Insert test job
       const insertRes = await client.query(`
         INSERT INTO hubspot_jobs (job_type, record_id, payload, status)
         VALUES ('INTAKE_INGESTION', 'rec_test_1', '{"contact":{"email":"test@example.com"}}', 'QUEUED')
@@ -106,5 +117,21 @@ describe('Real PostgreSQL Worker Integration & Queue Durability Test Suite', () 
     } finally {
       client.release();
     }
+  });
+
+  it('should reserve transition key in operational ledger idempotently', async () => {
+    if (!isPostgresAvailable) return;
+
+    const hsAdapter = new HubspotAdapter();
+    const ledger = new TransitionLedger(dbPool, hsAdapter);
+    const key = `wb_test_${Date.now()}`;
+
+    const res1 = await ledger.reserveTransition(key, 'rel_123::MQL::1');
+    expect(res1.action).toBe('RESERVED');
+
+    await ledger.confirmApplied(key, 'deal', 'deal_999');
+
+    const res2 = await ledger.reserveTransition(key, 'rel_123::MQL::1');
+    expect(res2.action).toBe('ALREADY_APPLIED');
   });
 });

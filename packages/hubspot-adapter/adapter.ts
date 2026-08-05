@@ -41,13 +41,14 @@ export class HubspotAdapter {
         hasLineItemObject: true,
         hasCustomObjects: customObjectTypes.length > 0
       };
-    } catch (err) {
+    } catch (err: any) {
+      logger.error('Failed to inspect portal capabilities', err);
       return {
         portalId,
-        hasLeadObject: true,
-        hasQuoteObject: true,
-        hasOrderObject: true,
-        hasLineItemObject: true,
+        hasLeadObject: false, // Return false explicitly on inspection error!
+        hasQuoteObject: false,
+        hasOrderObject: false,
+        hasLineItemObject: false,
         hasCustomObjects: false
       };
     }
@@ -182,39 +183,67 @@ export class HubspotAdapter {
         logger.info('Applying CREATE_SUCCESSOR intent', { predecessor: intent.predecessorKey, successor: intent.successorKey, type: intent.successorType });
 
         if (intent.successorType === 'SQL') {
-          // Create native Lead record in HubSpot
+          // Search Lead by coa_opportunity_key first before creating!
           try {
-            await this.client.crm.objects.leads.basicApi.create({
-              properties: {
-                hs_lead_name: `Lead - ${intent.successorKey}`,
-                coa_opportunity_key: intent.successorKey,
-                coa_opportunity_type: 'SQL',
-                coa_qualification_state: 'PENDING',
-                coa_cycle_index: String(intent.cycleIndex),
-                coa_predecessor_opportunity_key: intent.predecessorKey
-              },
-              associations: []
+            const existingLeads = await this.client.crm.objects.leads.searchApi.doSearch({
+              filterGroups: [{
+                filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: intent.successorKey }]
+              }],
+              sorts: [],
+              properties: ['hs_lead_name', 'coa_opportunity_key'],
+              limit: 1,
+              after: '0'
             });
+
+            if (existingLeads.results.length === 0) {
+              const newLead = await this.client.crm.objects.leads.basicApi.create({
+                properties: {
+                  hs_lead_name: `Lead - ${intent.successorKey}`,
+                  coa_opportunity_key: intent.successorKey,
+                  coa_opportunity_type: 'SQL',
+                  coa_qualification_state: 'PENDING',
+                  coa_cycle_index: String(intent.cycleIndex),
+                  coa_predecessor_opportunity_key: intent.predecessorKey
+                },
+                associations: []
+              });
+              // Read-after-write verification
+              await this.client.crm.objects.leads.basicApi.getById(newLead.id, ['coa_opportunity_key']);
+            }
           } catch (err: any) {
-            logger.info(`Lead record creation note: ${err.message}`);
+            logger.info(`Lead record operation note: ${err.message}`);
           }
         } else if (intent.successorType === 'FTP' || intent.successorType === 'RTP') {
-          // Create native Deal record in HubSpot
+          // Search Deal by coa_opportunity_key first before creating!
           try {
-            await this.client.crm.deals.basicApi.create({
-              properties: {
-                dealname: `Transaction Deal - ${intent.successorKey}`,
-                dealstage: 'open',
-                coa_opportunity_key: intent.successorKey,
-                coa_opportunity_type: intent.successorType,
-                coa_qualification_state: 'PENDING',
-                coa_cycle_index: String(intent.cycleIndex),
-                coa_predecessor_opportunity_key: intent.predecessorKey
-              },
-              associations: []
+            const existingDeals = await this.client.crm.deals.searchApi.doSearch({
+              filterGroups: [{
+                filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: intent.successorKey }]
+              }],
+              sorts: [],
+              properties: ['dealname', 'coa_opportunity_key'],
+              limit: 1,
+              after: '0'
             });
+
+            if (existingDeals.results.length === 0) {
+              const newDeal = await this.client.crm.deals.basicApi.create({
+                properties: {
+                  dealname: `Transaction Deal - ${intent.successorKey}`,
+                  dealstage: 'open',
+                  coa_opportunity_key: intent.successorKey,
+                  coa_opportunity_type: intent.successorType,
+                  coa_qualification_state: 'PENDING',
+                  coa_cycle_index: String(intent.cycleIndex),
+                  coa_predecessor_opportunity_key: intent.predecessorKey
+                },
+                associations: []
+              });
+              // Read-after-write verification
+              await this.client.crm.deals.basicApi.getById(newDeal.id, ['coa_opportunity_key']);
+            }
           } catch (err: any) {
-            logger.info(`Deal record creation note: ${err.message}`);
+            logger.info(`Deal record operation note: ${err.message}`);
           }
         }
         appliedIntents++;
