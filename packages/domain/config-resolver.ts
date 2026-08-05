@@ -8,6 +8,10 @@ export interface ResolveConfigOptions {
 }
 
 export class OrganizationConfigResolver {
+  public static resolveConfigByPortalId(portalId: number | string): QualificationConfig {
+    return new OrganizationConfigResolver().resolveConfig({ portalId });
+  }
+
   public resolvePortalInstallation(portalId?: number | string): { organizationKey: string; defaultRelationshipType: string } | null {
     if (!portalId) return null;
     const strPortalId = String(portalId).trim();

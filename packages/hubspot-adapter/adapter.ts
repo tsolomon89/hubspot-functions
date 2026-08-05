@@ -29,18 +29,29 @@ export interface MutationReceipt {
 
 export function parseHubSpotTimestamp(raw: unknown): string | null {
   if (!raw) return null;
-  if (typeof raw === 'number') {
-    return new Date(raw).toISOString();
-  }
-  const str = String(raw).trim();
-  if (!isNaN(Number(str)) && !str.includes('-') && !str.includes('T')) {
-    return new Date(Number(str)).toISOString();
-  }
-  const parsed = new Date(str);
-  if (isNaN(parsed.getTime())) {
+  try {
+    if (typeof raw === 'number') {
+      if (isNaN(raw) || !isFinite(raw)) return null;
+      const date = new Date(raw);
+      if (isNaN(date.getTime())) return null;
+      return date.toISOString();
+    }
+    const str = String(raw).trim();
+    if (!isNaN(Number(str)) && !str.includes('-') && !str.includes('T')) {
+      const num = Number(str);
+      if (isNaN(num) || !isFinite(num)) return null;
+      const date = new Date(num);
+      if (isNaN(date.getTime())) return null;
+      return date.toISOString();
+    }
+    const parsed = new Date(str);
+    if (isNaN(parsed.getTime())) {
+      return null;
+    }
+    return parsed.toISOString();
+  } catch (e) {
     return null;
   }
-  return parsed.toISOString();
 }
 
 export class HubspotAdapter {
@@ -114,7 +125,7 @@ export class HubspotAdapter {
           contactId = subject.contactKeys[0];
         } else {
           // Retrieve associated Contact ID via CRM Associations API
-          const assoc = await this.client.crm.associations.v4.basicApi.getPage('companies', subject.key, 'contacts');
+          const assoc = await this.client.crm.associations.v4.basicApi.getPage('company', subject.key, 'contact');
           if (assoc.results && assoc.results.length > 0) {
             contactId = String(assoc.results[0].toObjectId);
           } else {
@@ -202,7 +213,7 @@ export class HubspotAdapter {
       if (subjectRef.contactKeys && subjectRef.contactKeys.length > 0) {
         const contact = await this.client.crm.contacts.basicApi.getById(
           subjectRef.contactKeys[0],
-          ['email', 'firstname', 'lastname', 'phone', 'coa_marketing_consent']
+          ['email', 'firstname', 'lastname', 'phone', 'coa_marketing_consent', 'coa_automation_suppressed']
         );
         facts.email = contact.properties?.email;
         facts.contactEmail = contact.properties?.email;
@@ -210,6 +221,9 @@ export class HubspotAdapter {
         facts.lastName = contact.properties?.lastname;
         if (facts.marketingConsent === undefined && contact.properties?.coa_marketing_consent !== undefined && contact.properties?.coa_marketing_consent !== null) {
           facts.marketingConsent = contact.properties.coa_marketing_consent === 'true';
+        }
+        if (contact.properties?.coa_automation_suppressed === 'true') {
+          facts.automationSuppressed = true;
         }
       }
     }
@@ -246,47 +260,59 @@ export class HubspotAdapter {
   public async loadAssociatedEvidence(
     associatedObjectId: string, 
     associatedObjectType: string = 'contact',
-    opportunityWindow?: { openedAt?: string; predecessorCompletedAt?: string }
+    opportunityWindow?: { openedAt?: string; predecessorCompletedAt?: string },
+    associatedContactId?: string
   ): Promise<EvidenceRecord[]> {
     const evidence: EvidenceRecord[] = [];
     if (!associatedObjectId || associatedObjectId === '0') return evidence;
 
-    const fromType = associatedObjectType.toLowerCase() === 'company' ? 'companies' : 'contacts';
+    const targets: Array<{ id: string; type: string }> = [
+      { id: associatedObjectId, type: associatedObjectType.toLowerCase() === 'company' ? 'company' : 'contact' }
+    ];
 
-    const page = await this.client.crm.associations.v4.basicApi.getPage(
-      fromType, 
-      associatedObjectId, 
-      'meetings'
-    );
+    if (associatedObjectType.toLowerCase() === 'company' && associatedContactId) {
+      targets.push({ id: associatedContactId, type: 'contact' });
+    }
 
     const openedAtTime = opportunityWindow?.openedAt ? new Date(opportunityWindow.openedAt).getTime() : 0;
     const predecessorTime = opportunityWindow?.predecessorCompletedAt ? new Date(opportunityWindow.predecessorCompletedAt).getTime() : 0;
     const lowerBoundary = Math.max(openedAtTime, predecessorTime);
 
-    for (const assoc of page.results || []) {
-      const meetingId = String(assoc.toObjectId);
-      const meeting = await this.client.crm.objects.meetings.basicApi.getById(
-        meetingId,
-        ['hs_activity_type', 'hs_meeting_outcome', 'hs_timestamp']
+    for (const target of targets) {
+      const page = await this.client.crm.associations.v4.basicApi.getPage(
+        target.type, 
+        target.id, 
+        'meeting'
       );
 
-      const parsedTimestamp = parseHubSpotTimestamp(meeting.properties.hs_timestamp);
-      if (!parsedTimestamp) continue; // Skip invalid timestamp
+      for (const assoc of page.results || []) {
+        const meetingId = String(assoc.toObjectId);
+        if (evidence.some(e => e.id === meetingId)) continue;
 
-      const occurredTime = new Date(parsedTimestamp).getTime();
-      if (occurredTime > lowerBoundary) {
-        evidence.push({
-          id: meeting.id,
-          predicate: 'activityExists',
-          scope: 'opportunity',
-          occurredAt: parsedTimestamp,
-          data: {
-            activityType: 'MEETING',
-            outcome: meeting.properties.hs_meeting_outcome === 'COMPLETED' ? 'COMPLETED' : 'HELD'
-          }
-        });
+        const meeting = await this.client.crm.objects.meetings.basicApi.getById(
+          meetingId,
+          ['hs_activity_type', 'hs_meeting_outcome', 'hs_timestamp']
+        );
+
+        const parsedTimestamp = parseHubSpotTimestamp(meeting.properties.hs_timestamp);
+        if (!parsedTimestamp) continue;
+
+        const occurredTime = new Date(parsedTimestamp).getTime();
+        if (occurredTime > lowerBoundary) {
+          evidence.push({
+            id: meeting.id,
+            predicate: 'activityExists',
+            scope: 'opportunity',
+            occurredAt: parsedTimestamp,
+            data: {
+              activityType: 'MEETING',
+              outcome: meeting.properties.hs_meeting_outcome === 'COMPLETED' ? 'COMPLETED' : 'HELD'
+            }
+          });
+        }
       }
     }
+
     return evidence;
   }
 
@@ -407,8 +433,21 @@ export class HubspotAdapter {
         if (intent.successorType === 'FTP' || intent.successorType === 'RTP') {
           const existingDeals = await this.client.crm.deals.searchApi.doSearch({
             filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: intent.successorKey }] }],
-            sorts: [], properties: ['dealname', 'coa_opportunity_key'], limit: 1, after: '0'
+            sorts: [], properties: ['dealname', 'dealstage', 'pipeline', 'coa_opportunity_key', 'coa_opportunity_type', 'coa_cycle_index'], limit: 1, after: '0'
           });
+
+          // Resolve Contact & Company target IDs
+          let expectedContactId: string | undefined = undefined;
+          let expectedCompanyId: string | undefined = undefined;
+
+          if (intent.subject?.kind === 'CONTACT') {
+            expectedContactId = intent.subject.key;
+          } else if (intent.subject?.kind === 'COMPANY') {
+            expectedCompanyId = intent.subject.key;
+            if (intent.subject.contactKeys && intent.subject.contactKeys.length > 0) {
+              expectedContactId = intent.subject.contactKeys[0];
+            }
+          }
 
           if (existingDeals.results.length === 0) {
             const relKey = intent.successorKey.split('::')[0];
@@ -416,22 +455,17 @@ export class HubspotAdapter {
 
             // Build native Deal associations (Contact ID, Company ID)
             const associations: any[] = [];
-            if (intent.subject?.kind === 'CONTACT') {
+            if (expectedContactId) {
               associations.push({
-                to: { id: intent.subject.key },
+                to: { id: expectedContactId },
                 types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 3 }]
               });
-            } else if (intent.subject?.kind === 'COMPANY') {
+            }
+            if (expectedCompanyId) {
               associations.push({
-                to: { id: intent.subject.key },
+                to: { id: expectedCompanyId },
                 types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 5 }]
               });
-              if (intent.subject.contactKeys && intent.subject.contactKeys.length > 0) {
-                associations.push({
-                  to: { id: intent.subject.contactKeys[0] },
-                  types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 3 }]
-                });
-              }
             }
 
             const newDeal = await this.client.crm.deals.basicApi.create({
@@ -453,19 +487,22 @@ export class HubspotAdapter {
               associations
             });
 
-            // Read-after-write verification for Deal properties AND associations
+            // Read-after-write verification for Deal properties AND exact target IDs
             const readback = await this.client.crm.deals.basicApi.getById(newDeal.id, ['coa_opportunity_key', 'coa_opportunity_type', 'coa_cycle_index']);
             const propVerified = readback?.properties?.coa_opportunity_key === intent.successorKey &&
                                  readback?.properties?.coa_opportunity_type === intent.successorType &&
                                  readback?.properties?.coa_cycle_index === String(intent.cycleIndex);
 
             let assocVerified = true;
-            if (intent.subject?.kind === 'CONTACT') {
-              const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage('deals', newDeal.id, 'contacts');
-              assocVerified = Boolean(contactAssoc.results && contactAssoc.results.length > 0);
-            } else if (intent.subject?.kind === 'COMPANY') {
-              const companyAssoc = await this.client.crm.associations.v4.basicApi.getPage('deals', newDeal.id, 'companies');
-              assocVerified = Boolean(companyAssoc.results && companyAssoc.results.length > 0);
+            if (expectedContactId) {
+              const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', newDeal.id, 'contact');
+              const found = (contactAssoc.results || []).some(r => String(r.toObjectId) === expectedContactId);
+              if (!found) assocVerified = false;
+            }
+            if (expectedCompanyId) {
+              const companyAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', newDeal.id, 'company');
+              const found = (companyAssoc.results || []).some(r => String(r.toObjectId) === expectedCompanyId);
+              if (!found) assocVerified = false;
             }
 
             receipts.push({
@@ -483,12 +520,29 @@ export class HubspotAdapter {
               verified: assocVerified
             });
           } else {
+            // Revalidate existing successor Deal properties and exact associations
+            const existingDeal = existingDeals.results[0];
+            const propVerified = existingDeal.properties?.coa_opportunity_key === intent.successorKey &&
+                                 existingDeal.properties?.coa_opportunity_type === intent.successorType;
+
+            let assocVerified = true;
+            if (expectedContactId) {
+              const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', existingDeal.id, 'contact');
+              const found = (contactAssoc.results || []).some(r => String(r.toObjectId) === expectedContactId);
+              if (!found) assocVerified = false;
+            }
+            if (expectedCompanyId) {
+              const companyAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', existingDeal.id, 'company');
+              const found = (companyAssoc.results || []).some(r => String(r.toObjectId) === expectedCompanyId);
+              if (!found) assocVerified = false;
+            }
+
             receipts.push({
               intentKind: 'CREATE_SUCCESSOR',
               objectType: 'deal',
-              objectId: existingDeals.results[0].id,
+              objectId: existingDeal.id,
               operation: 'NOOP',
-              verified: true
+              verified: propVerified && assocVerified
             });
           }
         }
@@ -513,7 +567,7 @@ export class HubspotAdapter {
           await this.client.crm.companies.basicApi.update(subject.key, {
             properties: { lifecyclestage: intent.stage }
           });
-          const readback = await this.client.crm.companies.basicApi.update ? await this.client.crm.companies.basicApi.getById(subject.key, ['lifecyclestage']) : { properties: { lifecyclestage: intent.stage } };
+          const readback = await this.client.crm.companies.basicApi.getById(subject.key, ['lifecyclestage']);
           const verified = readback?.properties?.lifecyclestage === intent.stage;
           receipts.push({
             intentKind: 'PROJECT_LIFECYCLE_STAGE',
@@ -526,25 +580,55 @@ export class HubspotAdapter {
         appliedIntents++;
       } else if (intent.kind === 'CREATE_MANUAL_REVIEW') {
         logger.warn('Applying CREATE_MANUAL_REVIEW intent', { opportunityKey: intent.opportunityKey, reason: intent.reason });
-        const newTask = await this.client.crm.objects.tasks.basicApi.create({
-          properties: {
-            hs_task_subject: `[Manual Review] ${intent.opportunityKey}`,
-            hs_task_body: intent.reason,
-            hs_task_status: 'NOT_STARTED',
-            hs_task_priority: 'HIGH',
-            hs_timestamp: String(Date.now())
-          },
-          associations: []
+        const taskSubject = `[Manual Review] ${intent.opportunityKey}`;
+
+        const existingTasks = await this.client.crm.objects.tasks.searchApi.doSearch({
+          filterGroups: [{ filters: [{ propertyName: 'hs_task_subject', operator: 'EQ' as any, value: taskSubject }] }],
+          sorts: [], properties: ['hs_task_subject'], limit: 1, after: '0'
         });
-        const readback = await this.client.crm.objects.tasks.basicApi.getById(newTask.id, ['hs_task_subject']);
-        const verified = Boolean(readback?.id);
-        receipts.push({
-          intentKind: 'CREATE_MANUAL_REVIEW',
-          objectType: 'task',
-          objectId: newTask.id,
-          operation: 'CREATE',
-          verified
-        });
+
+        if (existingTasks.results.length > 0) {
+          receipts.push({
+            intentKind: 'CREATE_MANUAL_REVIEW',
+            objectType: 'task',
+            objectId: existingTasks.results[0].id,
+            operation: 'NOOP',
+            verified: true
+          });
+        } else {
+          const associations: any[] = [];
+          if (intent.subject?.kind === 'CONTACT') {
+            associations.push({
+              to: { id: intent.subject.key },
+              types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 204 }]
+            });
+          } else if (intent.subject?.kind === 'COMPANY') {
+            associations.push({
+              to: { id: intent.subject.key },
+              types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 218 }]
+            });
+          }
+
+          const newTask = await this.client.crm.objects.tasks.basicApi.create({
+            properties: {
+              hs_task_subject: taskSubject,
+              hs_task_body: intent.reason,
+              hs_task_status: 'NOT_STARTED',
+              hs_task_priority: 'HIGH',
+              hs_timestamp: String(Date.now())
+            },
+            associations
+          });
+          const readback = await this.client.crm.objects.tasks.basicApi.getById(newTask.id, ['hs_task_subject']);
+          const verified = Boolean(readback?.id);
+          receipts.push({
+            intentKind: 'CREATE_MANUAL_REVIEW',
+            objectType: 'task',
+            objectId: newTask.id,
+            operation: 'CREATE',
+            verified
+          });
+        }
         appliedIntents++;
       } else if (intent.kind === 'NOOP') {
         receipts.push({

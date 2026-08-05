@@ -42,22 +42,68 @@ export class HubSpotSnapshotLoader {
 
     const client = this.hsAdapter.getRawClient();
 
-    if (recordRef.objectType === 'contact' || recordRef.objectType === 'company') {
-      const isCompany = recordRef.objectType === 'company';
-      subject = isCompany ? { kind: 'COMPANY', key: recordRef.objectId } : { kind: 'CONTACT', key: recordRef.objectId };
-      
-      const subjectFacts = await this.hsAdapter.loadSubjectSnapshot(subject);
-      Object.assign(facts, subjectFacts);
+    if (recordRef.objectType === 'contact') {
+      subject = { kind: 'CONTACT', key: recordRef.objectId };
+      const contactFacts = await this.hsAdapter.loadSubjectSnapshot(subject);
+      Object.assign(facts, contactFacts);
 
-      if (facts.automationSuppressed === true) {
-        logger.info('Automation suppressed on subject record', { subject });
-        facts.blocked = true;
+      // Independently resolve associated Company ID for dual context
+      try {
+        const companyAssoc = await client.crm.associations.v4.basicApi.getPage('contact', recordRef.objectId, 'company');
+        if (companyAssoc.results && companyAssoc.results.length > 0) {
+          const companyId = String(companyAssoc.results[0].toObjectId);
+          subject = { kind: 'COMPANY', key: companyId, contactKeys: [recordRef.objectId] };
+          const companyFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'COMPANY', key: companyId });
+          if (companyFacts.relationshipKey) facts.relationshipKey = companyFacts.relationshipKey;
+          if (companyFacts.relationshipType) facts.relationshipType = companyFacts.relationshipType;
+          if (companyFacts.automationSuppressed === true) facts.automationSuppressed = true;
+        }
+      } catch (e: any) {
+        logger.warn('Could not resolve company for contact', e);
       }
-      
-      relationshipKey = (subjectFacts.relationshipKey as string) || (isCompany ? (subjectFacts.domain as string) : (subjectFacts.email as string)) || `rel_${recordRef.objectId}`;
+
+      relationshipKey = (facts.relationshipKey as string) || (facts.domain as string) || (facts.email as string) || `rel_${recordRef.objectId}`;
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
-      // Bootstrap or retrieve initial managed Lead for Contact/Company relationship
+      const managedLead = await this.hsAdapter.findOrCreateLeadForSubject(subject, relationshipKey, relationshipType, config);
+      if (managedLead) {
+        opportunityType = (managedLead.coa_opportunity_type as OpportunityType) || 'MQL';
+        cycleIndex = Number(managedLead.coa_cycle_index || 1);
+        opportunityKey = managedLead.coa_opportunity_key || opportunityKey;
+        if (managedLead.createdate) {
+          openedAt = parseHubSpotTimestamp(managedLead.createdate) || openedAt;
+        }
+        const stage = (managedLead.hs_pipeline_stage as string) || 'mql';
+        if (stage === 'qualified') opportunityState = 'WON';
+        else if (stage === 'disqualified') opportunityState = 'LOST';
+        facts.stage = stage;
+        facts.leadId = managedLead.id;
+
+        if (managedLead.coa_offering_keys) {
+          facts.offeringKeys = String(managedLead.coa_offering_keys).split(',');
+          facts.products = facts.offeringKeys;
+        }
+      }
+    } else if (recordRef.objectType === 'company') {
+      subject = { kind: 'COMPANY', key: recordRef.objectId };
+      const companyFacts = await this.hsAdapter.loadSubjectSnapshot(subject);
+      Object.assign(facts, companyFacts);
+
+      // Independently resolve associated Contact ID for dual context
+      try {
+        const contactAssoc = await client.crm.associations.v4.basicApi.getPage('company', recordRef.objectId, 'contact');
+        if (contactAssoc.results && contactAssoc.results.length > 0) {
+          const contactId = String(contactAssoc.results[0].toObjectId);
+          (subject as any).contactKeys = [contactId];
+          const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: contactId });
+          if (contactFacts.email) facts.email = contactFacts.email;
+          if (contactFacts.automationSuppressed === true) facts.automationSuppressed = true;
+        }
+      } catch (e) {}
+
+      relationshipKey = (facts.relationshipKey as string) || (facts.domain as string) || `rel_${recordRef.objectId}`;
+      opportunityKey = `${relationshipKey}::LEAD::1`;
+
       const managedLead = await this.hsAdapter.findOrCreateLeadForSubject(subject, relationshipKey, relationshipType, config);
       if (managedLead) {
         opportunityType = (managedLead.coa_opportunity_type as OpportunityType) || 'MQL';
@@ -88,13 +134,32 @@ export class HubSpotSnapshotLoader {
         openedAt = parseHubSpotTimestamp(leadProps.createdate) || openedAt;
       }
 
-      // Query associated Contact / Company to resolve subject identity
-      const assoc = await client.crm.associations.v4.basicApi.getPage('leads', recordRef.objectId, 'contacts');
-      if (assoc.results && assoc.results.length > 0) {
-        const contactId = String(assoc.results[0].toObjectId);
-        subject = { kind: 'CONTACT', key: contactId };
-        const contactFacts = await this.hsAdapter.loadSubjectSnapshot(subject);
-        Object.assign(facts, contactFacts);
+      // Query associated Contact AND Company to resolve dual subject identity
+      let resolvedContactId: string | undefined = undefined;
+      let resolvedCompanyId: string | undefined = undefined;
+
+      try {
+        const contactAssoc = await client.crm.associations.v4.basicApi.getPage('lead', recordRef.objectId, 'contact');
+        if (contactAssoc.results && contactAssoc.results.length > 0) {
+          resolvedContactId = String(contactAssoc.results[0].toObjectId);
+          const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: resolvedContactId });
+          Object.assign(facts, contactFacts);
+        }
+      } catch (e) {}
+
+      try {
+        const companyAssoc = await client.crm.associations.v4.basicApi.getPage('lead', recordRef.objectId, 'company');
+        if (companyAssoc.results && companyAssoc.results.length > 0) {
+          resolvedCompanyId = String(companyAssoc.results[0].toObjectId);
+          const companyFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'COMPANY', key: resolvedCompanyId });
+          if (companyFacts.relationshipKey) facts.relationshipKey = companyFacts.relationshipKey;
+        }
+      } catch (e) {}
+
+      if (resolvedCompanyId) {
+        subject = { kind: 'COMPANY', key: resolvedCompanyId, contactKeys: resolvedContactId ? [resolvedContactId] : [] };
+      } else if (resolvedContactId) {
+        subject = { kind: 'CONTACT', key: resolvedContactId };
       }
 
       const stage = (leadProps.hs_pipeline_stage as string) || 'mql';
@@ -122,30 +187,37 @@ export class HubSpotSnapshotLoader {
         openedAt = parseHubSpotTimestamp(dealProps.createdate) || openedAt;
       }
 
-      // Query associated Contact / Company
-      const companyAssoc = await client.crm.associations.v4.basicApi.getPage('deals', recordRef.objectId, 'companies');
-      if (companyAssoc.results && companyAssoc.results.length > 0) {
-        const companyId = String(companyAssoc.results[0].toObjectId);
-        subject = { kind: 'COMPANY', key: companyId };
-        const companyFacts = await this.hsAdapter.loadSubjectSnapshot(subject);
-        Object.assign(facts, companyFacts);
-      }
-      
-      const contactAssoc = await client.crm.associations.v4.basicApi.getPage('deals', recordRef.objectId, 'contacts');
-      if (contactAssoc.results && contactAssoc.results.length > 0) {
-        const contactId = String(contactAssoc.results[0].toObjectId);
-        if (subject.kind === 'COMPANY') {
-          (subject as any).contactKeys = [contactId];
-        } else {
-          subject = { kind: 'CONTACT', key: contactId };
+      // Query associated Contact AND Company for Deal
+      let resolvedContactId: string | undefined = undefined;
+      let resolvedCompanyId: string | undefined = undefined;
+
+      try {
+        const companyAssoc = await client.crm.associations.v4.basicApi.getPage('deal', recordRef.objectId, 'company');
+        if (companyAssoc.results && companyAssoc.results.length > 0) {
+          resolvedCompanyId = String(companyAssoc.results[0].toObjectId);
+          const companyFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'COMPANY', key: resolvedCompanyId });
+          if (companyFacts.relationshipKey) facts.relationshipKey = companyFacts.relationshipKey;
         }
-        const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: contactId });
-        Object.assign(facts, contactFacts);
+      } catch (e) {}
+
+      try {
+        const contactAssoc = await client.crm.associations.v4.basicApi.getPage('deal', recordRef.objectId, 'contact');
+        if (contactAssoc.results && contactAssoc.results.length > 0) {
+          resolvedContactId = String(contactAssoc.results[0].toObjectId);
+          const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: resolvedContactId });
+          Object.assign(facts, contactFacts);
+        }
+      } catch (e) {}
+
+      if (resolvedCompanyId) {
+        subject = { kind: 'COMPANY', key: resolvedCompanyId, contactKeys: resolvedContactId ? [resolvedContactId] : [] };
+      } else if (resolvedContactId) {
+        subject = { kind: 'CONTACT', key: resolvedContactId };
       }
 
       // Load associated Line Items & Products
       try {
-        const lineItemAssocs = await client.crm.associations.v4.basicApi.getPage('deals', recordRef.objectId, 'line_items');
+        const lineItemAssocs = await client.crm.associations.v4.basicApi.getPage('deal', recordRef.objectId, 'line_items');
         const productIds: string[] = [];
         const lineItems: any[] = [];
 
@@ -177,11 +249,16 @@ export class HubSpotSnapshotLoader {
       facts.dealId = recordRef.objectId;
     }
 
-    // Load associated evidence strictly scoped to subject ID within window
+    // Load associated evidence strictly scoped to subject ID & associated contact ID within window
+    const associatedContactId = subject.kind === 'COMPANY' && subject.contactKeys && subject.contactKeys.length > 0
+      ? subject.contactKeys[0]
+      : undefined;
+
     const evidence = await this.hsAdapter.loadAssociatedEvidence(
       subject.key, 
       subject.kind.toLowerCase(), 
-      { openedAt, predecessorCompletedAt }
+      { openedAt, predecessorCompletedAt },
+      associatedContactId
     );
 
     return {

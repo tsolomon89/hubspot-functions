@@ -2,43 +2,40 @@ import { describe, it, expect } from 'vitest';
 import { SchemaTool } from '../../packages/domain/schema-cli';
 
 describe('Schema Tool Plan & Apply Determinism', () => {
-  it('should load manifest and parse valid YAML structure', () => {
+  it('should plan property and pipeline creation from hubspot-schema.yaml manifest', () => {
     const tool = new SchemaTool();
     const manifest = tool.loadManifest();
+
     expect(manifest.version).toBe('2026.03');
     expect(manifest.project).toBe('hubspot-functions');
-    expect(manifest.properties).toBeDefined();
-    expect(manifest.properties.deals).toBeDefined();
-  });
 
-  it('should generate deterministic schema plan diff for coa_ properties', () => {
-    const tool = new SchemaTool();
     const diff = tool.plan();
+    expect(diff.propertyGroupsToCreate.length).toBeGreaterThan(0);
     expect(diff.propertiesToCreate.length).toBeGreaterThan(0);
-    const hasOppKey = diff.propertiesToCreate.some((p: any) => p.name === 'coa_opportunity_key');
-    expect(hasOppKey).toBe(true);
+    expect(diff.pipelinesToCreate.length).toBeGreaterThan(0);
   });
 
   it('should return empty diff when inspecting fully provisioned account schema', () => {
     const tool = new SchemaTool();
     const manifest = tool.loadManifest();
-    
-    // Mock current account schema containing all manifest properties and pipelines
+
     const mockCurrentSchema = {
       properties: {
-        companies: manifest.properties.companies || [],
-        deals: manifest.properties.deals || [],
-        leads: manifest.properties.leads || [],
-        contacts: manifest.properties.contacts || []
+        contacts: manifest.properties.contacts,
+        companies: manifest.properties.companies,
+        leads: manifest.properties.leads,
+        deals: manifest.properties.deals
       },
       pipelines: {
-        deals: (manifest.pipelines?.deals || []).map((p: any) => ({
+        leads: (manifest.pipelines.leads || []).map((p: any) => ({
           id: p.pipelineId,
-          label: p.name
+          label: p.name,
+          stages: p.stages.map((s: any) => ({ id: s.stageId, label: s.label }))
         })),
-        leads: (manifest.pipelines?.leads || []).map((p: any) => ({
+        deals: (manifest.pipelines.deals || []).map((p: any) => ({
           id: p.pipelineId,
-          label: p.name
+          label: p.name,
+          stages: p.stages.map((s: any) => ({ id: s.stageId, label: s.label }))
         }))
       }
     };

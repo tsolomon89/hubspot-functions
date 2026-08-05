@@ -124,7 +124,6 @@ export function evaluatePredicate(
     case 'transactionExists': {
       const evMatches = matchingEvidence.filter(e => e.predicate === 'transactionExists' || e.data?.transactionId || e.data?.orderId);
       
-      // Authoritative transaction completion: requires Closed Won stage or explicit completion fact! (Amount alone is NOT completion)
       let hasFactTransaction = false;
       if (snapshot.facts.transactionCompleted === true || snapshot.facts.stage === 'closedwon') {
         const factTxTime = (snapshot.facts.transactionCompletedAt as string) || snapshot.openedAt;
@@ -199,6 +198,21 @@ export function evaluateOpportunity(
 ): EvaluationResult {
   const fullConfig = injectUniversalGoals(config);
   const goals = fullConfig.goalsByOpportunityType[snapshot.opportunityType] || [];
+
+  // Kill Switch / Automation Suppression MUST be evaluated FIRST before any goals!
+  if (
+    config.featureFlags?.automationSuppressed ||
+    snapshot.facts.automationSuppressed === true ||
+    snapshot.facts.blocked === true
+  ) {
+    return {
+      qualificationState: 'BLOCKED',
+      satisfiedGoalKeys: [],
+      unsatisfiedGoalKeys: goals.map(g => g.key),
+      evidenceRefsByGoal: {},
+      evaluatedConfigVersion: fullConfig.configVersion
+    };
+  }
   
   const satisfiedGoalKeys: string[] = [];
   const unsatisfiedGoalKeys: string[] = [];
@@ -218,8 +232,6 @@ export function evaluateOpportunity(
   let qualificationState: QualificationState = 'PENDING';
   if (unsatisfiedGoalKeys.length === 0) {
     qualificationState = 'SATISFIED';
-  } else if (snapshot.facts.blocked === true) {
-    qualificationState = 'BLOCKED';
   } else if (snapshot.facts.manualReviewRequired === true) {
     qualificationState = 'MANUAL_REVIEW';
   }

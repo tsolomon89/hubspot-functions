@@ -77,7 +77,12 @@ export class SchemaTool {
     const associationLabelsToCreate: any[] = [];
     const pipelinesToCreate: any[] = [];
 
-    if (!currentAccountSchema || !currentAccountSchema.properties || Object.keys(currentAccountSchema.properties).length === 0) {
+    const hasAnyCustomProperty = currentAccountSchema?.properties && 
+      Object.values(currentAccountSchema.properties).some((arr: any) => 
+        Array.isArray(arr) && arr.some((p: any) => p.name && p.name.startsWith('coa_'))
+      );
+
+    if (!currentAccountSchema || !hasAnyCustomProperty) {
       for (const group of (manifest.propertyGroups || [])) {
         propertyGroupsToCreate.push(group);
       }
@@ -95,6 +100,7 @@ export class SchemaTool {
         }
       }
     } else {
+      // Compare properties
       for (const [objType, props] of Object.entries(manifest.properties || {})) {
         const existingProps = currentAccountSchema.properties[objType] || [];
         for (const p of (props as any[])) {
@@ -105,12 +111,21 @@ export class SchemaTool {
         }
       }
 
+      // Compare pipelines and individual stages
       for (const [objType, pipes] of Object.entries(manifest.pipelines || {})) {
         const existingPipes = currentAccountSchema.pipelines?.[objType] || [];
         for (const pipe of (pipes as any[])) {
           const existing = existingPipes.find((e: any) => e.id === pipe.pipelineId || e.label === pipe.name);
           if (!existing) {
             pipelinesToCreate.push({ objectType: objType, ...pipe });
+          } else {
+            // Check if stages match
+            const existingStageIds = (existing.stages || []).map((s: any) => s.id || s.stageId);
+            const manifestStageIds = (pipe.stages || []).map((s: any) => s.stageId);
+            const missingStage = manifestStageIds.some((id: string) => !existingStageIds.includes(id));
+            if (missingStage) {
+              pipelinesToCreate.push({ objectType: objType, ...pipe });
+            }
           }
         }
       }
@@ -207,7 +222,9 @@ export class SchemaTool {
   public async readback(hsAdapter?: HubspotAdapter): Promise<{ verified: boolean; diffAfterApply: SchemaDiff }> {
     const inspected = await this.inspect(hsAdapter);
     const diffAfterApply = this.plan(inspected);
-    const verified = diffAfterApply.propertiesToCreate.length === 0 && diffAfterApply.pipelinesToCreate.length === 0;
+    const verified = diffAfterApply.propertyGroupsToCreate.length === 0 &&
+                     diffAfterApply.propertiesToCreate.length === 0 && 
+                     diffAfterApply.pipelinesToCreate.length === 0;
 
     return {
       verified,
