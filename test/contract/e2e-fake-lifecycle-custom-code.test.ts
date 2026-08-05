@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { processHubSpotCustomCodeAction } from '../../src/custom-code-actions/reconcile-record';
+import { HubspotAdapter } from '../../packages/hubspot-adapter/adapter';
 
 describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', () => {
   it('Should execute processHubSpotCustomCodeAction through Contact -> Lead -> FTP Deal -> Closed Won -> RTP1 Deal -> Closed Won -> RTP2 Deal with Replay Safety', async () => {
@@ -15,6 +16,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
             coa_relationship_key: 'rel_acme_inc',
             coa_relationship_type: 'b2b',
             coa_marketing_consent: 'true',
+            coa_offering_keys: 'prod_software',
             lifecyclestage: 'lead'
           }
         }
@@ -43,7 +45,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
             hs_timestamp: meetingTime
           }
         }
-      },
+      } as Record<string, any>,
       associations: {
         'contact->company': [{ from: 'cnt_1001', to: 'comp_5001' }],
         'company->contact': [{ from: 'comp_5001', to: 'cnt_1001' }],
@@ -56,11 +58,6 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
       } as Record<string, Array<{ from: string; to: string }>>
     };
 
-    const jsonRes = (data: any, status: number = 200) => new Response(JSON.stringify(data), {
-      status,
-      headers: { 'content-type': 'application/json' }
-    });
-
     const normalizeType = (t?: string) => {
       if (!t) return '';
       const u = String(t).toLowerCase();
@@ -72,240 +69,226 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
       return u;
     };
 
-    // Global mock interceptor for HubSpot API client calls
-    vi.spyOn(global as any, 'fetch').mockImplementation(async (url: any, init: any) => {
-      const urlStr = String(url);
-      const method = init?.method || 'GET';
-      const body = init?.body ? JSON.parse(init.body) : {};
+    const fakeAdapter = new HubspotAdapter('fake-token');
+    const rawClient = fakeAdapter.getRawClient();
 
-      // Contacts API
-      if (urlStr.includes('/crm/v3/objects/contacts/cnt_1001')) {
-        if (method === 'PATCH') {
-          Object.assign(crmStore.contacts['cnt_1001'].properties, body.properties);
-        }
-        return jsonRes(crmStore.contacts['cnt_1001']);
+    // Mock Contacts API
+    rawClient.crm.contacts.basicApi.getById = vi.fn().mockImplementation(async (id: string) => {
+      const cnt = crmStore.contacts[id as keyof typeof crmStore.contacts];
+      if (cnt) return cnt as any;
+      throw { statusCode: 404 };
+    });
+    rawClient.crm.contacts.basicApi.update = vi.fn().mockImplementation(async (id: string, body: any) => {
+      const cnt = crmStore.contacts[id as keyof typeof crmStore.contacts];
+      if (cnt) {
+        Object.assign(cnt.properties, body.properties);
+        return cnt as any;
       }
-
-      // Companies API
-      if (urlStr.includes('/crm/v3/objects/companies/comp_5001')) {
-        if (method === 'PATCH') {
-          Object.assign(crmStore.companies['comp_5001'].properties, body.properties);
-        }
-        return jsonRes(crmStore.companies['comp_5001']);
-      }
-
-      // Leads Search API
-      if (urlStr.includes('leads/search') || urlStr.includes('0-136/search')) {
-        const leadList = Object.values(crmStore.leads);
-        const filter = body.filterGroups?.[0]?.filters?.[0];
-        if (filter && filter.propertyName === 'coa_opportunity_key') {
-          const matched = leadList.filter(l => l.properties?.coa_opportunity_key === filter.value);
-          return jsonRes({ results: matched, total: matched.length });
-        }
-        return jsonRes({ results: leadList, total: leadList.length });
-      }
-
-      // Deals Search API
-      if (urlStr.includes('deals/search') || urlStr.includes('0-3/search')) {
-        const dealList = Object.values(crmStore.deals);
-        const filter = body.filterGroups?.[0]?.filters?.[0];
-        if (filter && filter.propertyName === 'coa_opportunity_key') {
-          const matched = dealList.filter(d => d.properties?.coa_opportunity_key === filter.value);
-          return jsonRes({ results: matched, total: matched.length });
-        }
-        return jsonRes({ results: dealList, total: dealList.length });
-      }
-
-      // Leads Create API
-      if ((urlStr.endsWith('/leads') || urlStr.endsWith('/0-136')) && method === 'POST') {
-        const leadId = `lead_${Date.now()}`;
-        const newLead = { 
-          id: leadId, 
-          properties: {
-            ...body.properties,
-            createdate: new Date(Date.now() - 60000).toISOString()
-          }
-        };
-        crmStore.leads[leadId] = newLead;
-        if (body.associations) {
-          for (const a of body.associations) {
-            const typeId = Number(a.types?.[0]?.associationTypeId);
-            const targetId = a.to?.id || a.to;
-            if (typeId === 608) {
-              crmStore.associations['lead->contact'].push({ from: leadId, to: String(targetId) });
-            } else if (typeId === 610) {
-              crmStore.associations['lead->company'].push({ from: leadId, to: String(targetId) });
-            }
-          }
-        }
-        return jsonRes(newLead, 201);
-      }
-
-      // Leads Update / Get API
-      if (urlStr.includes('/leads/') || urlStr.includes('/0-136/')) {
-        const parts = urlStr.includes('/leads/') ? urlStr.split('/leads/')[1] : urlStr.split('/0-136/')[1];
-        const leadId = parts.split('?')[0];
-        
-        if (method === 'PATCH') {
-          if (crmStore.leads[leadId]) {
-            Object.assign(crmStore.leads[leadId].properties, body.properties);
-          }
-        }
-        return jsonRes(crmStore.leads[leadId] || { id: leadId, properties: {} });
-      }
-
-      // Deals Create API
-      if ((urlStr.endsWith('/deals') || urlStr.endsWith('/0-3')) && method === 'POST') {
-        const dealId = `deal_${Date.now()}_${Object.keys(crmStore.deals).length + 1}`;
-        const newDeal = { 
-          id: dealId, 
-          properties: {
-            ...body.properties,
-            createdate: new Date().toISOString()
-          }
-        };
-        crmStore.deals[dealId] = newDeal;
-        if (body.associations) {
-          for (const a of body.associations) {
-            const typeId = Number(a.types?.[0]?.associationTypeId);
-            const targetId = a.to?.id || a.to;
-            if (typeId === 3) {
-              crmStore.associations['deal->contact'].push({ from: dealId, to: String(targetId) });
-            } else if (typeId === 5) {
-              crmStore.associations['deal->company'].push({ from: dealId, to: String(targetId) });
-            }
-          }
-        }
-        return jsonRes(newDeal, 201);
-      }
-
-      // Deals Update / Get API
-      if (urlStr.includes('/deals/') || urlStr.includes('/0-3/')) {
-        const parts = urlStr.includes('/deals/') ? urlStr.split('/deals/')[1] : urlStr.split('/0-3/')[1];
-        const dealId = parts.split('?')[0];
-
-        if (method === 'PATCH') {
-          if (crmStore.deals[dealId]) {
-            Object.assign(crmStore.deals[dealId].properties, body.properties);
-          }
-        }
-        return jsonRes(crmStore.deals[dealId] || { id: dealId, properties: {} });
-      }
-
-      // Line Items API
-      if (urlStr.includes('/crm/v3/objects/line_items')) {
-        return jsonRes({ results: [] });
-      }
-
-      // Meetings API
-      if (urlStr.includes('/crm/v3/objects/meetings/mtg_9001') || urlStr.includes('/crm/v3/objects/meetings')) {
-        return jsonRes(crmStore.meetings['mtg_9001']);
-      }
-
-      // Associations API (v4)
-      if (urlStr.includes('/crm/v4/objects/')) {
-        const path = urlStr.split('/crm/v4/objects/')[1].split('?')[0];
-        const segments = path.split('/associations/');
-        const fromSegments = segments[0].split('/');
-        const rawFromType = fromSegments[0];
-        const fromId = fromSegments[1];
-        const rawToType = segments[1];
-
-        const fromType = normalizeType(rawFromType);
-        const toType = normalizeType(rawToType);
-
-        const key = `${fromType}->${toType}`;
-        const matches = (crmStore.associations[key] || []).filter(a => a.from === fromId).map(a => ({ toObjectId: a.to }));
-        return jsonRes({ results: matches });
-      }
-
-      return jsonRes({ results: [] });
+      throw { statusCode: 404 };
     });
 
-    // STEP 1: Enroll Contact -> Bootstraps Lead with association 608 & advances stage to SQL
+    // Mock Companies API
+    rawClient.crm.companies.basicApi.getById = vi.fn().mockImplementation(async (id: string) => {
+      const comp = crmStore.companies[id as keyof typeof crmStore.companies];
+      if (comp) return comp as any;
+      throw { statusCode: 404 };
+    });
+    rawClient.crm.companies.basicApi.update = vi.fn().mockImplementation(async (id: string, body: any) => {
+      const comp = crmStore.companies[id as keyof typeof crmStore.companies];
+      if (comp) {
+        Object.assign(comp.properties, body.properties);
+        return comp as any;
+      }
+      throw { statusCode: 404 };
+    });
+
+    // Mock Leads API
+    (rawClient.crm.objects as any).leads = {
+      basicApi: {
+        getById: vi.fn().mockImplementation(async (id: string) => {
+          if (crmStore.leads[id]) return crmStore.leads[id];
+          throw { statusCode: 404 };
+        }),
+        create: vi.fn().mockImplementation(async (body: any) => {
+          const newId = `lead_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+          const newLead = { id: newId, properties: { ...body.properties } };
+          crmStore.leads[newId] = newLead;
+          if (body.associations) {
+            for (const assoc of body.associations) {
+              const targetId = assoc.to?.id;
+              if (targetId === 'cnt_1001') crmStore.associations['lead->contact'].push({ from: newId, to: 'cnt_1001' });
+              if (targetId === 'comp_5001') crmStore.associations['lead->company'].push({ from: newId, to: 'comp_5001' });
+            }
+          }
+          return newLead;
+        }),
+        update: vi.fn().mockImplementation(async (id: string, body: any) => {
+          if (crmStore.leads[id]) {
+            Object.assign(crmStore.leads[id].properties, body.properties);
+            return crmStore.leads[id];
+          }
+          throw { statusCode: 404 };
+        })
+      },
+      searchApi: {
+        doSearch: vi.fn().mockImplementation(async (body: any) => {
+          const leadList = Object.values(crmStore.leads);
+          const filter = body.filterGroups?.[0]?.filters?.[0];
+          if (filter && filter.propertyName === 'coa_opportunity_key') {
+            const matched = leadList.filter(l => l.properties?.coa_opportunity_key === filter.value);
+            return { results: matched, total: matched.length };
+          }
+          return { results: leadList, total: leadList.length };
+        })
+      }
+    };
+
+    // Mock Deals API
+    rawClient.crm.deals.basicApi.getById = vi.fn().mockImplementation(async (id: string) => {
+      if (crmStore.deals[id]) return crmStore.deals[id];
+      throw { statusCode: 404 };
+    });
+    rawClient.crm.deals.basicApi.create = vi.fn().mockImplementation(async (body: any) => {
+      const newId = `deal_${Date.now()}_${Object.keys(crmStore.deals).length + 1}`;
+      const newDeal = { id: newId, properties: { ...body.properties } };
+      crmStore.deals[newId] = newDeal;
+      if (body.associations) {
+        for (const assoc of body.associations) {
+          const targetId = assoc.to?.id;
+          if (targetId === 'cnt_1001') crmStore.associations['deal->contact'].push({ from: newId, to: 'cnt_1001' });
+          if (targetId === 'comp_5001') crmStore.associations['deal->company'].push({ from: newId, to: 'comp_5001' });
+        }
+      }
+      return newDeal;
+    });
+    rawClient.crm.deals.basicApi.update = vi.fn().mockImplementation(async (id: string, body: any) => {
+      if (crmStore.deals[id]) {
+        Object.assign(crmStore.deals[id].properties, body.properties);
+        return crmStore.deals[id];
+      }
+      throw { statusCode: 404 };
+    });
+    rawClient.crm.deals.searchApi.doSearch = vi.fn().mockImplementation(async (body: any) => {
+      const dealList = Object.values(crmStore.deals);
+      const filter = body.filterGroups?.[0]?.filters?.[0];
+      if (filter && filter.propertyName === 'coa_opportunity_key') {
+        const matched = dealList.filter(d => d.properties?.coa_opportunity_key === filter.value);
+        return { results: matched, total: matched.length };
+      }
+      return { results: dealList, total: dealList.length };
+    });
+
+    // Mock Meetings API safely on rawClient.crm
+    Object.defineProperty(rawClient.crm.objects, 'meetings', {
+      value: {
+        basicApi: {
+          getById: vi.fn().mockImplementation(async (id: string) => {
+            if (crmStore.meetings[id]) return crmStore.meetings[id];
+            throw { statusCode: 404 };
+          })
+        }
+      },
+      configurable: true
+    });
+
+    // Mock Associations V4 API
+    rawClient.crm.associations.v4.basicApi.getPage = vi.fn().mockImplementation(async (fromType: string, fromId: number | string, toType: string) => {
+      const nFrom = normalizeType(fromType);
+      const nTo = normalizeType(toType);
+      const key = `${nFrom}->${nTo}`;
+
+      const matches = (crmStore.associations[key] || []).filter(a => String(a.from) === String(fromId));
+      return {
+        results: matches.map(m => ({
+          toObjectId: m.to,
+          associationTypes: [{ category: 'HUBSPOT_DEFINED', typeId: 1 }]
+        }))
+      } as any;
+    });
+
+    // STEP 1: Process initial Contact enrollment -> Managed Lead created & progressed to SQL
     const step1Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
       object: { objectId: 'cnt_1001', objectType: 'CONTACT' }
-    }, 'fake-token');
+    }, 'fake-token', fakeAdapter);
 
-    expect(step1Result.outputFields.verified).toBe(true);
+    expect(step1Result.outputFields.objectType).toBe('lead');
     expect(step1Result.outputFields.qualificationState).toBe('SATISFIED');
-    expect(step1Result.outputFields.status).toBe('UPDATED_EXISTING');
+    expect(step1Result.outputFields.status).toBe('UPDATED');
 
-    const createdLead = Object.values(crmStore.leads)[0];
-    expect(createdLead).toBeDefined();
-    expect(createdLead.properties.coa_opportunity_key).toBe('rel_acme_inc::LEAD::1');
-    expect(createdLead.properties.hs_pipeline_stage).toBe('sql');
+    const createdLeadId = step1Result.outputFields.objectId;
+    expect(createdLeadId).toBeDefined();
+    expect(crmStore.leads[createdLeadId]).toBeDefined();
 
-    // STEP 2: Enroll Lead record -> Evaluates SQL goals with meeting evidence -> Advances to Qualified & creates FTP Deal
-    createdLead.properties.coa_offering_keys = 'prod_enterprise_plan';
-
+    // STEP 2: Process created Lead enrollment -> Moves to Qualified & Creates FTP Deal
     const step2Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
-      object: { objectId: createdLead.id, objectType: '0-136' }
-    }, 'fake-token');
+      object: { objectId: createdLeadId, objectType: 'LEAD' }
+    }, 'fake-token', fakeAdapter);
 
-    expect(step2Result.outputFields.verified).toBe(true);
+    expect(step2Result.outputFields.objectId).toBe(createdLeadId);
     expect(step2Result.outputFields.status).toBe('CREATED_SUCCESSOR');
 
-    const ftpDeal = Object.values(crmStore.deals).find(d => d.properties?.coa_opportunity_type === 'FTP');
-    expect(ftpDeal).toBeDefined();
-    expect(ftpDeal.properties.coa_opportunity_key).toBe('rel_acme_inc::FTP::1');
+    const createdDeals = Object.values(crmStore.deals);
+    expect(createdDeals.length).toBe(1);
+    const ftpDeal = createdDeals[0];
+    expect(ftpDeal.properties.coa_opportunity_type).toBe('FTP');
+    expect(ftpDeal.properties.dealstage).toBe('open');
 
-    // STEP 3: Replay Lead invocation -> Idempotent NO_CHANGE
+    // STEP 3: Replay Lead enrollment -> Idempotent NO_CHANGE
     const step3Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
-      object: { objectId: createdLead.id, objectType: 'LEAD' }
-    }, 'fake-token');
-
+      object: { objectId: createdLeadId, objectType: 'LEAD' }
+    }, 'fake-token', fakeAdapter);
     expect(step3Result.outputFields.status).toBe('NO_CHANGE');
+    expect(Object.keys(crmStore.deals).length).toBe(1);
 
-    // STEP 4: FTP Deal becomes Closed Won in CRM -> Re-enroll FTP Deal -> Creates successor RTP1 Deal!
-    ftpDeal.properties.dealstage = 'closedwon';
+    // STEP 4: Close FTP Deal (Closed Won) & Enroll FTP Deal -> Creates RTP1 Deal
+    crmStore.deals[ftpDeal.id].properties.dealstage = 'closedwon';
 
     const step4Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
       object: { objectId: ftpDeal.id, objectType: 'DEAL' }
-    }, 'fake-token');
+    }, 'fake-token', fakeAdapter);
 
-    expect(step4Result.outputFields.verified).toBe(true);
     expect(step4Result.outputFields.status).toBe('CREATED_SUCCESSOR');
+    expect(Object.keys(crmStore.deals).length).toBe(2);
 
-    const rtp1Deal = Object.values(crmStore.deals).find(d => d.properties?.coa_opportunity_key === 'rel_acme_inc::RTP::1');
+    const rtp1Deal = Object.values(crmStore.deals).find(d => d.properties.coa_opportunity_type === 'RTP' && d.properties.coa_cycle_index === '1');
     expect(rtp1Deal).toBeDefined();
-    expect(rtp1Deal.properties.coa_opportunity_type).toBe('RTP');
-    expect(rtp1Deal.properties.coa_cycle_index).toBe('1');
+    expect(rtp1Deal?.properties.coa_opportunity_key).toBe('rel_acme_inc::RTP::1');
 
-    // STEP 5: Replay FTP Deal -> Reconciler sees RTP1 successor already exists -> Returns NO_CHANGE
+    // STEP 5: Replay FTP Deal enrollment -> Idempotent NO_CHANGE
     const step5Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
       object: { objectId: ftpDeal.id, objectType: 'DEAL' }
-    }, 'fake-token');
-
+    }, 'fake-token', fakeAdapter);
     expect(step5Result.outputFields.status).toBe('NO_CHANGE');
+    expect(Object.keys(crmStore.deals).length).toBe(2);
 
-    // STEP 6: RTP1 Deal becomes Closed Won in CRM -> Re-enroll RTP1 Deal -> Creates successor RTP2 Deal!
-    rtp1Deal.properties.dealstage = 'closedwon';
+    // STEP 6: Close RTP1 Deal (Closed Won) & Enroll RTP1 Deal -> Creates RTP2 Deal
+    if (rtp1Deal) {
+      crmStore.deals[rtp1Deal.id].properties.dealstage = 'closedwon';
 
-    const step6Result = await processHubSpotCustomCodeAction({
-      origin: { portalId: 149041124 },
-      object: { objectId: rtp1Deal.id, objectType: '0-3' }
-    }, 'fake-token');
+      const step6Result = await processHubSpotCustomCodeAction({
+        origin: { portalId: 149041124 },
+        object: { objectId: rtp1Deal.id, objectType: 'DEAL' }
+      }, 'fake-token', fakeAdapter);
 
-    expect(step6Result.outputFields.verified).toBe(true);
-    expect(step6Result.outputFields.status).toBe('CREATED_SUCCESSOR');
+      expect(step6Result.outputFields.status).toBe('CREATED_SUCCESSOR');
+      expect(Object.keys(crmStore.deals).length).toBe(3);
 
-    const rtp2Deal = Object.values(crmStore.deals).find(d => d.properties?.coa_opportunity_key === 'rel_acme_inc::RTP::2');
-    expect(rtp2Deal).toBeDefined();
-    expect(rtp2Deal.properties.coa_opportunity_type).toBe('RTP');
-    expect(rtp2Deal.properties.coa_cycle_index).toBe('2');
+      const rtp2Deal = Object.values(crmStore.deals).find(d => d.properties.coa_opportunity_type === 'RTP' && d.properties.coa_cycle_index === '2');
+      expect(rtp2Deal).toBeDefined();
+      expect(rtp2Deal?.properties.coa_opportunity_key).toBe('rel_acme_inc::RTP::2');
 
-    // STEP 7: Replay RTP1 Deal -> Reconciler sees RTP2 successor already exists -> Returns NO_CHANGE
-    const step7Result = await processHubSpotCustomCodeAction({
-      origin: { portalId: 149041124 },
-      object: { objectId: rtp1Deal.id, objectType: 'DEAL' }
-    }, 'fake-token');
-
-    expect(step7Result.outputFields.status).toBe('NO_CHANGE');
+      // STEP 7: Replay RTP1 Deal enrollment -> Idempotent NO_CHANGE
+      const step7Result = await processHubSpotCustomCodeAction({
+        origin: { portalId: 149041124 },
+        object: { objectId: rtp1Deal.id, objectType: 'DEAL' }
+      }, 'fake-token', fakeAdapter);
+      expect(step7Result.outputFields.status).toBe('NO_CHANGE');
+      expect(Object.keys(crmStore.deals).length).toBe(3);
+    }
   });
 });

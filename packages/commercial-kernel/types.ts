@@ -3,8 +3,8 @@ export type OpportunityState = 'OPEN' | 'WON' | 'LOST';
 export type QualificationState = 'PENDING' | 'SATISFIED' | 'BLOCKED' | 'MANUAL_REVIEW';
 
 export type CommercialSubjectRef =
-  | { kind: 'CONTACT'; key: string }
-  | { kind: 'COMPANY'; key: string; contactKeys?: string[] };
+  | { kind: 'CONTACT'; key: string; companyKey?: string }
+  | { kind: 'COMPANY'; key: string; contactKeys?: string[]; companyKey?: string };
 
 export interface EvidenceRecord {
   id: string;
@@ -28,6 +28,14 @@ export interface OpportunitySnapshot {
   subject: CommercialSubjectRef;
   facts: Record<string, unknown>;
   evidence: EvidenceRecord[];
+}
+
+export interface EvaluationResult {
+  qualificationState: QualificationState;
+  satisfiedGoalKeys: string[];
+  unsatisfiedGoalKeys: string[];
+  evidenceRefsByGoal: Record<string, string[]>;
+  evaluatedConfigVersion: string;
 }
 
 export interface GoalDefinition {
@@ -59,25 +67,33 @@ export interface QualificationConfig {
   };
 }
 
-export interface EvaluationResult {
-  qualificationState: QualificationState;
-  satisfiedGoalKeys: string[];
-  unsatisfiedGoalKeys: string[];
-  evidenceRefsByGoal: Record<string, string[]>;
-  evaluatedConfigVersion: string;
-}
-
 export type TransitionIntent =
+  | { kind: 'NOOP'; reason?: string }
   | { 
       kind: 'UPDATE_OPPORTUNITY'; 
       opportunityKey: string; 
       newState: OpportunityState; 
       qualificationState: QualificationState; 
       targetRecordId?: string;
-      targetObjectType?: 'contact' | 'company' | 'lead' | 'deal';
+      targetObjectType?: string;
       details?: Record<string, unknown>;
     }
-  | { kind: 'CREATE_SUCCESSOR'; predecessorKey: string; successorKey: string; successorType: OpportunityType; cycleIndex: number; subject?: CommercialSubjectRef }
-  | { kind: 'PROJECT_LIFECYCLE_STAGE'; subject: CommercialSubjectRef; stage: string }
-  | { kind: 'CREATE_MANUAL_REVIEW'; opportunityKey: string; reason: string; subject?: CommercialSubjectRef }
-  | { kind: 'NOOP'; reason: string };
+  | { 
+      kind: 'CREATE_SUCCESSOR'; 
+      predecessorKey: string; 
+      successorKey: string; 
+      successorType: OpportunityType; 
+      cycleIndex: number; 
+      subject?: CommercialSubjectRef;
+    }
+  | { 
+      kind: 'PROJECT_LIFECYCLE_STAGE'; 
+      subject: CommercialSubjectRef; 
+      stage: string; 
+    }
+  | { 
+      kind: 'CREATE_MANUAL_REVIEW'; 
+      opportunityKey: string; 
+      reason: string; 
+      subject?: CommercialSubjectRef; 
+    };

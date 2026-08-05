@@ -55,13 +55,21 @@ export function parseHubSpotTimestamp(raw?: any): string | null {
 export class HubspotAdapter {
   private client: Client;
 
-  constructor(accessToken?: string) {
-    const token = accessToken || process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
-    this.client = new Client({ accessToken: token });
+  constructor(accessTokenOrClient?: string | Client) {
+    if (accessTokenOrClient && typeof accessTokenOrClient !== 'string') {
+      this.client = accessTokenOrClient;
+    } else {
+      const token = (accessTokenOrClient as string) || process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
+      this.client = new Client({ accessToken: token });
+    }
   }
 
   public getRawClient(): Client {
     return this.client;
+  }
+
+  private get leadsApi(): any {
+    return (this.client.crm.objects as any).leads || (this.client.crm as any).objects?.leads;
   }
 
   public async loadSubjectSnapshot(subject: CommercialSubjectRef): Promise<Record<string, unknown>> {
@@ -114,7 +122,7 @@ export class HubspotAdapter {
 
   public async loadLeadSnapshot(leadId: string): Promise<Record<string, unknown>> {
     try {
-      const lead = await this.client.crm.objects.leads.basicApi.getById(leadId, [
+      const lead = await this.leadsApi.basicApi.getById(leadId, [
         'coa_opportunity_key',
         'coa_relationship_key',
         'coa_opportunity_type',
@@ -163,7 +171,7 @@ export class HubspotAdapter {
   ): Promise<Record<string, any> | null> {
     try {
       const opportunityKey = `${relationshipKey}::LEAD::1`;
-      const searchRes = await this.client.crm.objects.leads.searchApi.doSearch({
+      const searchRes = await this.leadsApi.searchApi.doSearch({
         filterGroups: [{
           filters: [{
             propertyName: 'coa_opportunity_key',
@@ -183,7 +191,7 @@ export class HubspotAdapter {
           'createdate'
         ],
         limit: 1,
-        after: '0'
+        after: 0
       });
 
       if (searchRes.results && searchRes.results.length > 0) {
@@ -212,7 +220,7 @@ export class HubspotAdapter {
         }
       }
 
-      const newLead = await this.client.crm.objects.leads.basicApi.create({
+      const newLead = await this.leadsApi.basicApi.create({
         properties: {
           hs_pipeline: pipelineId,
           hs_pipeline_stage: 'mql',
@@ -257,9 +265,10 @@ export class HubspotAdapter {
     for (const cId of contactIdsToQuery) {
       let assocResults: any[] = [];
       try {
+        const numericId = Number(cId) || (cId as any);
         const meetingAssocs = await this.client.crm.associations.v4.basicApi.getPage(
           'contact',
-          cId,
+          numericId,
           'meeting'
         );
         assocResults = meetingAssocs.results || [];
@@ -315,9 +324,9 @@ export class HubspotAdapter {
         let targetType = intent.targetObjectType;
 
         if (!targetId) {
-          const leadSearch = await this.client.crm.objects.leads.searchApi.doSearch({
+          const leadSearch = await this.leadsApi.searchApi.doSearch({
             filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: intent.opportunityKey }] }],
-            sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: '0'
+            sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: 0
           });
           if (leadSearch.results.length > 0) {
             targetId = leadSearch.results[0].id;
@@ -325,7 +334,7 @@ export class HubspotAdapter {
           } else {
             const dealSearch = await this.client.crm.deals.searchApi.doSearch({
               filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: intent.opportunityKey }] }],
-              sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: '0'
+              sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: 0
             });
             if (dealSearch.results.length > 0) {
               targetId = dealSearch.results[0].id;
@@ -354,10 +363,10 @@ export class HubspotAdapter {
               ? String(intent.details.targetLeadStage) 
               : (intent.newState === 'WON' ? 'qualified' : 'mql');
             updateProps.hs_pipeline_stage = targetStage;
-            await this.client.crm.objects.leads.basicApi.update(targetId, { properties: updateProps });
+            await this.leadsApi.basicApi.update(targetId, { properties: updateProps });
             
             // Comprehensive Readback verification
-            const readback = await this.client.crm.objects.leads.basicApi.getById(targetId, [
+            const readback = await this.leadsApi.basicApi.getById(targetId, [
               'coa_qualification_state', 
               'hs_pipeline_stage',
               'coa_config_version'
@@ -426,7 +435,19 @@ export class HubspotAdapter {
         if (intent.successorType === 'FTP' || intent.successorType === 'RTP') {
           const existingDeals = await this.client.crm.deals.searchApi.doSearch({
             filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: intent.successorKey }] }],
-            sorts: [], properties: ['dealname', 'dealstage', 'pipeline', 'coa_opportunity_key', 'coa_opportunity_type', 'coa_cycle_index'], limit: 1, after: '0'
+            sorts: [], properties: [
+              'dealname', 
+              'dealstage', 
+              'pipeline', 
+              'coa_opportunity_key', 
+              'coa_relationship_key',
+              'coa_relationship_type',
+              'coa_opportunity_type', 
+              'coa_cycle_index',
+              'coa_predecessor_opportunity_key',
+              'coa_managed',
+              'coa_config_version'
+            ], limit: 1, after: 0
           });
 
           // Resolve Contact & Company target IDs
@@ -442,10 +463,10 @@ export class HubspotAdapter {
             }
           }
 
-          if (existingDeals.results.length === 0) {
-            const relKey = intent.successorKey.split('::')[0];
-            const pipelineId = config?.hubspotPipelines?.dealPipelineId || 'b2b_transaction_deal_pipeline';
+          const relKey = intent.successorKey.split('::')[0];
+          const pipelineId = config?.hubspotPipelines?.dealPipelineId || 'b2b_transaction_deal_pipeline';
 
+          if (existingDeals.results.length === 0) {
             // Build native Deal associations (Contact ID, Company ID)
             const associations: any[] = [];
             if (expectedContactId) {
@@ -487,8 +508,10 @@ export class HubspotAdapter {
               'dealstage',
               'coa_opportunity_key',
               'coa_relationship_key',
+              'coa_relationship_type',
               'coa_opportunity_type',
               'coa_cycle_index',
+              'coa_predecessor_opportunity_key',
               'coa_managed',
               'coa_config_version'
             ]);
@@ -497,16 +520,17 @@ export class HubspotAdapter {
                                  readback?.properties?.coa_cycle_index === String(intent.cycleIndex) &&
                                  readback?.properties?.pipeline === pipelineId &&
                                  readback?.properties?.dealstage === 'open' &&
+                                 readback?.properties?.coa_relationship_key === relKey &&
                                  readback?.properties?.coa_managed === 'true';
 
             let assocVerified = true;
             if (expectedContactId) {
-              const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', newDeal.id, 'contact');
+              const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(newDeal.id) || (newDeal.id as any), 'contact');
               const found = (contactAssoc.results || []).some(r => String(r.toObjectId) === expectedContactId);
               if (!found) assocVerified = false;
             }
             if (expectedCompanyId) {
-              const companyAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', newDeal.id, 'company');
+              const companyAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(newDeal.id) || (newDeal.id as any), 'company');
               const found = (companyAssoc.results || []).some(r => String(r.toObjectId) === expectedCompanyId);
               if (!found) assocVerified = false;
             }
@@ -526,19 +550,25 @@ export class HubspotAdapter {
               verified: assocVerified
             });
           } else {
-            // Revalidate existing successor Deal properties and exact associations
+            // Revalidate existing successor Deal properties and exact associations authoritatively!
             const existingDeal = existingDeals.results[0];
-            const propVerified = existingDeal.properties?.coa_opportunity_key === intent.successorKey &&
-                                 existingDeal.properties?.coa_opportunity_type === intent.successorType;
+            const props = existingDeal.properties || {};
+
+            const propVerified = props.coa_opportunity_key === intent.successorKey &&
+                                 props.coa_opportunity_type === intent.successorType &&
+                                 props.coa_cycle_index === String(intent.cycleIndex) &&
+                                 props.pipeline === pipelineId &&
+                                 props.coa_relationship_key === relKey &&
+                                 props.coa_managed === 'true';
 
             let assocVerified = true;
             if (expectedContactId) {
-              const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', existingDeal.id, 'contact');
+              const contactAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(existingDeal.id) || (existingDeal.id as any), 'contact');
               const found = (contactAssoc.results || []).some(r => String(r.toObjectId) === expectedContactId);
               if (!found) assocVerified = false;
             }
             if (expectedCompanyId) {
-              const companyAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', existingDeal.id, 'company');
+              const companyAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(existingDeal.id) || (existingDeal.id as any), 'company');
               const found = (companyAssoc.results || []).some(r => String(r.toObjectId) === expectedCompanyId);
               if (!found) assocVerified = false;
             }
@@ -588,9 +618,9 @@ export class HubspotAdapter {
         logger.warn('Applying CREATE_MANUAL_REVIEW intent', { opportunityKey: intent.opportunityKey, reason: intent.reason });
         const taskSubject = `[Manual Review] ${intent.opportunityKey}`;
 
-        const existingTasks = await this.client.crm.objects.tasks.searchApi.doSearch({
+        const existingTasks = await (this.client.crm.objects as any).tasks.searchApi.doSearch({
           filterGroups: [{ filters: [{ propertyName: 'hs_task_subject', operator: 'EQ' as any, value: taskSubject }] }],
-          sorts: [], properties: ['hs_task_subject'], limit: 1, after: '0'
+          sorts: [], properties: ['hs_task_subject'], limit: 1, after: 0
         });
 
         if (existingTasks.results.length > 0) {
@@ -615,7 +645,7 @@ export class HubspotAdapter {
             });
           }
 
-          const newTask = await this.client.crm.objects.tasks.basicApi.create({
+          const newTask = await (this.client.crm.objects as any).tasks.basicApi.create({
             properties: {
               hs_task_subject: taskSubject,
               hs_task_body: intent.reason,
@@ -626,7 +656,7 @@ export class HubspotAdapter {
             associations
           });
 
-          const readback = await this.client.crm.objects.tasks.basicApi.getById(newTask.id, ['hs_task_subject']);
+          const readback = await (this.client.crm.objects as any).tasks.basicApi.getById(newTask.id, ['hs_task_subject']);
           const verified = readback?.properties?.hs_task_subject === taskSubject;
 
           receipts.push({

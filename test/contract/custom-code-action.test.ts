@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { processHubSpotCustomCodeAction, main } from '../../src/custom-code-actions/reconcile-record';
+import { HubspotAdapter, HubSpotSnapshotLoader } from '../../packages/hubspot-adapter';
 
 describe('HubSpot Custom Code Action Contract Tests', () => {
   it('should throw error when missing valid record ID in production-shaped HubSpot event payload', async () => {
@@ -26,53 +27,38 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
   });
 
   it('should throw ACTION_UNVERIFIED when CRM mutation succeeds but readback property verification fails', async () => {
-    vi.spyOn(global as any, 'fetch').mockImplementation(async (url: any, init: any) => {
-      const urlStr = String(url);
-      const method = init?.method || 'GET';
+    const fakeAdapter = new HubspotAdapter('fake-token');
 
-      const jsonRes = (data: any, status: number = 200) => new Response(JSON.stringify(data), {
-        status,
-        headers: { 'content-type': 'application/json' }
-      });
+    vi.spyOn(fakeAdapter, 'findOrCreateLeadForSubject').mockResolvedValueOnce({
+      id: 'lead_fail_readback',
+      properties: { coa_opportunity_key: 'rel_fail::LEAD::1' }
+    });
 
-      if (urlStr.includes('/crm/v3/objects/contacts/cnt_fail_readback')) {
-        if (method === 'PATCH') {
-          return jsonRes({ id: 'cnt_fail_readback', properties: { lifecyclestage: 'marketingqualifiedlead' } });
-        }
-        // Readback returns stale stage 'lead' (mismatch with expected 'marketingqualifiedlead')
-        return jsonRes({ 
-          id: 'cnt_fail_readback', 
-          properties: {
-            email: 'test@example.com',
-            coa_relationship_key: 'rel_fail',
-            coa_relationship_type: 'b2b',
-            coa_marketing_consent: 'true',
-            lifecyclestage: 'lead' // Stale property causing readback failure
-          }
-        });
-      }
+    vi.spyOn(HubSpotSnapshotLoader.prototype, 'loadSnapshotFromRecord').mockResolvedValue({
+      organizationKey: 'org_global_corp',
+      relationshipKey: 'rel_fail',
+      relationshipType: 'b2b',
+      opportunityKey: 'rel_fail::LEAD::1',
+      opportunityType: 'MQL',
+      opportunityState: 'OPEN',
+      cycleIndex: 1,
+      openedAt: new Date().toISOString(),
+      subject: { kind: 'CONTACT', key: 'cnt_fail_readback' },
+      facts: { email: 'test@example.com', marketingConsent: true },
+      evidence: []
+    });
 
-      if (urlStr.includes('/crm/v3/objects/leads/search')) {
-        return jsonRes({ 
-          results: [{ 
-            id: 'lead_123', 
-            properties: { 
-              coa_opportunity_key: 'rel_fail::LEAD::1', 
-              hs_pipeline_stage: 'mql' 
-            } 
-          }] 
-        });
-      }
-
-      if (urlStr.includes('/crm/v3/objects/leads/lead_123')) {
-        return jsonRes({ id: 'lead_123', properties: { coa_opportunity_key: 'rel_fail::LEAD::1', hs_pipeline_stage: 'mql' } });
-      }
-
-      if (urlStr.includes('/crm/v4/objects/')) {
-        return jsonRes({ results: [] });
-      }
-
-      return jsonRes({ results: [] });
+    vi.spyOn(fakeAdapter, 'applyTransitionIntents').mockResolvedValueOnce({
+      success: false,
+      appliedIntents: 1,
+      receipts: [{
+        intentKind: 'PROJECT_LIFECYCLE_STAGE',
+        objectType: 'contact',
+        objectId: 'cnt_fail_readback',
+        operation: 'UPDATE',
+        verified: false,
+        error: 'Readback verification failed'
+      }]
     });
 
     const event = {
@@ -80,6 +66,6 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
       object: { objectId: 'cnt_fail_readback', objectType: 'CONTACT' }
     };
 
-    await expect(processHubSpotCustomCodeAction(event, 'fake-token')).rejects.toThrow('ACTION_UNVERIFIED');
+    await expect(processHubSpotCustomCodeAction(event, 'fake-token', fakeAdapter)).rejects.toThrow('ACTION_UNVERIFIED');
   });
 });

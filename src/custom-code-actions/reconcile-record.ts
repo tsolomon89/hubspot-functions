@@ -1,134 +1,152 @@
 import { 
   evaluateOpportunity, 
-  planTransition,
-  CommercialSubjectRef
+  planTransition 
 } from '../../packages/commercial-kernel';
+import { 
+  HubspotAdapter, 
+  HubSpotSnapshotLoader 
+} from '../../packages/hubspot-adapter';
 import { OrganizationConfigResolver } from '../../packages/domain/config-resolver';
-import { HubspotAdapter, HubSpotSnapshotLoader } from '../../packages/hubspot-adapter';
 import { logger } from '../../packages/observability';
 
-export interface HubSpotCustomCodeEvent {
-  origin?: {
-    portalId?: number;
-  };
-  object?: {
-    objectId: string | number;
-    objectType: string;
-  };
-  inputFields?: Record<string, string>;
-}
-
-export interface HubSpotCustomCodeCallbackResult {
+export interface HubSpotCustomCodeResult {
   outputFields: {
-    qualificationState: string;
+    objectId: string;
+    objectType: string;
     opportunityKey: string;
+    qualificationState: string;
     appliedIntentsCount: number;
-    status: 'NO_CHANGE' | 'UPDATED_EXISTING' | 'CREATED_SUCCESSOR' | 'DRY_RUN_SUCCESSOR_PLANNED' | 'BLOCKED' | 'MANUAL_REVIEW';
     verified: boolean;
-    errorReason?: string;
+    status: 'NO_CHANGE' | 'UPDATED' | 'CREATED_SUCCESSOR' | 'MANUAL_REVIEW_REQUIRED' | 'BLOCKED';
   };
 }
 
 export async function processHubSpotCustomCodeAction(
-  event: HubSpotCustomCodeEvent,
-  accessToken?: string
-): Promise<HubSpotCustomCodeCallbackResult> {
-  logger.info('Executing stateless HubSpot Custom Code Action', { event });
+  event: any,
+  accessToken?: string,
+  adapterInstance?: HubspotAdapter
+): Promise<HubSpotCustomCodeResult> {
+  const portalId = event?.origin?.portalId || 149041124;
+  const rawObjectId = event?.object?.objectId || event?.object?.id || '0';
+  const objectType = (event?.object?.objectType || 'contact').toLowerCase();
 
-  try {
-    const rawObjectType = event.object?.objectType?.toUpperCase() || '';
-    const rawObjectId = String(event.object?.objectId || '').trim();
+  if (!rawObjectId || rawObjectId === '0') {
+    throw new Error('INVALID_ENROLLMENT: HubSpot Custom Code action missing valid object.objectId in event payload');
+  }
 
-    if (!rawObjectId || rawObjectId === '0') {
-      throw new Error('INVALID_ENROLLMENT: Missing event.object.objectId in HubSpot custom code payload.');
-    }
+  logger.info('Executing stateless HubSpot Custom Code Action', {
+    event: { origin: event?.origin, object: { objectId: rawObjectId, objectType } }
+  });
 
-    const portalId = event.origin?.portalId;
-    if (!portalId) {
-      throw new Error('INVALID_ENROLLMENT: Missing event.origin.portalId in HubSpot custom code payload.');
-    }
+  const config = OrganizationConfigResolver.resolveConfigByPortalId(portalId);
 
-    let objectType: 'contact' | 'company' | 'lead' | 'deal';
-    if (rawObjectType === 'CONTACT' || rawObjectType === '0-1') {
-      objectType = 'contact';
-    } else if (rawObjectType === 'COMPANY' || rawObjectType === '0-2') {
-      objectType = 'company';
-    } else if (rawObjectType === 'LEAD' || rawObjectType === '0-136') {
-      objectType = 'lead';
-    } else if (rawObjectType === 'DEAL' || rawObjectType === '0-3') {
-      objectType = 'deal';
-    } else {
-      throw new Error(`UNSUPPORTED_OBJECT_TYPE: Enrolled object type '${event.object?.objectType}' is not supported by Commercial Operations Kernel.`);
-    }
+  const adapter = adapterInstance || new HubspotAdapter(accessToken);
+  const snapshotLoader = new HubSpotSnapshotLoader(adapter);
 
-    const config = OrganizationConfigResolver.resolveConfigByPortalId(portalId);
-    const token = accessToken || process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
-    const adapter = new HubspotAdapter(token);
-    const snapshotLoader = new HubSpotSnapshotLoader(adapter);
+  const snapshot = await snapshotLoader.loadSnapshotFromRecord(
+    { objectType, objectId: rawObjectId },
+    config.organizationKey
+  );
 
-    const snapshot = await snapshotLoader.loadSnapshotFromRecord(
-      { objectType, objectId: rawObjectId },
-      config.organizationKey,
+  logger.info('Loading pure opportunity snapshot directly from HubSpot CRM', { objectType, objectId: rawObjectId });
+
+  // Special Lead Bootstrap Handling for raw Contact or Company enrollment
+  if (objectType === 'contact' || objectType === '0-1' || objectType === 'company' || objectType === '0-2') {
+    const lead = await adapter.findOrCreateLeadForSubject(
+      snapshot.subject,
+      snapshot.relationshipKey,
       config.relationshipType,
       config
     );
 
-    const evalRes = evaluateOpportunity(snapshot, config);
-    const intents = planTransition(snapshot, evalRes, config);
-    const correlationKey = `${snapshot.opportunityKey}:${Date.now()}`;
-    const mutationResult = await adapter.applyTransitionIntents(intents, correlationKey, config);
+    if (lead) {
+      const leadSnapshot = await snapshotLoader.loadSnapshotFromRecord(
+        { objectType: 'lead', objectId: lead.id },
+        config.organizationKey
+      );
+      const evalRes = evaluateOpportunity(leadSnapshot, config);
+      const intents = planTransition(leadSnapshot, evalRes, config);
+      const mutationResult = await adapter.applyTransitionIntents(intents, leadSnapshot.opportunityKey, config);
 
-    if (!mutationResult.success) {
-      const unverified = mutationResult.receipts.filter(r => !r.verified);
-      throw new Error(`ACTION_UNVERIFIED: Custom Code Action mutation verification failed for ${unverified.length} receipt(s): ${JSON.stringify(unverified)}`);
+      if (!mutationResult.success) {
+        const failedReceipts = mutationResult.receipts.filter(r => !r.verified);
+        throw new Error(`ACTION_UNVERIFIED: Mutation readback verification failed: ${JSON.stringify(failedReceipts)}`);
+      }
+
+      let status: HubSpotCustomCodeResult['outputFields']['status'] = 'NO_CHANGE';
+      if (intents.some(i => i.kind === 'CREATE_SUCCESSOR')) {
+        status = 'CREATED_SUCCESSOR';
+      } else if (intents.some(i => i.kind === 'UPDATE_OPPORTUNITY')) {
+        status = 'UPDATED';
+      }
+
+      return {
+        outputFields: {
+          objectId: lead.id,
+          objectType: 'lead',
+          opportunityKey: leadSnapshot.opportunityKey,
+          qualificationState: evalRes.qualificationState,
+          appliedIntentsCount: mutationResult.appliedIntents,
+          verified: mutationResult.success,
+          status
+        }
+      };
     }
+  }
 
-    let status: 'NO_CHANGE' | 'UPDATED_EXISTING' | 'CREATED_SUCCESSOR' | 'DRY_RUN_SUCCESSOR_PLANNED' | 'BLOCKED' | 'MANUAL_REVIEW' = 'NO_CHANGE';
+  // Standard Opportunity Reconciliation
+  const evaluation = evaluateOpportunity(snapshot, config);
+  const intents = planTransition(snapshot, evaluation, config);
+  const mutationResult = await adapter.applyTransitionIntents(intents, snapshot.opportunityKey, config);
 
-    if (evalRes.qualificationState === 'BLOCKED') {
-      status = 'BLOCKED';
-    } else if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_MANUAL_REVIEW')) {
-      status = 'MANUAL_REVIEW';
-    } else if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_SUCCESSOR' && r.operation === 'CREATE')) {
-      status = 'CREATED_SUCCESSOR';
-    } else if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_SUCCESSOR' && r.operation === 'NOOP' && r.verified)) {
-      status = config.featureFlags?.dryRunTransactions ? 'DRY_RUN_SUCCESSOR_PLANNED' : 'NO_CHANGE';
-    } else if (mutationResult.receipts.some(r => r.operation === 'UPDATE' && r.verified)) {
-      status = 'UPDATED_EXISTING';
-    }
+  if (!mutationResult.success) {
+    const failedReceipts = mutationResult.receipts.filter(r => !r.verified);
+    throw new Error(`ACTION_UNVERIFIED: Mutation readback verification failed: ${JSON.stringify(failedReceipts)}`);
+  }
 
-    logger.info('Stateless HubSpot Custom Code Action executed successfully', {
+  let status: HubSpotCustomCodeResult['outputFields']['status'] = 'NO_CHANGE';
+  if (intents.some(i => i.kind === 'CREATE_SUCCESSOR')) {
+    status = 'CREATED_SUCCESSOR';
+  } else if (intents.some(i => i.kind === 'CREATE_MANUAL_REVIEW')) {
+    status = 'MANUAL_REVIEW_REQUIRED';
+  } else if (evaluation.qualificationState === 'BLOCKED') {
+    status = 'BLOCKED';
+  } else if (intents.some(i => i.kind === 'UPDATE_OPPORTUNITY')) {
+    status = 'UPDATED';
+  }
+
+  logger.info('Stateless HubSpot Custom Code Action executed successfully', {
+    objectId: rawObjectId,
+    objectType,
+    opportunityKey: snapshot.opportunityKey,
+    qualificationState: evaluation.qualificationState,
+    appliedIntentsCount: mutationResult.appliedIntents,
+    verified: mutationResult.success,
+    status
+  });
+
+  return {
+    outputFields: {
       objectId: rawObjectId,
       objectType,
       opportunityKey: snapshot.opportunityKey,
-      qualificationState: evalRes.qualificationState,
+      qualificationState: evaluation.qualificationState,
       appliedIntentsCount: mutationResult.appliedIntents,
       verified: mutationResult.success,
       status
-    });
+    }
+  };
+}
 
-    return {
-      outputFields: {
-        qualificationState: evalRes.qualificationState,
-        opportunityKey: snapshot.opportunityKey,
-        appliedIntentsCount: mutationResult.appliedIntents,
-        status,
-        verified: mutationResult.success
-      }
-    };
+export async function main(event: any, callback?: Function): Promise<HubSpotCustomCodeResult> {
+  try {
+    const result = await processHubSpotCustomCodeAction(event);
+    if (callback) {
+      callback(result);
+    }
+    return result;
   } catch (err: any) {
     logger.error('HubSpot Custom Code Action execution error', { error: err });
     throw err;
   }
-}
-
-export async function main(
-  event: HubSpotCustomCodeEvent,
-  callback?: (result: HubSpotCustomCodeCallbackResult) => void
-): Promise<HubSpotCustomCodeCallbackResult> {
-  const result = await processHubSpotCustomCodeAction(event);
-  if (callback) {
-    callback(result);
-  }
-  return result;
 }

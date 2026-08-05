@@ -73,7 +73,7 @@ export function injectUniversalGoals(config: QualificationConfig): Qualification
 export function evaluatePredicate(
   goal: GoalDefinition,
   snapshot: OpportunitySnapshot
-): { satisfied: boolean; evidenceRefs: string[] } {
+): { satisfied: boolean; manualReviewRequired?: boolean; evidenceRefs: string[] } {
   // Enforce evidence window scope rules
   const matchingEvidence = snapshot.evidence.filter(ev => {
     if (goal.scope === 'opportunity' && ev.occurredAt < snapshot.openedAt) {
@@ -88,6 +88,10 @@ export function evaluatePredicate(
   });
 
   switch (goal.predicate) {
+    case 'manualReview': {
+      const isTriggered = snapshot.facts[goal.params?.property as string] === true || goal.params?.forceReview === true;
+      return { satisfied: !isTriggered, manualReviewRequired: isTriggered, evidenceRefs: isTriggered ? ['fact_manual_review'] : [] };
+    }
     case 'hasIdentity':
     case 'anyCommunicationChannel': {
       const email = snapshot.facts.email || snapshot.facts.contactEmail;
@@ -148,6 +152,14 @@ export function evaluatePredicate(
         satisfied = val === goal.params.equals;
       } else if (goal.params?.notEquals !== undefined) {
         satisfied = val !== goal.params.notEquals;
+      } else if (goal.params?.greaterThan !== undefined) {
+        satisfied = typeof val === 'number' && val > Number(goal.params.greaterThan);
+      } else if (goal.params?.lessThan !== undefined) {
+        satisfied = typeof val === 'number' && val < Number(goal.params.lessThan);
+      } else if (goal.params?.in !== undefined && Array.isArray(goal.params.in)) {
+        satisfied = goal.params.in.includes(val);
+      } else if (goal.params?.contains !== undefined && typeof val === 'string') {
+        satisfied = val.includes(String(goal.params.contains));
       } else if (goal.params?.isTruthy) {
         satisfied = Boolean(val);
       } else if (goal.params?.isFalsy) {
@@ -182,9 +194,13 @@ export function evaluateOpportunity(
   const satisfiedGoalKeys: string[] = [];
   const unsatisfiedGoalKeys: string[] = [];
   const evidenceRefsByGoal: Record<string, string[]> = {};
+  let manualReviewNeeded = false;
 
   for (const goal of goals) {
     const res = evaluatePredicate(goal, snapshot);
+    if (res.manualReviewRequired) {
+      manualReviewNeeded = true;
+    }
     if (res.satisfied) {
       satisfiedGoalKeys.push(goal.key);
       evidenceRefsByGoal[goal.key] = res.evidenceRefs;
@@ -195,7 +211,9 @@ export function evaluateOpportunity(
   }
 
   let qualificationState: QualificationState = 'SATISFIED';
-  if (unsatisfiedGoalKeys.length > 0) {
+  if (manualReviewNeeded) {
+    qualificationState = 'MANUAL_REVIEW';
+  } else if (unsatisfiedGoalKeys.length > 0) {
     qualificationState = 'PENDING';
   }
 

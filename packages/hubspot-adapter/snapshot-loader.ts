@@ -1,319 +1,388 @@
-import { HubspotAdapter, parseHubSpotTimestamp } from './adapter';
-import { 
-  OpportunitySnapshot, 
-  CommercialSubjectRef, 
-  OpportunityType, 
-  OpportunityState, 
-  EvidenceRecord,
-  QualificationConfig,
-  deriveSuccessorKey
-} from '../commercial-kernel';
+import { Client } from '@hubspot/api-client';
+import { OpportunitySnapshot, EvidenceRecord } from '../commercial-kernel/types';
+import { parseHubSpotTimestamp, HubspotAdapter } from './adapter';
 import { logger } from '../observability';
 
 export interface HubSpotRecordRef {
-  objectType: 'contact' | 'company' | 'lead' | 'deal';
   objectId: string;
+  objectType: string;
 }
 
 export class HubSpotSnapshotLoader {
-  private hsAdapter: HubspotAdapter;
+  private client: Client;
 
-  constructor(hsAdapter: HubspotAdapter) {
-    this.hsAdapter = hsAdapter;
+  constructor(accessTokenOrAdapter?: string | HubspotAdapter) {
+    if (accessTokenOrAdapter instanceof HubspotAdapter) {
+      this.client = accessTokenOrAdapter.getRawClient();
+    } else {
+      const token = accessTokenOrAdapter || process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
+      this.client = new Client({ accessToken: token });
+    }
+  }
+
+  private get leadsApi(): any {
+    return (this.client.crm.objects as any).leads || (this.client.crm as any).objects?.leads;
   }
 
   public async loadSnapshotFromRecord(
     recordRef: HubSpotRecordRef,
-    organizationKey: string = 'org_default',
-    relationshipType: string = 'b2b',
-    config?: QualificationConfig
+    organizationKey: string = 'org_default'
   ): Promise<OpportunitySnapshot> {
-    logger.info('Loading pure opportunity snapshot directly from HubSpot CRM', { objectType: recordRef.objectType, objectId: recordRef.objectId });
+    return this.loadPureSnapshotFromHubSpot(recordRef, organizationKey);
+  }
 
-    let subject: CommercialSubjectRef = { kind: 'CONTACT', key: recordRef.objectId };
-    let opportunityType: OpportunityType = 'MQL';
-    let opportunityState: OpportunityState = 'OPEN';
+  public async loadPureSnapshotFromHubSpot(
+    recordRef: HubSpotRecordRef,
+    organizationKey: string = 'org_default'
+  ): Promise<OpportunitySnapshot> {
+    const rawType = (recordRef.objectType || '').toLowerCase();
+
+    let subjectKind: 'CONTACT' | 'COMPANY' = 'CONTACT';
+    let subjectKey = '';
+    let contactKeys: string[] = [];
+    let companyKey: string | undefined = undefined;
+
+    let facts: Record<string, unknown> = {};
+    let evidence: EvidenceRecord[] = [];
+
+    let opportunityKey = '';
+    let opportunityType: 'MQL' | 'SQL' | 'FTP' | 'RTP' = 'MQL';
+    let opportunityState: 'OPEN' | 'WON' | 'LOST' = 'OPEN';
     let cycleIndex = 1;
-    let relationshipKey = `${organizationKey}_${relationshipType}_${recordRef.objectId}`;
-    let opportunityKey = `${relationshipKey}::LEAD::1`;
-    let predecessorOpportunityKey: string | undefined = undefined;
-    let predecessorCompletedAt: string | undefined = undefined;
     let openedAt = new Date().toISOString();
-    const facts: Record<string, unknown> = {};
+    let predecessorCompletedAt: string | undefined = undefined;
+    let relationshipKey = '';
 
-    const client = this.hsAdapter.getRawClient();
+    if (rawType === 'contact' || rawType === '0-1') {
+      subjectKind = 'CONTACT';
+      subjectKey = recordRef.objectId;
+      contactKeys = [recordRef.objectId];
 
-    if (recordRef.objectType === 'contact') {
-      subject = { kind: 'CONTACT', key: recordRef.objectId };
-      const contactFacts = await this.hsAdapter.loadSubjectSnapshot(subject);
-      Object.assign(facts, contactFacts);
+      const contact = await this.client.crm.contacts.basicApi.getById(recordRef.objectId, [
+        'email',
+        'lifecyclestage',
+        'coa_relationship_key',
+        'coa_relationship_type',
+        'coa_marketing_consent',
+        'coa_automation_suppressed',
+        'coa_offering_keys',
+        'createdate'
+      ]);
+      const cProps = contact.properties || {};
 
-      // Independently resolve associated Company ID for dual context
       try {
-        const companyAssoc = await client.crm.associations.v4.basicApi.getPage('contact', recordRef.objectId, 'company');
-        if (companyAssoc.results && companyAssoc.results.length > 0) {
-          const companyId = String(companyAssoc.results[0].toObjectId);
-          subject = { kind: 'COMPANY', key: companyId, contactKeys: [recordRef.objectId] };
-          const companyFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'COMPANY', key: companyId });
-          if (companyFacts.relationshipKey) facts.relationshipKey = companyFacts.relationshipKey;
-          if (companyFacts.relationshipType) facts.relationshipType = companyFacts.relationshipType;
-          if (companyFacts.automationSuppressed === true) facts.automationSuppressed = true;
+        const companyAssocs = await this.client.crm.associations.v4.basicApi.getPage(
+          'contact',
+          Number(recordRef.objectId) || (recordRef.objectId as any),
+          'company'
+        );
+        if (companyAssocs.results && companyAssocs.results.length > 0) {
+          companyKey = String(companyAssocs.results[0].toObjectId);
         }
       } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) {
-          throw err;
-        }
-        logger.warn('No company association found for contact', { contactId: recordRef.objectId });
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      relationshipKey = (facts.relationshipKey as string) || (facts.domain as string) || (facts.email as string) || `rel_${recordRef.objectId}`;
+      relationshipKey = cProps.coa_relationship_key || companyKey || `cnt_${recordRef.objectId}`;
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
-      const managedLead = await this.hsAdapter.findOrCreateLeadForSubject(subject, relationshipKey, relationshipType, config);
-      if (managedLead) {
-        opportunityType = (managedLead.coa_opportunity_type as OpportunityType) || 'MQL';
-        cycleIndex = Number(managedLead.coa_cycle_index || 1);
-        opportunityKey = managedLead.coa_opportunity_key || opportunityKey;
-        if (managedLead.createdate) {
-          openedAt = parseHubSpotTimestamp(managedLead.createdate) || openedAt;
-        }
-        const stage = (managedLead.hs_pipeline_stage as string) || 'mql';
-        if (stage === 'qualified') opportunityState = 'WON';
-        else if (stage === 'disqualified') opportunityState = 'LOST';
-        facts.stage = stage;
-        facts.leadId = managedLead.id;
-
-        if (managedLead.coa_offering_keys) {
-          facts.offeringKeys = String(managedLead.coa_offering_keys).split(',');
-          facts.products = facts.offeringKeys;
-        }
+      facts = {
+        email: cProps.email,
+        contactEmail: cProps.email,
+        lifecycleStage: cProps.lifecyclestage,
+        marketingConsent: cProps.coa_marketing_consent === 'true' || cProps.coa_marketing_consent === '1',
+        automationSuppressed: cProps.coa_automation_suppressed === 'true' || cProps.coa_automation_suppressed === '1'
+      };
+      if (cProps.coa_offering_keys) {
+        facts.offeringKeys = String(cProps.coa_offering_keys).split(',').map(s => s.trim());
       }
-    } else if (recordRef.objectType === 'company') {
-      subject = { kind: 'COMPANY', key: recordRef.objectId };
-      const companyFacts = await this.hsAdapter.loadSubjectSnapshot(subject);
-      Object.assign(facts, companyFacts);
+      openedAt = parseHubSpotTimestamp(cProps.createdate) || openedAt;
 
-      // Independently resolve associated Contact ID for dual context
+    } else if (rawType === 'company' || rawType === '0-2') {
+      subjectKind = 'COMPANY';
+      subjectKey = recordRef.objectId;
+
+      const company = await this.client.crm.companies.basicApi.getById(recordRef.objectId, [
+        'domain',
+        'name',
+        'lifecyclestage',
+        'coa_relationship_key',
+        'coa_relationship_type',
+        'coa_marketing_consent',
+        'coa_automation_suppressed',
+        'coa_offering_keys',
+        'createdate'
+      ]);
+      const compProps = company.properties || {};
+
       try {
-        const contactAssoc = await client.crm.associations.v4.basicApi.getPage('company', recordRef.objectId, 'contact');
-        if (contactAssoc.results && contactAssoc.results.length > 0) {
-          const contactId = String(contactAssoc.results[0].toObjectId);
-          (subject as any).contactKeys = [contactId];
-          const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: contactId });
-          if (contactFacts.email) facts.email = contactFacts.email;
-          if (contactFacts.automationSuppressed === true) facts.automationSuppressed = true;
+        const contactAssocs = await this.client.crm.associations.v4.basicApi.getPage(
+          'company',
+          Number(recordRef.objectId) || (recordRef.objectId as any),
+          'contact'
+        );
+        if (contactAssocs.results && contactAssocs.results.length > 0) {
+          contactKeys = contactAssocs.results.map(r => String(r.toObjectId));
         }
       } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) {
-          throw err;
-        }
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      relationshipKey = (facts.relationshipKey as string) || (facts.domain as string) || `rel_${recordRef.objectId}`;
+      relationshipKey = compProps.coa_relationship_key || `comp_${recordRef.objectId}`;
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
-      const managedLead = await this.hsAdapter.findOrCreateLeadForSubject(subject, relationshipKey, relationshipType, config);
-      if (managedLead) {
-        opportunityType = (managedLead.coa_opportunity_type as OpportunityType) || 'MQL';
-        cycleIndex = Number(managedLead.coa_cycle_index || 1);
-        opportunityKey = managedLead.coa_opportunity_key || opportunityKey;
-        if (managedLead.createdate) {
-          openedAt = parseHubSpotTimestamp(managedLead.createdate) || openedAt;
-        }
-        const stage = (managedLead.hs_pipeline_stage as string) || 'mql';
-        if (stage === 'qualified') opportunityState = 'WON';
-        else if (stage === 'disqualified') opportunityState = 'LOST';
-        facts.stage = stage;
-        facts.leadId = managedLead.id;
-
-        if (managedLead.coa_offering_keys) {
-          facts.offeringKeys = String(managedLead.coa_offering_keys).split(',');
-          facts.products = facts.offeringKeys;
-        }
+      facts = {
+        domain: compProps.domain,
+        companyName: compProps.name,
+        lifecycleStage: compProps.lifecyclestage,
+        marketingConsent: compProps.coa_marketing_consent === 'true' || compProps.coa_marketing_consent === '1',
+        automationSuppressed: compProps.coa_automation_suppressed === 'true' || compProps.coa_automation_suppressed === '1'
+      };
+      if (compProps.coa_offering_keys) {
+        facts.offeringKeys = String(compProps.coa_offering_keys).split(',').map(s => s.trim());
       }
-    } else if (recordRef.objectType === 'lead') {
-      const leadProps = await this.hsAdapter.loadLeadSnapshot(recordRef.objectId);
-      opportunityType = (leadProps.coa_opportunity_type as OpportunityType) || 'MQL';
-      cycleIndex = Number(leadProps.coa_cycle_index || 1);
-      relationshipKey = (leadProps.coa_relationship_key as string) || `rel_${recordRef.objectId}`;
-      opportunityKey = (leadProps.coa_opportunity_key as string) || `${relationshipKey}::LEAD::1`;
-      predecessorOpportunityKey = leadProps.coa_predecessor_opportunity_key as string;
-      if (leadProps.createdate) {
-        openedAt = parseHubSpotTimestamp(leadProps.createdate) || openedAt;
-      }
+      openedAt = parseHubSpotTimestamp(compProps.createdate) || openedAt;
 
-      // Query associated Contact AND Company to resolve dual subject identity
-      let resolvedContactId: string | undefined = undefined;
-      let resolvedCompanyId: string | undefined = undefined;
+    } else if (rawType === 'lead' || rawType === '0-136') {
+      const lead = await this.leadsApi.basicApi.getById(recordRef.objectId, [
+        'coa_opportunity_key',
+        'coa_relationship_key',
+        'coa_opportunity_type',
+        'coa_cycle_index',
+        'hs_pipeline_stage',
+        'coa_qualification_state',
+        'coa_predecessor_opportunity_key',
+        'coa_offering_keys',
+        'createdate'
+      ]);
+      const lProps = lead.properties || {};
+
+      let assocContactId: string | undefined = undefined;
+      let assocCompanyId: string | undefined = undefined;
 
       try {
-        const contactAssoc = await client.crm.associations.v4.basicApi.getPage('lead', recordRef.objectId, 'contact');
-        if (contactAssoc.results && contactAssoc.results.length > 0) {
-          resolvedContactId = String(contactAssoc.results[0].toObjectId);
-          const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: resolvedContactId });
-          Object.assign(facts, contactFacts);
+        const cAssoc = await this.client.crm.associations.v4.basicApi.getPage('lead', Number(recordRef.objectId) || (recordRef.objectId as any), 'contact');
+        if (cAssoc.results && cAssoc.results.length > 0) {
+          assocContactId = String(cAssoc.results[0].toObjectId);
+          contactKeys.push(assocContactId);
         }
       } catch (err: any) {
         if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
       try {
-        const companyAssoc = await client.crm.associations.v4.basicApi.getPage('lead', recordRef.objectId, 'company');
-        if (companyAssoc.results && companyAssoc.results.length > 0) {
-          resolvedCompanyId = String(companyAssoc.results[0].toObjectId);
-          const companyFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'COMPANY', key: resolvedCompanyId });
-          if (companyFacts.relationshipKey) facts.relationshipKey = companyFacts.relationshipKey;
+        const compAssoc = await this.client.crm.associations.v4.basicApi.getPage('lead', Number(recordRef.objectId) || (recordRef.objectId as any), 'company');
+        if (compAssoc.results && compAssoc.results.length > 0) {
+          assocCompanyId = String(compAssoc.results[0].toObjectId);
+          companyKey = assocCompanyId;
         }
       } catch (err: any) {
         if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      if (resolvedCompanyId) {
-        subject = { kind: 'COMPANY', key: resolvedCompanyId, contactKeys: resolvedContactId ? [resolvedContactId] : [] };
-      } else if (resolvedContactId) {
-        subject = { kind: 'CONTACT', key: resolvedContactId };
+      if (assocCompanyId) {
+        subjectKind = 'COMPANY';
+        subjectKey = assocCompanyId;
+      } else if (assocContactId) {
+        subjectKind = 'CONTACT';
+        subjectKey = assocContactId;
       }
 
-      const stage = (leadProps.hs_pipeline_stage as string) || 'mql';
+      relationshipKey = lProps.coa_relationship_key || (subjectKey ? `${subjectKind.toLowerCase()}_${subjectKey}` : `rel_lead_${recordRef.objectId}`);
+      opportunityKey = lProps.coa_opportunity_key || `${relationshipKey}::LEAD::1`;
+
+      const stage = (lProps.hs_pipeline_stage || 'mql').toLowerCase();
       if (stage === 'qualified') {
+        opportunityType = 'SQL';
         opportunityState = 'WON';
-        // Check if successor FTP Deal already exists
-        const successorKey = deriveSuccessorKey(relationshipKey, 'FTP', 1);
-        const successorSearch = await client.crm.deals.searchApi.doSearch({
-          filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: successorKey }] }],
-          sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: '0'
+      } else if (stage === 'sql') {
+        opportunityType = 'SQL';
+        opportunityState = 'OPEN';
+      } else {
+        opportunityType = 'MQL';
+        opportunityState = 'OPEN';
+      }
+
+      if (lProps.coa_offering_keys) {
+        facts.offeringKeys = String(lProps.coa_offering_keys).split(',').map(s => s.trim());
+      }
+
+      cycleIndex = Number(lProps.coa_cycle_index) || 1;
+      openedAt = parseHubSpotTimestamp(lProps.createdate) || openedAt;
+
+      // Check if deterministic successor FTP Deal already exists in CRM
+      const successorFtpKey = `${relationshipKey}::FTP::1`;
+      try {
+        const dealSearch = await this.client.crm.deals.searchApi.doSearch({
+          filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: successorFtpKey }] }],
+          sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: 0
         });
-        if (successorSearch.results && successorSearch.results.length > 0) {
+        if (dealSearch.results && dealSearch.results.length > 0) {
           facts.successorAlreadyExists = true;
         }
-      } else if (stage === 'disqualified') {
-        opportunityState = 'LOST';
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      facts.stage = stage;
-      facts.email = leadProps.email;
-      facts.leadId = recordRef.objectId;
-      if (leadProps.coa_offering_keys) {
-        facts.offeringKeys = String(leadProps.coa_offering_keys).split(',');
-        facts.products = facts.offeringKeys;
-      }
-    } else if (recordRef.objectType === 'deal') {
-      const dealProps = await this.hsAdapter.loadDealSnapshot(recordRef.objectId);
-      opportunityType = (dealProps.coa_opportunity_type as OpportunityType) || 'FTP';
-      cycleIndex = Number(dealProps.coa_cycle_index || 1);
-      relationshipKey = (dealProps.coa_relationship_key as string) || `rel_${recordRef.objectId}`;
-      opportunityKey = (dealProps.coa_opportunity_key as string) || `${relationshipKey}::${opportunityType}::${cycleIndex}`;
-      predecessorOpportunityKey = dealProps.coa_predecessor_opportunity_key as string;
-      if (dealProps.coa_predecessor_completed_at) {
-        predecessorCompletedAt = parseHubSpotTimestamp(dealProps.coa_predecessor_completed_at) || undefined;
-      }
-      if (dealProps.createdate) {
-        openedAt = parseHubSpotTimestamp(dealProps.createdate) || openedAt;
-      }
+    } else if (rawType === 'deal' || rawType === '0-3') {
+      const deal = await this.client.crm.deals.basicApi.getById(recordRef.objectId, [
+        'dealname',
+        'amount',
+        'dealstage',
+        'pipeline',
+        'coa_opportunity_key',
+        'coa_relationship_key',
+        'coa_opportunity_type',
+        'coa_cycle_index',
+        'coa_qualification_state',
+        'coa_predecessor_opportunity_key',
+        'coa_predecessor_completed_at',
+        'createdate'
+      ]);
+      const dProps = deal.properties || {};
 
-      // Query associated Contact AND Company for Deal
-      let resolvedContactId: string | undefined = undefined;
-      let resolvedCompanyId: string | undefined = undefined;
+      let assocContactId: string | undefined = undefined;
+      let assocCompanyId: string | undefined = undefined;
 
       try {
-        const companyAssoc = await client.crm.associations.v4.basicApi.getPage('deal', recordRef.objectId, 'company');
-        if (companyAssoc.results && companyAssoc.results.length > 0) {
-          resolvedCompanyId = String(companyAssoc.results[0].toObjectId);
-          const companyFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'COMPANY', key: resolvedCompanyId });
-          if (companyFacts.relationshipKey) facts.relationshipKey = companyFacts.relationshipKey;
+        const cAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(recordRef.objectId) || (recordRef.objectId as any), 'contact');
+        if (cAssoc.results && cAssoc.results.length > 0) {
+          assocContactId = String(cAssoc.results[0].toObjectId);
+          contactKeys.push(assocContactId);
         }
       } catch (err: any) {
         if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
       try {
-        const contactAssoc = await client.crm.associations.v4.basicApi.getPage('deal', recordRef.objectId, 'contact');
-        if (contactAssoc.results && contactAssoc.results.length > 0) {
-          resolvedContactId = String(contactAssoc.results[0].toObjectId);
-          const contactFacts = await this.hsAdapter.loadSubjectSnapshot({ kind: 'CONTACT', key: resolvedContactId });
-          Object.assign(facts, contactFacts);
+        const compAssoc = await this.client.crm.associations.v4.basicApi.getPage('deal', Number(recordRef.objectId) || (recordRef.objectId as any), 'company');
+        if (compAssoc.results && compAssoc.results.length > 0) {
+          assocCompanyId = String(compAssoc.results[0].toObjectId);
+          companyKey = assocCompanyId;
         }
       } catch (err: any) {
         if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      if (resolvedCompanyId) {
-        subject = { kind: 'COMPANY', key: resolvedCompanyId, contactKeys: resolvedContactId ? [resolvedContactId] : [] };
-      } else if (resolvedContactId) {
-        subject = { kind: 'CONTACT', key: resolvedContactId };
+      if (assocCompanyId) {
+        subjectKind = 'COMPANY';
+        subjectKey = assocCompanyId;
+      } else if (assocContactId) {
+        subjectKind = 'CONTACT';
+        subjectKey = assocContactId;
       }
 
-      // Load associated Line Items & Products
-      try {
-        const lineItemAssocs = await client.crm.associations.v4.basicApi.getPage('deal', recordRef.objectId, 'line_items');
-        const productIds: string[] = [];
-        const lineItems: any[] = [];
+      relationshipKey = dProps.coa_relationship_key || (subjectKey ? `${subjectKind.toLowerCase()}_${subjectKey}` : `rel_deal_${recordRef.objectId}`);
+      opportunityType = (dProps.coa_opportunity_type as any) || 'FTP';
+      cycleIndex = Number(dProps.coa_cycle_index) || 1;
+      opportunityKey = dProps.coa_opportunity_key || `${relationshipKey}::${opportunityType}::${cycleIndex}`;
 
-        for (const itemAssoc of lineItemAssocs.results || []) {
-          const itemId = String(itemAssoc.toObjectId);
-          const lineItem = await (client.crm as any).lineItems.basicApi.getById(itemId, ['name', 'hs_product_id', 'quantity', 'price']);
-          const prodId = lineItem.properties?.hs_product_id || lineItem.id;
-          productIds.push(prodId);
-          lineItems.push(lineItem.properties);
-        }
-
-        facts.products = productIds;
-        facts.offeringKeys = productIds;
-        facts.lineItems = lineItems;
-      } catch (err: any) {
-        if (err.statusCode && err.statusCode !== 404) throw err;
-      }
-
-      const stage = (dealProps.dealstage as string) || 'open';
+      const stage = (dProps.dealstage || 'open').toLowerCase();
       if (stage === 'closedwon') {
         opportunityState = 'WON';
         facts.transactionCompleted = true;
-
-        // Check if deterministic successor Deal already exists
-        const nextCycle = opportunityType === 'FTP' ? 1 : cycleIndex + 1;
-        const nextType: OpportunityType = 'RTP';
-        const successorKey = deriveSuccessorKey(relationshipKey, nextType, nextCycle);
-
-        const successorSearch = await client.crm.deals.searchApi.doSearch({
-          filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: successorKey }] }],
-          sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: '0'
-        });
-        if (successorSearch.results && successorSearch.results.length > 0) {
-          facts.successorAlreadyExists = true;
-        }
       } else if (stage === 'closedlost') {
         opportunityState = 'LOST';
+      } else {
+        opportunityState = 'OPEN';
       }
 
-      facts.stage = stage;
-      facts.amount = dealProps.amount;
-      facts.dealId = recordRef.objectId;
+      openedAt = parseHubSpotTimestamp(dProps.createdate) || openedAt;
+      predecessorCompletedAt = parseHubSpotTimestamp(dProps.coa_predecessor_completed_at) || undefined;
+
+      // Search if deterministic successor Deal already exists in CRM
+      const nextCycleIndex = opportunityType === 'FTP' ? 1 : cycleIndex + 1;
+      const successorType = opportunityType === 'FTP' ? 'RTP' : 'RTP';
+      const successorKey = `${relationshipKey}::${successorType}::${nextCycleIndex}`;
+
+      try {
+        const succSearch = await this.client.crm.deals.searchApi.doSearch({
+          filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: successorKey }] }],
+          sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: 0
+        });
+        if (succSearch.results && succSearch.results.length > 0) {
+          facts.successorAlreadyExists = true;
+        }
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      }
+    } else {
+      throw new Error(`INVALID_ENROLLMENT: Unsupported objectType '${recordRef.objectType}'`);
     }
 
-    // Load associated evidence strictly scoped to subject ID & associated contact ID within window
-    const associatedContactId = subject.kind === 'COMPANY' && subject.contactKeys && subject.contactKeys.length > 0
-      ? subject.contactKeys[0]
-      : undefined;
+    // Hydrate subject contact facts
+    if (contactKeys.length > 0) {
+      try {
+        const primaryContact = await this.client.crm.contacts.basicApi.getById(contactKeys[0], [
+          'email',
+          'lifecyclestage',
+          'coa_marketing_consent',
+          'coa_automation_suppressed',
+          'coa_offering_keys'
+        ]);
+        const pcProps = primaryContact.properties || {};
+        facts.email = pcProps.email || facts.email;
+        facts.contactEmail = pcProps.email || facts.contactEmail;
+        if (pcProps.coa_marketing_consent === 'true' || pcProps.coa_marketing_consent === '1') {
+          facts.marketingConsent = true;
+        }
+        if (pcProps.coa_automation_suppressed === 'true' || pcProps.coa_automation_suppressed === '1') {
+          facts.automationSuppressed = true;
+        }
+        if (pcProps.coa_offering_keys && !facts.offeringKeys) {
+          facts.offeringKeys = String(pcProps.coa_offering_keys).split(',').map(s => s.trim());
+        }
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      }
+    }
 
-    const evidence = await this.hsAdapter.loadAssociatedEvidence(
-      subject.key, 
-      subject.kind.toLowerCase(), 
-      { openedAt, predecessorCompletedAt },
-      associatedContactId
-    );
+    // Load meetings evidence associated with primary contact
+    if (contactKeys.length > 0) {
+      try {
+        const lowerTime = predecessorCompletedAt ? new Date(predecessorCompletedAt).getTime() : new Date(openedAt).getTime();
+        const meetingAssocs = await this.client.crm.associations.v4.basicApi.getPage('contact', Number(contactKeys[0]) || (contactKeys[0] as any), 'meeting');
+        for (const assoc of meetingAssocs.results || []) {
+          const meetingId = String(assoc.toObjectId);
+          const meeting = await (this.client.crm as any).objects.meetings.basicApi.getById(meetingId, [
+            'hs_meeting_outcome',
+            'hs_timestamp'
+          ]);
+          const parsedTime = parseHubSpotTimestamp(meeting.properties.hs_timestamp);
+          if (parsedTime && new Date(parsedTime).getTime() > lowerTime) {
+            evidence.push({
+              id: meeting.id,
+              predicate: 'activityExists',
+              scope: 'opportunity',
+              occurredAt: parsedTime,
+              data: {
+                activityType: 'MEETING',
+                outcome: meeting.properties.hs_meeting_outcome === 'COMPLETED' ? 'COMPLETED' : 'HELD'
+              }
+            });
+          }
+        }
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      }
+    }
 
     return {
       organizationKey,
       relationshipKey,
-      relationshipType,
+      relationshipType: 'b2b',
       opportunityKey,
       opportunityType,
       opportunityState,
       cycleIndex,
       openedAt,
-      predecessorOpportunityKey,
       predecessorCompletedAt,
-      subject,
+      subject: {
+        kind: subjectKind,
+        key: subjectKey,
+        contactKeys,
+        companyKey
+      },
       facts,
       evidence
     };

@@ -67,7 +67,7 @@ export function planTransition(
     return [{ kind: 'NOOP', reason: 'Opportunity is LOST' }];
   }
 
-  // Successor-Aware Reconciliation: Closed Won opportunity with an already existing verified successor is terminal NOOP
+  // Replay Safety: Closed Won opportunity with existing verified successor is terminal NOOP
   if (snapshot.opportunityState === 'WON' && snapshot.facts.successorAlreadyExists === true) {
     return [{ kind: 'NOOP', reason: 'Opportunity is WON and deterministic successor already exists' }];
   }
