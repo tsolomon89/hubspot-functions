@@ -1,0 +1,657 @@
+﻿{
+    "jsonrpc":  "2.0",
+    "id":  2,
+    "result":  {
+                   "content":  [
+                                   {
+                                       "type":  "text",
+                                       "text":  "{\"functions\":[{\"created_time\":\"2026-05-30T07:47:55+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Lead\",\"plural_label\":\"Leads\",\"api_name\":\"Leads\",\"moduleName\":\"Leads\",\"id\":\"991103000000000043\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:49:18+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000774702\"},\"name\":\"process Lead\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000774791\"},{\"created_time\":\"2026-05-30T07:48:31+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:49:07+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000774697\"},\"name\":\"process Deal\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000774797\"},{\"created_time\":\"2026-05-30T07:46:49+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Contact\",\"plural_label\":\"Contacts\",\"api_name\":\"Contacts\",\"moduleName\":\"Contacts\",\"id\":\"991103000000000047\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:48:58+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000774692\"},\"name\":\"process Contact\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000774779\"},{\"created_time\":\"2026-05-30T07:47:23+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Account\",\"plural_label\":\"Accounts\",\"api_name\":\"Accounts\",\"moduleName\":\"Accounts\",\"id\":\"991103000000000045\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:48:48+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000774687\"},\"name\":\"process Account\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000774785\"},{\"created_time\":\"2026-05-31T19:21:24+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:48:26+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780343\"},\"name\":\"sequenceRouter\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780386\"},{\"created_time\":\"2026-06-01T06:23:19+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Task\",\"plural_label\":\"Tasks\",\"api_name\":\"Tasks\",\"moduleName\":\"Tasks\",\"id\":\"991103000000000063\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:48:04+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780337\"},\"name\":\"handleTaskCompletion\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780448\"},{\"created_time\":\"2026-05-31T19:27:10+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Meeting\",\"plural_label\":\"Meetings\",\"api_name\":\"Events\",\"moduleName\":\"Events\",\"id\":\"991103000000000065\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:47:53+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780334\"},\"name\":\"handleMeetingEvent\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780415\"},{\"created_time\":\"2026-06-01T09:22:50+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":{\"singular_label\":\"Email\",\"plural_label\":\"Emails\",\"api_name\":\"Emails\",\"moduleName\":\"Emails\",\"id\":\"991103000000000115\"},\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:47:39+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780542\"},\"name\":\"handleEmailReplied\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780547\"},{\"created_time\":\"2026-06-01T09:42:15+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":{\"singular_label\":\"Email\",\"plural_label\":\"Emails\",\"api_name\":\"Emails\",\"moduleName\":\"Emails\",\"id\":\"991103000000000115\"},\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:47:29+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780537\"},\"name\":\"handleEmailOpenedNotReplied\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780568\"},{\"created_time\":\"2026-06-01T09:41:27+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":{\"singular_label\":\"Email\",\"plural_label\":\"Emails\",\"api_name\":\"Emails\",\"moduleName\":\"Emails\",\"id\":\"991103000000000115\"},\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:47:17+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780532\"},\"name\":\"handleEmailNotReplied\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780561\"},{\"created_time\":\"2026-06-01T08:53:23+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":{\"singular_label\":\"Email\",\"plural_label\":\"Emails\",\"api_name\":\"Emails\",\"moduleName\":\"Emails\",\"id\":\"991103000000000115\"},\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:47:04+01:00\",\"associated\":false,\"function\":{\"id\":\"991103000000780331\"},\"name\":\"handleEmailEvent\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780517\"},{\"created_time\":\"2026-06-01T09:43:23+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":{\"singular_label\":\"Email\",\"plural_label\":\"Emails\",\"api_name\":\"Emails\",\"moduleName\":\"Emails\",\"id\":\"991103000000000115\"},\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:46:50+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780527\"},\"name\":\"handleEmailClicked\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780574\"},{\"created_time\":\"2026-06-01T09:23:40+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":{\"singular_label\":\"Email\",\"plural_label\":\"Emails\",\"api_name\":\"Emails\",\"moduleName\":\"Emails\",\"id\":\"991103000000000115\"},\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:46:36+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780522\"},\"name\":\"handleEmailBounced\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780554\"},{\"created_time\":\"2026-05-31T19:23:30+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:46:25+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780328\"},\"name\":\"handleDemoOutcome\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780410\"},{\"created_time\":\"2026-05-31T19:22:51+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Deal\",\"plural_label\":\"Deals\",\"api_name\":\"Deals\",\"moduleName\":\"Potentials\",\"id\":\"991103000000000049\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:46:10+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780325\"},\"name\":\"handleCommercialsStatusChange\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780404\"},{\"created_time\":\"2026-06-01T06:27:28+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Call\",\"plural_label\":\"Calls\",\"api_name\":\"Calls\",\"moduleName\":\"Calls\",\"id\":\"991103000000000067\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-06-14T07:45:58+01:00\",\"associated\":true,\"function\":{\"id\":\"991103000000780322\"},\"name\":\"handleCallOutcome\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000780459\"},{\"created_time\":\"2026-05-26T11:49:33+01:00\",\"lock_status\":{\"locked\":false},\"editable\":true,\"module\":{\"singular_label\":\"Lead\",\"plural_label\":\"Leads\",\"api_name\":\"Leads\",\"moduleName\":\"Leads\",\"id\":\"991103000000000043\"},\"related_module\":null,\"deletable\":true,\"description\":null,\"language\":\"deluge\",\"source\":\"crm\",\"created_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"feature_type\":\"workflow\",\"modified_time\":\"2026-05-27T08:03:08+01:00\",\"associated\":false,\"function\":{\"id\":\"991103000000543684\"},\"name\":\"Convert Lead\",\"modified_by\":{\"name\":\"Timothy Solomon\",\"id\":\"991103000000543001\"},\"id\":\"991103000000543692\"}],\"info\":{\"per_page\":200,\"count\":17,\"page\":1,\"more_records\":false}}"
+                                   }
+                               ],
+                   "isError":  false,
+                   "structuredContent":  {
+                                             "status":  "success",
+                                             "data":  {
+                                                          "functions":  [
+                                                                            {
+                                                                                "created_time":  "2026-05-30T07:47:55+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Lead",
+                                                                                               "plural_label":  "Leads",
+                                                                                               "api_name":  "Leads",
+                                                                                               "moduleName":  "Leads",
+                                                                                               "id":  "991103000000000043"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:49:18+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000774702"
+                                                                                             },
+                                                                                "name":  "process Lead",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000774791"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-05-30T07:48:31+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:49:07+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000774697"
+                                                                                             },
+                                                                                "name":  "process Deal",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000774797"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-05-30T07:46:49+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Contact",
+                                                                                               "plural_label":  "Contacts",
+                                                                                               "api_name":  "Contacts",
+                                                                                               "moduleName":  "Contacts",
+                                                                                               "id":  "991103000000000047"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:48:58+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000774692"
+                                                                                             },
+                                                                                "name":  "process Contact",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000774779"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-05-30T07:47:23+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Account",
+                                                                                               "plural_label":  "Accounts",
+                                                                                               "api_name":  "Accounts",
+                                                                                               "moduleName":  "Accounts",
+                                                                                               "id":  "991103000000000045"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:48:48+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000774687"
+                                                                                             },
+                                                                                "name":  "process Account",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000774785"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-05-31T19:21:24+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:48:26+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780343"
+                                                                                             },
+                                                                                "name":  "sequenceRouter",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780386"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-06-01T06:23:19+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Task",
+                                                                                               "plural_label":  "Tasks",
+                                                                                               "api_name":  "Tasks",
+                                                                                               "moduleName":  "Tasks",
+                                                                                               "id":  "991103000000000063"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:48:04+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780337"
+                                                                                             },
+                                                                                "name":  "handleTaskCompletion",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780448"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-05-31T19:27:10+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Meeting",
+                                                                                               "plural_label":  "Meetings",
+                                                                                               "api_name":  "Events",
+                                                                                               "moduleName":  "Events",
+                                                                                               "id":  "991103000000000065"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:47:53+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780334"
+                                                                                             },
+                                                                                "name":  "handleMeetingEvent",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780415"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-06-01T09:22:50+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  {
+                                                                                                       "singular_label":  "Email",
+                                                                                                       "plural_label":  "Emails",
+                                                                                                       "api_name":  "Emails",
+                                                                                                       "moduleName":  "Emails",
+                                                                                                       "id":  "991103000000000115"
+                                                                                                   },
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:47:39+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780542"
+                                                                                             },
+                                                                                "name":  "handleEmailReplied",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780547"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-06-01T09:42:15+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  {
+                                                                                                       "singular_label":  "Email",
+                                                                                                       "plural_label":  "Emails",
+                                                                                                       "api_name":  "Emails",
+                                                                                                       "moduleName":  "Emails",
+                                                                                                       "id":  "991103000000000115"
+                                                                                                   },
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:47:29+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780537"
+                                                                                             },
+                                                                                "name":  "handleEmailOpenedNotReplied",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780568"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-06-01T09:41:27+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  {
+                                                                                                       "singular_label":  "Email",
+                                                                                                       "plural_label":  "Emails",
+                                                                                                       "api_name":  "Emails",
+                                                                                                       "moduleName":  "Emails",
+                                                                                                       "id":  "991103000000000115"
+                                                                                                   },
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:47:17+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780532"
+                                                                                             },
+                                                                                "name":  "handleEmailNotReplied",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780561"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-06-01T08:53:23+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  {
+                                                                                                       "singular_label":  "Email",
+                                                                                                       "plural_label":  "Emails",
+                                                                                                       "api_name":  "Emails",
+                                                                                                       "moduleName":  "Emails",
+                                                                                                       "id":  "991103000000000115"
+                                                                                                   },
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:47:04+01:00",
+                                                                                "associated":  false,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780331"
+                                                                                             },
+                                                                                "name":  "handleEmailEvent",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780517"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-06-01T09:43:23+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  {
+                                                                                                       "singular_label":  "Email",
+                                                                                                       "plural_label":  "Emails",
+                                                                                                       "api_name":  "Emails",
+                                                                                                       "moduleName":  "Emails",
+                                                                                                       "id":  "991103000000000115"
+                                                                                                   },
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:46:50+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780527"
+                                                                                             },
+                                                                                "name":  "handleEmailClicked",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780574"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-06-01T09:23:40+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  {
+                                                                                                       "singular_label":  "Email",
+                                                                                                       "plural_label":  "Emails",
+                                                                                                       "api_name":  "Emails",
+                                                                                                       "moduleName":  "Emails",
+                                                                                                       "id":  "991103000000000115"
+                                                                                                   },
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:46:36+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780522"
+                                                                                             },
+                                                                                "name":  "handleEmailBounced",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780554"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-05-31T19:23:30+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:46:25+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780328"
+                                                                                             },
+                                                                                "name":  "handleDemoOutcome",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780410"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-05-31T19:22:51+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Deal",
+                                                                                               "plural_label":  "Deals",
+                                                                                               "api_name":  "Deals",
+                                                                                               "moduleName":  "Potentials",
+                                                                                               "id":  "991103000000000049"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:46:10+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780325"
+                                                                                             },
+                                                                                "name":  "handleCommercialsStatusChange",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780404"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-06-01T06:27:28+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Call",
+                                                                                               "plural_label":  "Calls",
+                                                                                               "api_name":  "Calls",
+                                                                                               "moduleName":  "Calls",
+                                                                                               "id":  "991103000000000067"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-06-14T07:45:58+01:00",
+                                                                                "associated":  true,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000780322"
+                                                                                             },
+                                                                                "name":  "handleCallOutcome",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000780459"
+                                                                            },
+                                                                            {
+                                                                                "created_time":  "2026-05-26T11:49:33+01:00",
+                                                                                "lock_status":  {
+                                                                                                    "locked":  false
+                                                                                                },
+                                                                                "editable":  true,
+                                                                                "module":  {
+                                                                                               "singular_label":  "Lead",
+                                                                                               "plural_label":  "Leads",
+                                                                                               "api_name":  "Leads",
+                                                                                               "moduleName":  "Leads",
+                                                                                               "id":  "991103000000000043"
+                                                                                           },
+                                                                                "related_module":  null,
+                                                                                "deletable":  true,
+                                                                                "description":  null,
+                                                                                "language":  "deluge",
+                                                                                "source":  "crm",
+                                                                                "created_by":  {
+                                                                                                   "name":  "Timothy Solomon",
+                                                                                                   "id":  "991103000000543001"
+                                                                                               },
+                                                                                "feature_type":  "workflow",
+                                                                                "modified_time":  "2026-05-27T08:03:08+01:00",
+                                                                                "associated":  false,
+                                                                                "function":  {
+                                                                                                 "id":  "991103000000543684"
+                                                                                             },
+                                                                                "name":  "Convert Lead",
+                                                                                "modified_by":  {
+                                                                                                    "name":  "Timothy Solomon",
+                                                                                                    "id":  "991103000000543001"
+                                                                                                },
+                                                                                "id":  "991103000000543692"
+                                                                            }
+                                                                        ],
+                                                          "info":  {
+                                                                       "per_page":  200,
+                                                                       "count":  17,
+                                                                       "page":  1,
+                                                                       "more_records":  false
+                                                                   }
+                                                      }
+                                         }
+               }
+}

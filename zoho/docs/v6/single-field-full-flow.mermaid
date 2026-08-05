@@ -1,0 +1,45 @@
+flowchart TD
+    classDef user fill:#e8f5ff,stroke:#1f6feb,color:#0b1f33
+    classDef fn fill:#e6ffed,stroke:#1a7f37,color:#0b1f33
+    classDef gate fill:#fff4ce,stroke:#9a6700,color:#2f2100
+    classDef retired fill:#f6f8fa,stroke:#8c959f,color:#24292f
+
+    UTask["USER: Task Product names<br/>brands + dates"]:::user
+    UCall["USER: Call Product names<br/>brands + dates"]:::user
+    UEvent["USER: Event state/stage<br/>Product names + brands + dates"]:::user
+
+    HT["handleTaskCompletion"]:::fn
+    HC["handleCallOutcome"]:::fn
+    HM["handleMeetingEvent"]:::fn
+
+    UTask --> HT
+    UCall --> HC
+    UEvent --> HM
+
+    Ctx["contextJson.products<br/>Product-name strings"]:::fn
+    HT --> Ctx
+    HC --> Ctx
+    HM --> Ctx
+
+    Router["routeContactSequence"]:::fn
+    DealEngine["processDeal"]:::fn
+    Ctx --> Router --> DealEngine
+    HM --> DealEngine
+
+    Resolve{"Resolve Product_Name<br/>or Product_Code"}:::gate
+    Quote["Per-Product Quote<br/>Quote_Product + Quoted_Items"]:::fn
+    Key["Quote_Applied_Activity_Keys<br/>exact key ledger"]:::fn
+    Verify{"Readback verifies<br/>key + Products"}:::gate
+
+    DealEngine --> Resolve
+    Resolve -- ambiguous/unresolved --> Review["Manual Review"]:::gate
+    Resolve -- resolved --> Quote --> Key --> Verify
+    Verify -- failed --> Review
+    Verify -- passed --> Recompute["Amount + ledger + stage gates"]:::fn
+
+    UQuote["USER: Quote create/edit/stage/move"]:::user
+    WF021["WF021 handleQuoteStageChange"]:::fn
+    UQuote --> WF021 --> DealEngine
+
+    Legacy["Legacy until final gate:<br/>WF020 active, WF004 active"]:::retired
+    Retired["Retired fields:<br/>activity marker fields<br/>phantom commercial timestamps<br/>Meeting_Type"]:::retired

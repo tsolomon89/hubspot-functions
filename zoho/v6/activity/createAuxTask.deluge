@@ -1,0 +1,121 @@
+string automation.createAuxTask(string contactIdStr, string dealIdStr, string taskType, string note)
+{
+	// =========================================================================
+	// createAuxTask  (Contact-centric)
+	//
+	// Creates a blocking manual Task (e.g. "Data Repair", "Manual Review",
+	// "Review Reply") linked to Who_Id=Contact, What_Id=Deal. Reuses existing
+	// Task_Type picklist values only. Deduplicated per Contact/Deal/type on open
+	// status. Returns the Task ID (existing or new) or "".
+	// =========================================================================
+
+	info "VERSION: v6-contact-centric";
+
+	contactId = 0;
+	if(!isNull(contactIdStr) && contactIdStr != "") { contactId = contactIdStr.toLong(); }
+	dealId = 0;
+	if(!isNull(dealIdStr) && dealIdStr != "") { dealId = dealIdStr.toLong(); }
+	if(contactId == 0 || dealId == 0 || isNull(taskType) || taskType == "") { return ""; }
+
+	// Real newline for rep-facing Description text. This org's Deluge stores a literal backslash-n
+	// sequence instead of a line break (verified live 2026-07-07), so line breaks must come from an
+	// actual newline character. hextoText("0A") = line feed (a raw newline in a string literal is not valid Deluge here).
+	nl = hextoText("0A");
+
+	existingTasks = zoho.crm.getRelatedRecords("Tasks", "Deals", dealId);
+	if(isNull(existingTasks) || existingTasks.size() == 0 || existingTasks.toString().startsWith("{\"code\""))
+	{
+		existingTasks = zoho.crm.searchRecords("Tasks", "(What_Id:equals:" + dealId + ")");
+	}
+	if(!isNull(existingTasks) && existingTasks.size() > 0 && !existingTasks.toString().startsWith("{\"code\""))
+	{
+		for each tk in existingTasks
+		{
+			tWho = "";
+			whoLookup = tk.get("Who_Id");
+			if(!isNull(whoLookup) && !isNull(whoLookup.get("id"))) { tWho = whoLookup.get("id").toString(); }
+			tType = ifnull(tk.get("Task_Type"), "").toString();
+			tStatus = ifnull(tk.get("Status"), "").toString();
+			if(tWho == contactId.toString() && tType == taskType && (tStatus == "Not Started" || tStatus == "In Progress"))
+			{
+				// append-issue: a reused Manual Review accumulates DISTINCT issue codes
+				// instead of discarding later issues. Issue code = the leading [token] of
+				// the note (e.g. "[pricing_unavailable]"); dedup on that, else on the note.
+				existingTaskId = tk.get("id").toString();
+				newNote = ifnull(note, "").toString().trim();
+				if(newNote != "")
+				{
+					curDesc = ifnull(tk.get("Description"), "").toString();
+					issueCode = "";
+					if(newNote.startsWith("[") && newNote.contains("]")) { issueCode = newNote.subString(0, newNote.indexOf("]") + 1); }
+					alreadyPresent = false;
+					if(issueCode != "" && curDesc.contains(issueCode)) { alreadyPresent = true; }
+					else if(issueCode == "" && curDesc.contains(newNote)) { alreadyPresent = true; }
+					if(!alreadyPresent)
+					{
+						updDesc = curDesc;
+						if(updDesc.trim() != "") { updDesc = updDesc + nl; }
+						updDesc = updDesc + newNote;
+						noTriggerA = Map();
+						noTriggerA.put("trigger", List());
+						zoho.crm.updateRecord("Tasks", existingTaskId.toLong(), {"Description":updDesc}, noTriggerA);
+					}
+				}
+				return existingTaskId;
+			}
+		}
+	}
+
+	deal = zoho.crm.getRecordById("Deals", dealId);
+	tkMap = Map();
+	tkMap.put("Subject", taskType + ": " + ifnull(note, "").toString());
+	tkMap.put("Status", "In Progress");
+	tkMap.put("What_Id", dealId);
+	tkMap.put("$se_module", "Deals");
+	tkMap.put("Who_Id", contactId);
+	tkMap.put("Task_Sequence_Managed", true);
+	tkMap.put("Task_Type", taskType);
+	tkMap.put("Blocks_Sequence", "Yes");
+	// Field-update contract footer for the rep. The specific issue/instruction (note) leads; the
+	// footer states the ONE user action + exactly what automation does on save, tailored to the task
+	// TYPE so it never promises behaviour the handler does not perform:
+	//   - resume types (Manual Review / Data Repair / Review Reply / Suppression Review / Enrichment)
+	//     only resume the sequence on Won and NEVER read the Contract fields -> no commercial claim.
+	//   - Send Commercials delivers the already-drafted Quote on Won -> "sent" wording, no re-entry.
+	//   - any other (evidence-driven) type advances via task:positive and DOES read the Contract
+	//     fields -> keep the commercial-evidence line.
+	// The dedup/append logic above matches on the note text only, so a constant per-type footer is safe.
+	resumeTypes = {"Manual Review", "Data Repair", "Review Reply", "Suppression Review", "Enrichment"};
+	if(resumeTypes.contains(taskType))
+	{
+		auxHelp = nl + nl + "--- Automation-managed task." + nl + "Your action: resolve the item above, then set Task State = Won (or Task State = Lost + Task Lost Reasons if it cannot proceed)." + nl + "Do not edit Task Status, Status, or the Stage / Pipeline / Sequence fields - automation owns them." + nl + "On save: automation resumes the Contact sequence. No commercial / Contract fields are read on this task.";
+	}
+	else if(taskType == "Send Commercials")
+	{
+		auxHelp = nl + nl + "--- Automation-managed task." + nl + "Your action: once the commercials have been sent to the customer, set Task State = Won." + nl + "Do not re-enter the Contract fields, and do not edit the Quote, Task Status, Status, or the Stage / Pipeline / Sequence fields." + nl + "On save: automation marks the Quote Delivered and advances the Deal to Commercial Agreement.";
+	}
+	else
+	{
+		auxHelp = nl + nl + "--- Automation-managed task." + nl + "Your action: when the work is done, set Task State = Won (or Task State = Lost + Task Lost Reasons)." + nl + "If commercial terms were discussed, quoted or agreed, also fill the Task Contract fields (Products / Brands / Date Start / Date End / Frequency) before Won." + nl + "Do not edit Task Status, Status, or the Stage / Pipeline / Sequence fields - automation advances the record and updates any Quote after you save.";
+	}
+	tkMap.put("Description", ifnull(note, "").toString() + auxHelp);
+	tkMap.put("Task_Status", "Working");
+	tkMap.put("Task_State", "Open");
+	if(!isNull(deal) && !isNull(deal.get("id")))
+	{
+		ownerLookup = deal.get("Owner");
+		if(!isNull(ownerLookup) && !isNull(ownerLookup.get("id"))) { tkMap.put("Owner", ownerLookup.get("id").toString()); }
+		// activity mirror fields (automation-owned) from the Deal context
+		// F3 FIX: Deluge getRecordById omits the special Pipeline field; resolve via the shared resolver.
+		auxPipeline = automation.resolveDealPipeline(dealId.toString());
+		auxOppType  = ifnull(deal.get("Stage"), "").toString();
+		auxStage    = ifnull(deal.get("Opportunity_Stage"), "").toString();
+		if(auxPipeline != "") { tkMap.put("Task_Pipeline", auxPipeline); }
+		if(auxOppType != "")  { tkMap.put("Task_Opportunity", auxOppType); }
+		if(auxStage != "")    { tkMap.put("Task_Stage", auxStage); }
+	}
+	createResp = zoho.crm.createRecord("Tasks", tkMap);
+	newId = "";
+	if(!isNull(createResp) && !isNull(createResp.get("id"))) { newId = createResp.get("id").toString(); }
+	return newId;
+}

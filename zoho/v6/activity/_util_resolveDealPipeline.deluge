@@ -1,0 +1,42 @@
+string automation.resolveDealPipeline(string dealIdStr)
+{
+	// =========================================================================
+	// _util_resolveDealPipeline   (VERSION: v6-product-pipeline)
+	//
+	// Resolve the Deal Pipeline (B2B / Partnership) for the activity mirror fields
+	// (Task_Pipeline / Call_Task_Pipeline / Meeting_Task_Pipeline), derived from the
+	// authoritative Product -> Pipeline rule.
+	//
+	// Product Interest is authoritative for the pipeline. The Deal's own `Pipeline`
+	// field is UNREADABLE inside the Deluge runtime (verified 2026-07-16: native/REST/
+	// COQL all return it blank in-function), but `Deal_Product_Key` IS readable — so we
+	// read the product key and map it via pipelineForProductKey. This is the runtime
+	// form of the authoritative mapping, NOT a name/tag/layout heuristic (that heuristic
+	// has been removed).
+	//
+	//   product key B2B (jurnii_*) / blank -> "B2B"
+	//   product key "partnership"           -> "Partnership"
+	//   unknown non-blank key               -> "" (leave mirror blank) + log
+	//
+	// Every call site guards `if(pipeline != "")`, so a blank return leaves the mirror
+	// untouched rather than mislabelling it.
+	// =========================================================================
+	dealId = 0;
+	cleanDealId = ifnull(dealIdStr, "").toString().replaceAll("zcrm_", "").trim();
+	if(cleanDealId != "" && cleanDealId.matches("[0-9]+")) { dealId = cleanDealId.toLong(); }
+	if(dealId == 0) { return ""; }
+
+	nativeDeal = zoho.crm.getRecordById("Deals", dealId);
+	if(isNull(nativeDeal) || isNull(nativeDeal.get("id"))) { return ""; }
+
+	dealProductKey = ifnull(nativeDeal.get("Deal_Product_Key"), "").toString().trim();
+	pl = automation.pipelineForProductKey(dealProductKey);
+
+	if(pl == "unresolved")
+	{
+		automation.logAutomationEvent("resolveDealPipeline", "Deals", dealId.toString(), "pipeline_unresolved_product", "blank_mirror", {"product_key":dealProductKey});
+		return "";
+	}
+	automation.logAutomationEvent("resolveDealPipeline", "Deals", dealId.toString(), "pipeline_resolved", pl, {"product_key":dealProductKey});
+	return pl;
+}

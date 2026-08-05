@@ -1,0 +1,307 @@
+void automation.applyQuoteLifecycle(string dealId)
+{
+	// =========================================================================
+	// _util_applyQuoteLifecycle   (VERSION: v6-phase3-aer-lifecycle)
+	//
+	// A/E/R Quote transition lifecycle. Closed Won is the SIGNED event (D1); it is
+	// the ONLY trigger for a transition. Confirmed does NOT transition anything.
+	//
+	//   Acquisition Closed Won -> ensure the single OPEN Renewal (reuse if one already
+	//                             exists, e.g. import supplied Acq + Renewal; else create).
+	//   Expansion   Closed Won -> update the single OPEN Renewal (add ACV; NO new slot).
+	//                             If none exists -> create one (D3, auto-create + log).
+	//   Renewal     Closed Won -> create the NEXT OPEN Renewal (roll dates forward).
+	//   Renewal     Closed Lost-> churn: Deal -> Lost ONLY if no other OPEN Quote remains
+	//                             (D4; OPEN = non-Closed-Lost AND non-Closed-Won).
+	//
+	// Invariants + idempotency:
+	//   - At most ONE open Quote per Quote_Type per Deal. TWO passes: pass 1 applies every
+	//     Closed Won create/bump; pass 2 applies Renewal Closed Lost churn (so a successor
+	//     Renewal created by a Closed Won in the SAME run is visible to churn regardless of
+	//     iteration order). Churn recomputes "other open" from a LIVE re-read.
+	//   - Each transition stamps a deterministic key (AcqCW/ExpCW/RenCW/RenCL:<qid>) on the
+	//     TRIGGERING Quote in Quote_Applied_Lifecycle_Keys; a present key -> skip. Before every
+	//     mutating action the key is RE-READ live, and before a create the Deal's Quotes are
+	//     RE-SEARCHED live for an open Renewal (reuse if present) -- closing the check-then-act
+	//     window against the async WF001d re-fire. Mirrors 5b impKey / 8z scafKey.
+	//   - Deals never Won (Opportunity_State in {Open, Lost}); Closed Won lives on the Quote.
+	//   - Successor Renewal is Draft, Quote_Product = the Deal_Product (no mismatch),
+	//     Contract_ACV carried from predecessor (D2; 0 + review if blank), dates a fixed 1-year
+	//     term (D6; no-dates + review if predecessor End missing), chase = new End - 45d.
+	//
+	// Called from processDeal 10 (after 9 signed establishment, before 6 Amount recompute).
+	// =========================================================================
+	dId = ifnull(dealId, "").toString().replaceAll("zcrm_", "").trim();
+	if(dId == "" || !dId.matches("[0-9]+")) { return; }
+
+	noTrigger = Map();
+	noTrigger.put("trigger", List());
+
+	deal = zoho.crm.getRecordById("Deals", dId.toLong());
+	if(isNull(deal) || isNull(deal.get("id"))) { return; }
+
+	// Resolve Deal product + Account + controlling Contact (successor Quote wiring).
+	dpLk = deal.get("Deal_Product");
+	dealProdId = "";
+	dealProdName = "";
+	if(!isNull(dpLk) && !isNull(dpLk.get("id"))) { dealProdId = dpLk.get("id").toString(); dealProdName = ifnull(dpLk.get("name"), "").toString(); }
+
+	accId = "";
+	accName = "";
+	accLk = deal.get("Account_Name");
+	if(!isNull(accLk) && !isNull(accLk.get("id"))) { accId = accLk.get("id").toString(); accName = ifnull(accLk.get("name"), "").toString(); }
+
+	primaryContactId = "";
+	pcLk = deal.get("Deal_Primary_Contact");
+	if(!isNull(pcLk) && !isNull(pcLk.get("id"))) { primaryContactId = pcLk.get("id").toString(); }
+	if(primaryContactId == "")
+	{
+		cnLk = deal.get("Contact_Name");
+		if(!isNull(cnLk) && !isNull(cnLk.get("id"))) { primaryContactId = cnLk.get("id").toString(); }
+	}
+
+	// Company-Tier Target-ACV benchmark (Account authoritative; mirrors 5b/8z).
+	tierTarget = 0;
+	if(accId != "" && accId.matches("[0-9]+"))
+	{
+		accRecL = zoho.crm.getRecordById("Accounts", accId.toLong());
+		if(!isNull(accRecL))
+		{
+			tierNumL = ifnull(accRecL.get("Company_Tier"), "").toString().trim();
+			if(tierNumL == "1") { tierTarget = 26000; }
+			else if(tierNumL == "2") { tierTarget = 16500; }
+			else if(tierNumL == "3") { tierTarget = 10500; }
+		}
+	}
+
+	// ---- snapshot: read every Quote (full records; getRelatedRecords omits custom fields) ----
+	relQ = zoho.crm.getRelatedRecords("Quotes", "Deals", dId.toLong());
+	fullQuotes = List();
+	openRenewalId = "";        // the single OPEN (non-CL, non-CW) Renewal, if any
+	if(!isNull(relQ) && relQ.size() > 0 && !relQ.toString().startsWith("{\"code\""))
+	{
+		for each rq in relQ
+		{
+			rqId = "";
+			if(!isNull(rq.get("id"))) { rqId = rq.get("id").toString(); }
+			if(rqId == "" || !rqId.matches("[0-9]+")) { continue; }
+			fq = zoho.crm.getRecordById("Quotes", rqId.toLong());
+			if(isNull(fq) || isNull(fq.get("id"))) { continue; }
+			fullQuotes.add(fq);
+			fqStg = ifnull(fq.get("Quote_Stage"), "").toString().trim();
+			fqType = ifnull(fq.get("Quote_Type"), "").toString().trim();
+			if(fqType == "Renewal" && fqStg != "Closed Lost" && fqStg != "Closed Won") { openRenewalId = rqId; }
+		}
+	}
+	if(fullQuotes.size() == 0) { return; }
+
+	// =====================================================================
+	// PASS 1: Closed Won -> create/reuse/bump the Renewal slot.
+	// =====================================================================
+	for each fq in fullQuotes
+	{
+		qid = fq.get("id").toString();
+		stage = ifnull(fq.get("Quote_Stage"), "").toString().trim();
+		qtype = ifnull(fq.get("Quote_Type"), "").toString().trim();
+		if(stage != "Closed Won") { continue; }
+		if(qtype != "Acquisition" && qtype != "Expansion" && qtype != "Renewal") { continue; }
+
+		if(qtype == "Acquisition") { transKey = "AcqCW:" + qid; }
+		else if(qtype == "Expansion") { transKey = "ExpCW:" + qid; }
+		else { transKey = "RenCW:" + qid; }
+
+		// idempotency: re-read the trigger Quote's keys LIVE right before acting.
+		qLive = zoho.crm.getRecordById("Quotes", qid.toLong());
+		if(isNull(qLive)) { continue; }
+		liveKeys = ifnull(qLive.get("Quote_Applied_Lifecycle_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+		applied = false;
+		for each k in liveKeys.toList("\n") { if(k.trim() == transKey) { applied = true; } }
+		if(applied) { continue; }
+
+		// Expansion bump vs (Acq/Ren) ensure-renewal.
+		if(qtype == "Expansion" && openRenewalId != "")
+		{
+			expAcv = ifnull(fq.get("Contract_ACV"), "0").toDecimal();
+			renFull = zoho.crm.getRecordById("Quotes", openRenewalId.toLong());
+			if(!isNull(renFull) && !isNull(renFull.get("id")))
+			{
+				curRenAcv = ifnull(renFull.get("Contract_ACV"), "0").toDecimal();
+				newRenAcv = curRenAcv + expAcv;
+				zoho.crm.updateRecord("Quotes", openRenewalId.toLong(), {"Contract_ACV": newRenAcv}, noTrigger);
+				automation.logAutomationEvent("applyQuoteLifecycle", "Deals", dId, "renewal_bumped", dealProdName, {"from":transKey, "renewal":openRenewalId, "added":expAcv.toString(), "new_acv":newRenAcv.toString()});
+			}
+		}
+		else
+		{
+			// Acq / Ren Closed Won, or Expansion with no open Renewal (D3): ensure a single open Renewal.
+			// RE-SEARCH live for an open Renewal right before creating (closes the concurrent
+			// check-then-act window; reuse if another run already created it).
+			if(openRenewalId == "")
+			{
+				reQ = zoho.crm.getRelatedRecords("Quotes", "Deals", dId.toLong());
+				if(!isNull(reQ) && reQ.size() > 0 && !reQ.toString().startsWith("{\"code\""))
+				{
+					for each rq2 in reQ
+					{
+						rq2Id = "";
+						if(!isNull(rq2.get("id"))) { rq2Id = rq2.get("id").toString(); }
+						if(rq2Id == "" || !rq2Id.matches("[0-9]+")) { continue; }
+						rq2Full = zoho.crm.getRecordById("Quotes", rq2Id.toLong());
+						if(isNull(rq2Full)) { continue; }
+						rq2Stg = ifnull(rq2Full.get("Quote_Stage"), "").toString().trim();
+						rq2Type = ifnull(rq2Full.get("Quote_Type"), "").toString().trim();
+						if(rq2Type == "Renewal" && rq2Stg != "Closed Lost" && rq2Stg != "Closed Won") { openRenewalId = rq2Id; }
+					}
+				}
+			}
+
+			if(openRenewalId == "")
+			{
+				// create the successor Renewal
+				predEnd = ifnull(fq.get("Contract_Date_End"), "").toString().trim();
+				predAcv = ifnull(fq.get("Contract_ACV"), "0").toDecimal();
+				newStart = ""; newEnd = ""; renewalChase = ""; datesOk = false;
+				if(predEnd != "")
+				{
+					predEndDate = predEnd.toDate();
+					newStartDate = predEndDate.addDay(1);
+					newEndDate = newStartDate.addYear(1).addDay(-1);
+					newStart = newStartDate.toString("yyyy-MM-dd");
+					newEnd = newEndDate.toString("yyyy-MM-dd");
+					renewalChase = newEndDate.addDay(-45).toString("yyyy-MM-dd");
+					datesOk = true;
+				}
+
+				renewLine = Map();
+				renewLinePm = Map();
+				if(dealProdId != "" && dealProdId.matches("[0-9]+")) { renewLinePm.put("id", dealProdId); renewLine.put("Product_Name", renewLinePm); }
+				renewLine.put("Quantity", 1);
+				renewLine.put("Quoted_Item_Pricing_Tier", "Base");
+				renewLine.put("List_Price", 0);
+				renewLines = List(); renewLines.add(renewLine);
+
+				originKey = "Origin:" + transKey;
+				renewMap = Map();
+				renewMap.put("Subject", automation.buildQuoteSubject(accName, dealProdName, "Renewal", ifnull(deal.get("Deal_Name"), "").toString()));
+				renewMap.put("Quote_Stage", "Draft");
+				renewMap.put("Quote_Type", "Renewal");
+				renewMap.put("Opportunity_Type", "RTP");
+				if(accId != "") { rAcc = Map(); rAcc.put("id", accId); renewMap.put("Account_Name", rAcc); }
+				rDeal = Map(); rDeal.put("id", dId); renewMap.put("Deal_Name", rDeal);
+				if(dealProdId != "" && dealProdId.matches("[0-9]+")) { rQp = Map(); rQp.put("id", dealProdId); renewMap.put("Quote_Product", rQp); }
+				if(primaryContactId != "") { rC = Map(); rC.put("id", primaryContactId); renewMap.put("Contact_Name", rC); }
+				renewMap.put("Quote_Target_ACV", tierTarget);
+				renewMap.put("Quote_Last_Deal_ID", dId);
+				if(predAcv > 0) { renewMap.put("Contract_ACV", predAcv); } else { renewMap.put("Contract_ACV", 0); }
+				if(datesOk)
+				{
+					renewMap.put("Contract_Date_Start", newStart);
+					renewMap.put("Contract_Date_End", newEnd);
+					renewMap.put("Quote_Contract_Date_Renewal", renewalChase);
+				}
+				if(dealProdId != "") { renewMap.put("Quoted_Items", renewLines); }
+				renewMap.put("Quote_Applied_Lifecycle_Keys", originKey);
+
+				rBody = Map(); rData = List(); rData.add(renewMap); rBody.put("data", rData); rBody.put("trigger", List());
+				rHdr = Map(); rHdr.put("Content-Type", "application/json");
+				rResp = invokeurl
+				[
+					url: "https://www.zohoapis.eu/crm/v6/Quotes"
+					type: POST
+					parameters: rBody.toString()
+					connection: "zoho_crm"
+					headers: rHdr
+				];
+				newRenId = "";
+				if(!isNull(rResp) && !isNull(rResp.get("data")) && rResp.get("data").size() > 0)
+				{
+					r0 = rResp.get("data").get(0);
+					if(ifnull(r0.get("code"), "").toString() == "SUCCESS" && !isNull(r0.get("details")) && !isNull(r0.get("details").get("id"))) { newRenId = r0.get("details").get("id").toString(); }
+				}
+				if(newRenId != "") { openRenewalId = newRenId; }
+				automation.logAutomationEvent("applyQuoteLifecycle", "Deals", dId, "renewal_created", dealProdName, {"from":transKey, "renewal":newRenId, "dates":if(datesOk, newStart + ".." + newEnd, "none"), "acv":predAcv.toString()});
+
+				if(!datesOk)
+				{
+					automation.createManualReview(primaryContactId, dId, "renewal_date_invalid", "Renewal created from " + qtype + " Closed Won Quote " + qid + " but the predecessor has no Contract_Date_End; the successor Renewal has no dates. Set the contract dates.");
+				}
+				if(predAcv <= 0)
+				{
+					automation.createManualReview(primaryContactId, dId, "target_acv_unresolved", "Renewal created from " + qtype + " Closed Won Quote " + qid + " but the predecessor Contract_ACV is blank/0; the successor Renewal ACV is 0. Set the renewal contract value.");
+				}
+			}
+			// else: an open Renewal already exists (reuse); no create.
+		}
+
+		// stamp the transition key on the trigger Quote (append to the LIVE-read keys).
+		newKeys = liveKeys;
+		if(newKeys.trim() != "") { newKeys = newKeys + "\n" + transKey; } else { newKeys = transKey; }
+		zoho.crm.updateRecord("Quotes", qid.toLong(), {"Quote_Applied_Lifecycle_Keys": newKeys}, noTrigger);
+	}
+
+	// =====================================================================
+	// PASS 2: Renewal Closed Lost -> churn (Deal Lost iff no other OPEN Quote).
+	//   Runs AFTER pass 1 so a successor Renewal created this run counts as "open".
+	// =====================================================================
+	for each fq in fullQuotes
+	{
+		qid = fq.get("id").toString();
+		stage = ifnull(fq.get("Quote_Stage"), "").toString().trim();
+		qtype = ifnull(fq.get("Quote_Type"), "").toString().trim();
+		if(stage != "Closed Lost" || qtype != "Renewal") { continue; }
+
+		transKey = "RenCL:" + qid;
+		qLive = zoho.crm.getRecordById("Quotes", qid.toLong());
+		if(isNull(qLive)) { continue; }
+		liveKeys = ifnull(qLive.get("Quote_Applied_Lifecycle_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+		applied = false;
+		for each k in liveKeys.toList("\n") { if(k.trim() == transKey) { applied = true; } }
+		if(applied) { continue; }
+
+		// D4: OPEN = non-Closed-Lost AND non-Closed-Won. Historical Closed Won does NOT keep the
+		// Deal open. Re-read the Deal's Quotes LIVE so a successor created in pass 1 is counted.
+		hasOtherOpen = false;
+		liveQ = zoho.crm.getRelatedRecords("Quotes", "Deals", dId.toLong());
+		if(!isNull(liveQ) && liveQ.size() > 0 && !liveQ.toString().startsWith("{\"code\""))
+		{
+			for each lq in liveQ
+			{
+				lqId = "";
+				if(!isNull(lq.get("id"))) { lqId = lq.get("id").toString(); }
+				if(lqId == "" || !lqId.matches("[0-9]+") || lqId == qid) { continue; }
+				lqFull = zoho.crm.getRecordById("Quotes", lqId.toLong());
+				if(isNull(lqFull)) { continue; }
+				lqStg = ifnull(lqFull.get("Quote_Stage"), "").toString().trim();
+				if(lqStg != "Closed Lost" && lqStg != "Closed Won") { hasOtherOpen = true; }
+			}
+		}
+
+		if(!hasOtherOpen)
+		{
+			dealNow = zoho.crm.getRecordById("Deals", dId.toLong());
+			if(!isNull(dealNow) && ifnull(dealNow.get("Opportunity_State"), "Open").toString() == "Open")
+			{
+				churnUpd = Map();
+				churnUpd.put("Opportunity_State", "Lost");
+				churnUpd.put("Opportunity_Status", "Closed");
+				// Lost_Reasons is the v6 loss field processDeal 8 reads for hasLossReason. It is a
+				// PICKLIST whose approved churn option is EXACTLY "Churned / Did Not Renew" (verified in
+				// live metadata; same value used by routeContactSequence / resolveActivityLoss). Setting
+				// it makes the churn survive processDeal 8's contact-viability recompute (an open Contact
+				// must never re-open a churned Deal). Reason_For_Loss__s is deliberately NOT written: its
+				// picklist has no "Churned / Did Not Renew" option and we never create one.
+				churnUpd.put("Lost_Reasons", "Churned / Did Not Renew");
+				zoho.crm.updateRecord("Deals", dId.toLong(), churnUpd, noTrigger);
+				automation.logAutomationEvent("applyQuoteLifecycle", "Deals", dId, "deal_churned", dealProdName, {"from":transKey});
+			}
+		}
+		else
+		{
+			automation.logAutomationEvent("applyQuoteLifecycle", "Deals", dId, "renewal_lost_deal_open", dealProdName, {"from":transKey});
+		}
+
+		newKeys = liveKeys;
+		if(newKeys.trim() != "") { newKeys = newKeys + "\n" + transKey; } else { newKeys = transKey; }
+		zoho.crm.updateRecord("Quotes", qid.toLong(), {"Quote_Applied_Lifecycle_Keys": newKeys}, noTrigger);
+	}
+}

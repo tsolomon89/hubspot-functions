@@ -1,0 +1,436 @@
+void automation.processContact(string contact_id)
+{
+	// =========================================================================
+	// processContact  (Contact-centric)
+	//
+	// Owns Contact normalization + activation. Does NOT own reconciliation/rollup
+	// (that is processDeal, the sole owner — called once at the end).
+	//
+	// Pipeline:
+	//   1. Read Contact, resolve / repair canonical Account (Account_Key)
+	//   2. Normalize Contact Stage / State defaults, Contact_Role1 from Job_Title,
+	//      and stage-completion dates on the Contact
+	//   3. Product evidence -> Product Deals (Deal = Account x Product only). One
+	//      Product Deal per resolved product via createOrReuseProductDeal; associate
+	//      this Contact (by its Contact_Role1) to each matching Product Deal;
+	//      processDeal(dealId) reconciles each. No generic Account-level Deal.
+	//   4. (reconciliation lives only in processDeal, called per Product Deal above)
+	//   5. Activation: ensure an unactivated open Decision-Maker Contact has one
+	//      Sequence Activation Task, driven by the SINGLE Product Deal. Multi-Deal
+	//      Contact -> Manual Review [multi_product_sequence_ambiguous] (never auto-pick).
+	//
+	// Product resolution outcomes (HARD RULE 4 / 7):
+	//   - 0 products -> MQL-level. No Deal, no [product_unresolved], no activation.
+	//   - each resolved product -> its own Product Deal (Deal_Key=accountKey::productKey).
+	//   - unresolved raw evidence -> Manual Review [product_unresolved].
+	//   - >1 Product Deal for one Contact -> activation deferred to Manual Review.
+	//
+	// All processor writes use suppressTrigger so WFC-Contact / WFC-Deal /
+	// WFC-Account do not cascade.
+	//
+	// REQUIRED ZOHO CRM SETTING:
+	// - Accounts.Account_Key UNIQUE
+	// - Deals.Deal_Key UNIQUE
+	// =========================================================================
+	info "VERSION: v6-contact-centric-product-deal";
+
+	if(contact_id == null || contact_id == "") { return; }
+	cleanId = contact_id.replaceAll("zcrm_", "").trim();
+
+	contactRecord = zoho.crm.getRecordById("Contacts", cleanId.toLong());
+	if(contactRecord.get("id") == null) { return; }
+
+	stageRanks = {"Marketing Consent":1, "Demo Booking":2, "Demo Confirmation":3, "Demo Hosted":4, "Proposal Preparation":5, "Commercial Agreement":6, "Onboarding":7, "Renewal":8};
+	stagesList = {"Marketing Consent", "Demo Booking", "Demo Confirmation", "Demo Hosted", "Proposal Preparation", "Commercial Agreement", "Onboarding", "Renewal"};
+
+	// ---- 1. Read Contact ----
+	accountId = "";
+	accNameMap = contactRecord.get("Account_Name");
+	if(accNameMap != null && accNameMap.get("id") != null)
+	{
+		accountId = accNameMap.get("id").toString();
+	}
+	email = ifnull(contactRecord.get("Email"), "").toString().trim();
+	cName = ifnull(contactRecord.get("Full_Name"), "").toString().trim();
+	if(cName == "")
+	{
+		first = ifnull(contactRecord.get("First_Name"), "").toString().trim();
+		last = ifnull(contactRecord.get("Last_Name"), "").toString().trim();
+		cName = (first + " " + last).trim();
+	}
+
+	accountKey = "";
+
+	// ---- 2. Resolve / repair canonical Account ----
+	if(accountId != "")
+	{
+		accRec = zoho.crm.getRecordById("Accounts", accountId.toLong());
+		accountKey = ifnull(accRec.get("Account_Key"), "").toString();
+		website = ifnull(accRec.get("Website"), "").toString().trim();
+		accountName = ifnull(accRec.get("Account_Name"), "").toString().trim();
+
+		if(accountKey == "")
+		{
+			normalizedDomain = "";
+			if(website != "")
+			{
+				normalizedDomain = website.toLowerCase().replaceAll("https://", "").replaceAll("http://", "").replaceAll("www.", "");
+				if(normalizedDomain.contains("/")) { normalizedDomain = normalizedDomain.toList("/").get(0); }
+			}
+			else if(email != "" && email.contains("@"))
+			{
+				domainPart = email.getSuffix("@").toLowerCase();
+				freeDomains = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"};
+				if(!freeDomains.contains(domainPart)) { normalizedDomain = domainPart; }
+			}
+
+			if(normalizedDomain != "") { accountKey = normalizedDomain; }
+			else if(accountName != "") { accountKey = accountName.replaceAll("[\\(\\)\\:\\,]", "").trim().toLowerCase(); }
+			else { accountKey = "unknown::" + contact_id; }
+			if(accountKey.length() > 200) { accountKey = accountKey.substring(0, 200); }
+
+			zoho.crm.updateRecord("Accounts", accountId.toLong(), {"Account_Key": accountKey}, {"trigger": List()});
+		}
+	}
+	else
+	{
+		normalizedDomain = "";
+		if(email != "" && email.contains("@"))
+		{
+			domainPart = email.getSuffix("@").toLowerCase();
+			freeDomains = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"};
+			if(!freeDomains.contains(domainPart)) { normalizedDomain = domainPart; }
+		}
+
+		if(normalizedDomain != "") { accountKey = normalizedDomain; }
+		else if(cName != "") { accountKey = cName.replaceAll("[\\(\\)\\:\\,]", "").trim().toLowerCase(); }
+		else { accountKey = "unknown::" + contact_id; }
+		if(accountKey.length() > 200) { accountKey = accountKey.substring(0, 200); }
+
+		searchAcc = zoho.crm.searchRecords("Accounts", "(Account_Key:equals:" + accountKey + ")");
+		if(searchAcc != null && searchAcc.size() > 0 && !searchAcc.toString().startsWith("{\"code\""))
+		{
+			accountId = searchAcc.get(0).get("id").toString();
+		}
+		else
+		{
+			createAccMap = Map();
+			createAccMap.put("Account_Key", accountKey);
+			createAccMap.put("Account_Name", if(cName != "", cName, accountKey));
+
+			accCreateRes = zoho.crm.createRecord("Accounts", createAccMap);
+			if(accCreateRes.get("id") != null)
+			{
+				accountId = accCreateRes.get("id").toString();
+			}
+			else if(accCreateRes.get("code") == "DUPLICATE_DATA" && accCreateRes.get("details") != null)
+			{
+				accountId = accCreateRes.get("details").get("id").toString();
+			}
+		}
+	}
+
+	if(accountId == "" || accountId == "null") { return; }
+
+	// accountName must be defined on BOTH account paths (the else-branch that creates a
+	// new Account never set it). Fall back to the Contact name then the Account_Key so
+	// createOrReuseProductDeal always receives a non-empty display name.
+	if(isNull(accountName) || accountName.toString().trim() == "")
+	{
+		accountName = if(cName != "", cName, accountKey);
+	}
+
+	// ---- 3. Normalize Contact defaults and completed dates ----
+	updConInit = Map();
+	if(accNameMap == null || accNameMap.get("id") == null || accNameMap.get("id").toString() != accountId)
+	{
+		updConInit.put("Account_Name", accountId);
+	}
+	contactStage = ifnull(contactRecord.get("Stage"), "").toString().trim();
+	if(contactStage == "")
+	{
+		contactStage = "Marketing Consent";
+		updConInit.put("Stage", contactStage);
+	}
+	if(ifnull(contactRecord.get("State"), "") == "") { updConInit.put("State", "Open"); }
+	if(ifnull(contactRecord.get("Status"), "") == "") { updConInit.put("Status", "New"); }
+
+	// Resolve and populate custom Contact_Role field if empty (inlined — no cross-function call)
+	// Defaults above and the role below ONLY fill blanks — never overwrite an explicit value.
+	cJobTitle = ifnull(contactRecord.get("Job_Title"), "").toString().trim();
+	if(cJobTitle != "" && ifnull(contactRecord.get("Contact_Role1"), "").toString().trim() == "")
+	{
+		resolvedRoleVal = "Decision Maker";
+		titleKey = cJobTitle.toLowerCase();
+		dmTitles = {"automation & ai transformation director","casino director","chief architect","chief commercial officer","chief customer officer","chief data officer","chief executive officer","chief financial officer","chief marketing officer","chief online gaming","chief operating officer","chief product officer","chief revenue officer","chief strategy officer","chief systems officer","chief technology officer","chief trading officer","chief transformation officer","co-founder","commercial director","commerical director","company director","customer experience director","data director","design director","digital director","digital experience director","director of digital product","director of gaming","director of information technology","director of operations","director of product","director of product & operations management","director of product analysis","director of product operations","director of strategy & customer experience","director of technology","director of ux & growth","director product & tech","director product & technology","experimentation lead","founder","fp&a director","gaming director","general manager","global cmo","global cxo","global director of product support & services","global head of product","global product director","global product manager","group cfo","group chief operating officer","group gaming director emea","group head of commercial gaming operations","group product manager","group strategy director","group trading director","growth director","head of acquisition","head of analytics","head of bi","head of brand","head of brand & creative","head of brand marketing","head of casino","head of casino business development","head of commercial","head of crm","head of cro","head of customer experience","head of customer marketing","head of customer value management","head of cx","head of data platform","head of design","head of digital","head of digital product","head of engineering","head of finance","head of gaming","head of gaming commercial","head of gaming operations","head of gaming product","head of group marketing","head of growth","head of igaming","head of infrastructure","head of internal audit","head of international horse racing","head of marketing","head of online","head of online & customer acquisition","head of online casino operations","head of product","head of product design","head of product marketing","head of program product + chief of staff","head of promotions","head of proposition","head of research","head of retention","head of special product development","head of sports","head of sportsbook","head of strategy & performance","head of technology","head of ux","lifecycle director","manager of global product management","managing director","market manager","marketing director","operational product supplier manager","owner","performance marketing director","president","product design director","product director","product management lead","product operations director","promotions director","proposition director","regional director","revenue director","senior global brand manager","senior ia & ai business transformation architect","senior product manager","senior vice president product development","sportsbook director","svp product","ux director","vice managing director","vice president","vice president & general manager","vice president marketing","vice president of commercials","vice president of finance","vice president of global operations & media","vice president of operations","vice president of pricing strategy","vice president of product","vice president of product development","vice president of sales & marketing","vice president product management","vice president risk","vp customer experience","vp growth","vp product"};
+		euTitles = {"advanced analytics lead","ai & automation lead","ai lead","analytics engineer","attribution manager","behavioural analyst","betting operations manager","bi analyst","bi developer","bonus manager","brand & marketing director","brand & product marketing lead","business operations manager","campaign manager","casino manager","casino product manager","commercial analyst","competitor intelligence analyst","country manager","crm director","crm manager","cro director","cro manager","cro product manager","customer excellence department head","customer experience insights manager","customer experience manager","customer insights product owner","customer journey manager","cx manager","data layer specialist","data visualisation analyst","design lead","design manager","design systems engineer","design systems lead","digital analyst","digital product manager","director customer experience & strategy","director of applied intelligence","director of cx & optimisation","director of digital marketing","director of marketing","director of marketing & affiliation","director of marketing communications","director of poker & bingo","director of poker operations","director of sportsbook","director of strategy & business delivery","director of user experience","experience researcher","experimentation manager","frontend developer","gaming product manager","generosity analytics & segmentation senior manager","go-to-market manager","head of experience","head of generosity transformation","head of performance","head of pricing strategy & insights","head of product analytics","head of product growth","head of sales","head of seo","head of trade marketing","head of ux & design","head trader","igaming product manager","information & product analysis specialist manager","interaction designer","lead product designer","lifecycle manager","live casino manager","manager egaming","manager product management","manager ux/ui & da gaming","market analyst","marketing analyst","marketing operations manager","offer manager","optimisation manager","paid search executive","planning & execution director","player engagement manager","pricing analyst","pricing strategy director","product & design operations specialist","product & experience operations manager","product analyst","product analytics","product designer","product experience director","product insights manager","product manager","product manager & qa lead","product marketing manager","product operations manager","product owner","promotions manager","proposition manager","regional head of digital","research manager","retention manager","senior crm marketing specialist","senior cvm manager","senior director sportsbook product","senior generosity transformation manager","senior product designer","senior product development manager","senior project leader","senior research manager","senior ux researcher","sports director","sportsbook operations manager","sportsbook product manager","sportsbook trading manager","tagging specialist","tracking specialist","trading manager","ui designer","user experience research manager","user research lead","user research manager","user researcher","ux analyst","ux architect","ux designer","ux researcher","voice of customer manager","web analyst","web developer","website manager","website product manager"};
+		infTitles = {"account executive","acquisition manager","administrative assistant","art director","associate director of product","bi manager","brand manager","business development director","business development executive","campaign strategy manager","chief assurance officer","chief of staff","client director","client partner","commercial finance manager","commercial manager","commercial planning manager","compliance manager","compliance product manager","consultant","creative director","creative lead","customer operations manager","data analyst","delivery director","deputy director","designer","director","director & general manager","director of corporate compliance","director of corporate security","director of engineering","director of generosity transformation","director of hospitality & general services","director of hotel sales","director of payments","director of people & culture","director of product compliance","director of product design","director of product development","director of product management","director of project management","director of trading strategy","engineering manager","experience director (product, cx, data, research & pmo)","finance business partner","fp&a manager","freelance writer","frontend lead","head cashier","head of affiliates","head of aml","head of aml, fraud & risk","head of b2b","head of backend engineering","head of business development","head of compliance","head of corporate communications","head of creative","head of creative research & insights","head of customer care","head of customer excellence","head of customer service","head of customer support","head of customer support & vip accounts management","head of facility & workplace strategy","head of greyhound racing operations","head of human resources","head of investor relations & capital deployment","head of legal","head of liquidity","head of live casino","head of operations","head of operations & support","head of partnerships","head of people & culture","head of propositions","head of social","head of streaming operations","head of support department","head of trading","head of trading & risk","head of vip","head of vip services","human resources business partner","human resources director","insight manager","legal counsel","lifecycle marketing manager","live ops product manager","live ops product manager, head of content","m&a principal","marketing manager","obg strategy","paid search manager","paid social manager","payment product manager","performance marketing manager","player experience lead","player operations manager","player protection lead","player value manager","poker product manager","principal product manager","product & customer support manager","product & insight director","product lead","product release manager","program manager","regulatory affairs manager","responsible gambling manager","safer gambling analyst","safer gambling lead","sales manager","senior business development manager","senior commercial manager","senior ecommerce consultant","senior graphic designer","senior legal & regulatory counsel","senior manager","senior manager new business & sales executive","senior product owner","senior sales manager","sportsbook property director kentucky","strategy consultant","supplier manager","team lead hr business partner","technical director","trading graduate","uk news editor","ux/ui designer","vice president of human resources","vip manager"};
+		if(euTitles.contains(titleKey)) { resolvedRoleVal = "End User"; }
+		else if(infTitles.contains(titleKey)) { resolvedRoleVal = "Influencer"; }
+		info "processContact: resolved Contact_Role title='" + cJobTitle + "' → role='" + resolvedRoleVal + "'";
+		updConInit.put("Contact_Role1", resolvedRoleVal);
+	}
+
+	// Stage completion date dynamic stamping on Contact itself
+	contactStageFields = Map();
+	contactStageFields.put("Marketing Consent", "Contact_Completed_Marketing_Qualification_At");
+	contactStageFields.put("Demo Booking", "Contact_Completed_Demo_Booking_At");
+	contactStageFields.put("Demo Confirmation", "Contact_Completed_Demo_Confirmation_At");
+	contactStageFields.put("Demo Hosted", "Contact_Completed_Demo_Hosted_At");
+	contactStageFields.put("Proposal Preparation", "Contact_Completed_Proposal_Preparation_At");
+	contactStageFields.put("Commercial Agreement", "Contact_Completed_Commercial_Agreement_At");
+	contactStageFields.put("Onboarding", "Contact_Completed_Onboarding_At");
+	contactStageFields.put("Renewal", "Contact_Completed_Renewal_At");
+
+	contactRank = ifnull(stageRanks.get(contactStage), 1).toLong();
+	for each stageItem in stagesList
+	{
+		stageItemRank = ifnull(stageRanks.get(stageItem), 0).toLong();
+		if(stageItemRank <= contactRank)
+		{
+			fieldApi = contactStageFields.get(stageItem);
+			if(fieldApi != null && contactRecord.get(fieldApi) == null)
+			{
+				// Store local CRM time without an explicit timezone. XXX stored one hour
+				// behind in BST; literal Z stored one hour ahead; raw DateTime was ignored.
+				updConInit.put(fieldApi, zoho.currenttime.toString("yyyy-MM-dd'T'HH:mm:ss"));
+			}
+		}
+	}
+
+	if(updConInit.size() > 0)
+	{
+		// Suppress Contact workflow to prevent processContact recursing on its own write.
+		suppressTrigger = Map();
+		suppressTrigger.put("trigger", List());
+		updConInitResp = zoho.crm.updateRecord("Contacts", cleanId.toLong(), updConInit, suppressTrigger);
+		info "Contact update resp (incl. Contact_Role if blank, trigger suppressed): " + updConInitResp;
+		contactRecord = zoho.crm.getRecordById("Contacts", cleanId.toLong());
+	}
+
+	// ---- 4. Product evidence -> Product Deals (Deal = Account x Product only) ----
+	// The normalize adapter is the ONLY place that knows which fields carry product /
+	// contract evidence. products[] = resolved canonical products; unresolved[] = raw
+	// evidence that resolveDealProduct could not map; conflicts[] = type conflicts.
+	// HARD RULE 1/2: never a generic Account Deal; every Deal_Key = accountKey::productKey
+	// via createOrReuseProductDeal.
+	tuples = automation.normalizeToProductQuoteTuples("Contacts", cleanId).toMap();
+	products = ifnull(tuples.get("products"), List());
+	unresolvedList = ifnull(tuples.get("unresolved"), List());
+
+	// Resolve the Contact_Role value once (name string), for the Contact_Role junction.
+	// Prefer the value just written / already on the Contact; default to Decision Maker.
+	contactRoleVal = ifnull(contactRecord.get("Contact_Role1"), "").toString().trim();
+	if(contactRoleVal == "") { contactRoleVal = "Decision Maker"; }
+
+	// Unresolved raw evidence -> Manual Review [product_unresolved] (never auto-pick).
+	if(!isNull(unresolvedList) && unresolvedList.size() > 0)
+	{
+		for each ur in unresolvedList
+		{
+			urRaw = ifnull(ur.get("raw"), "").toString();
+			urReason = ifnull(ur.get("reason"), "").toString();
+			automation.createManualReview(cleanId, "", "product_unresolved", "Contact product evidence '" + urRaw + "' did not resolve to a canonical Product (" + urReason + ").");
+		}
+	}
+
+	// MQL-level: no resolvable product evidence -> no Deal, no [product_unresolved],
+	// no activation (activation needs a Deal What_Id). Log and return.
+	if(isNull(products) || products.size() == 0)
+	{
+		automation.logAutomationEvent("processContact", "Contacts", cleanId, "product_resolution", "mql_no_product_deal", {"account": accountId, "unresolved": ifnull(unresolvedList, List()).size().toString()});
+		return;
+	}
+
+	// One Product Deal per resolved product; associate THIS Contact to each matching
+	// Deal (HARD RULE 5: evidence matches the Deal product, established by normalize).
+	productDealIds = List();
+	b2bDriverDealIds = List();   // subset eligible to DRIVE the B2B sequence (pipeline == B2B)
+	for each prod in products
+	{
+		pProductId = ifnull(prod.get("product_id"), "").toString();
+		pProductName = ifnull(prod.get("product_name"), "").toString();
+		pProductKey = ifnull(prod.get("product_key"), "").toString();
+
+		cordRes = automation.createOrReuseProductDeal(accountId, accountKey, pProductId, pProductName, pProductKey, accountName).toMap();
+		if(ifnull(cordRes.get("valid"), "false").toString() != "true")
+		{
+			automation.createManualReview(cleanId, "", "product_unresolved", "Could not create/reuse Product Deal for '" + pProductName + "' (" + ifnull(cordRes.get("reason"), "").toString() + ").");
+			continue;
+		}
+		pDealId = ifnull(cordRes.get("deal_id"), "").toString();
+		if(pDealId == "" || !pDealId.matches("[0-9]+")) { continue; }
+
+		// Associate this Contact to THIS Product Deal only, carrying its resolved role.
+		roleMap = Map();
+		roleMap.put("Contact_Role", contactRoleVal);
+		zoho.crm.updateRelatedRecord("Contact_Roles", cleanId.toLong(), "Deals", pDealId.toLong(), roleMap);
+
+		productDealIds.add(pDealId);
+		// Only B2B-pipeline Deals may DRIVE the Contact's B2B sequence. Partnership (and any
+		// unresolved) Deals are still created + linked + reconciled (held out inside processDeal),
+		// but are EXCLUDED from the sequence-driver count so they never make the Contact ambiguous
+		// or block B2B activation. Product Interest is authoritative (pipelineForProductKey).
+		if(automation.pipelineForProductKey(pProductKey) == "B2B") { b2bDriverDealIds.add(pDealId); }
+
+		// processDeal = sole owner of Contacts, Roles, Products, Primary Contact,
+		// Opportunity_* rollup, Account rollup. Reconcile each Product Deal (a Partnership
+		// Deal is held out by processDeal's pipeline gate).
+		automation.processDeal(pDealId, "{}");
+	}
+
+	automation.logAutomationEvent("processContact", "Contacts", cleanId, "product_resolution", "product_deals", {"count": productDealIds.size().toString(), "account": accountId});
+
+	if(productDealIds.size() == 0) { return; }
+
+	// ---- 5. Activation (Decision Maker only), driven by the SINGLE Product Deal. ----
+	// Re-read the Contact for authoritative State / Sequence_State / role (processDeal
+	// may have touched Contact_Role1 / Primary Contact).
+	contactRecord = zoho.crm.getRecordById("Contacts", cleanId.toLong());
+	contactSeqState = ifnull(contactRecord.get("Sequence_State"), "").toString();
+	if(contactSeqState == "")
+	{
+		// blank lifecycle -> explicitly Not Activated (so the gate below is unambiguous)
+		zoho.crm.updateRecord("Contacts", cleanId.toLong(), {"Sequence_State": "Not Activated"}, {"trigger": List()});
+		contactSeqState = "Not Activated";
+	}
+
+	// Activation gate: Decision Maker only (HARD RULE 6), Open + Not Activated only.
+	// A Stopped / Running / Complete Contact must never auto-(re)activate here.
+	contactState = ifnull(contactRecord.get("State"), "Open").toString();
+	contactRoleNow = ifnull(contactRecord.get("Contact_Role1"), "").toString().trim();
+	if(contactRoleNow == "") { contactRoleNow = contactRoleVal; }
+	if(contactRoleNow == "Decision Maker" && contactState == "Open" && contactSeqState == "Not Activated")
+	{
+		// Only B2B-pipeline Deals drive the sequence. Count the B2B DRIVERS, not all Product
+		// Deals, so a Contact with a B2B product + Partnership activates normally on the B2B Deal.
+		if(b2bDriverDealIds.size() == 0)
+		{
+			// Partnership-only (or unresolved-only) Contact: created + linked, but no B2B sequence
+			// to start. Held for the Partnership flow (out of scope); never a B2B Activation Task.
+			automation.logAutomationEvent("processContact", "Contacts", cleanId, "activation", "no_b2b_sequence_driver", {"product_deals":productDealIds.size().toString()});
+			return;
+		}
+		// HARD RULE 7: ONE active automated B2B sequence per Contact. Multiple B2B Deals are
+		// ambiguous -> Manual Review; never auto-pick. Partnership Deals never contribute here.
+		if(b2bDriverDealIds.size() > 1)
+		{
+			automation.createManualReview(cleanId, b2bDriverDealIds.get(0), "multi_product_sequence_ambiguous", "Contact maps to multiple B2B Product Deals but only one Contact sequence can run; a human must choose which Product Deal drives the sequence.");
+			return;
+		}
+
+		// Exactly one B2B Product Deal -> it drives the sequence.
+		dealId = b2bDriverDealIds.get(0);
+		// dedup: an open Sequence Activation Task for this Contact + Stage already exists?
+		activationExists = false;
+		existingTasks = zoho.crm.getRelatedRecords("Tasks", "Deals", dealId.toLong());
+		if(isNull(existingTasks) || existingTasks.size() == 0 || existingTasks.toString().startsWith("{\"code\""))
+		{
+			existingTasks = zoho.crm.searchRecords("Tasks", "(What_Id:equals:" + dealId + ")");
+		}
+		if(!isNull(existingTasks) && existingTasks.size() > 0 && !existingTasks.toString().startsWith("{\"code\""))
+		{
+			for each tk in existingTasks
+			{
+				tWho = "";
+				whoL = tk.get("Who_Id");
+				if(!isNull(whoL) && !isNull(whoL.get("id"))) { tWho = whoL.get("id").toString(); }
+				if(tWho == cleanId && ifnull(tk.get("Task_Type"), "").toString() == "Sequence Activation" && ifnull(tk.get("Task_Sequence_Stage"), "").toString() == contactStage && (ifnull(tk.get("Status"), "").toString() == "Not Started" || ifnull(tk.get("Status"), "").toString() == "In Progress"))
+				{
+					activationExists = true;
+					break;
+				}
+			}
+		}
+
+		if(!activationExists)
+		{
+			// The Activation Task is the human decision point. Task_Sequence_Type is the
+			// only command field; Contact.Sequence_Type stays blank until the owner chooses.
+			// Lead_Source is context only and must not preselect or infer the route.
+			ownerId = "";
+			ownerLookup = contactRecord.get("Owner");
+			if(!isNull(ownerLookup) && !isNull(ownerLookup.get("id"))) { ownerId = ownerLookup.get("id").toString(); }
+			leadSrc = ifnull(contactRecord.get("Lead_Source"), "").toString();
+			// Route is chosen by the rep on the Activation Task via Task_Sequence_Type. The Task is
+			// ALWAYS created with Task_Sequence_Type blank so the rep explicitly selects Email/Call/Manual;
+			// the Contact's residual Sequence_Type must never auto-activate a route.
+			// Real newline for rep-facing Description text (this org's Deluge stores a literal
+			// backslash-n instead of a line break). hextoText("0A") = line feed (a raw newline in a string literal is not valid Deluge here).
+			nl = hextoText("0A");
+			actDesc = "Purpose" + nl + "Complete this task to activate the Contact's sequence." + nl + nl + "Contact: " + cName + nl + "Stage: " + contactStage + nl + "Lead Source (context only): " + leadSrc + nl + nl + "What you need to update" + nl + "1. Select the appropriate Task Sequence Type:" + nl + "   - Email = automation sends the opening email, then books the first Call" + nl + "   - Call = automation books the first Call" + nl + "   - Manual = you run the sequence yourself (automated emails/calls stay off)" + nl + "2. To choose a different opening email (Email route), add a Note to this Task containing only 'Warm' or 'Cold'." + nl + "3. Leave the Task without a Warm or Cold Note to use the standard opening email." + nl + "4. Set Task State = Won to start." + nl + nl + "Do not edit" + nl + "Description, Task Pipeline, Task Stage, sequence-management fields, or automation status fields." + nl + nl + "Important" + nl + "- The most recently added Note controls the opening-email variant." + nl + "- That Note must contain only 'Warm' or 'Cold' - any other content uses the standard opening email." + nl + "- Do not enter both 'Warm' and 'Cold' (that stops activation and creates a Manual Review)." + nl + "- Only the first email changes; the rest of the sequence continues normally.";
+			actTask = Map();
+			actTask.put("Subject", "Activate sequence: " + cName + " — " + contactStage);
+			actTask.put("Status", "Not Started");
+			actTask.put("What_Id", dealId);
+			actTask.put("$se_module", "Deals");
+			actTask.put("Who_Id", cleanId);
+			actTask.put("Task_Sequence_Managed", true);
+			actTask.put("Task_Type", "Sequence Activation");
+			actTask.put("Task_Sequence_Stage", contactStage);
+			actTask.put("Blocks_Sequence", "Yes");
+			actTask.put("Description", actDesc);
+			// F4 FIX (2026-06-24): the activation Task must carry the full inherited commercial
+			// context (parity with email-audit / aux Tasks), not only the sequence stage and not
+			// only in Subject/Description text. Task_Stage = commercial stage (= contactStage, kept
+			// in sync with Deal.Opportunity_Stage); Task_Opportunity = Deal.Stage (opportunity type);
+			// Task_Pipeline via the shared resolver (Deluge getRecordById omits Pipeline).
+			actTask.put("Task_Stage", contactStage);
+			actTask.put("Task_State", "Open");
+			actTask.put("Task_Status", "New");
+			actDealRec = zoho.crm.getRecordById("Deals", dealId.toLong());
+			if(!isNull(actDealRec) && !isNull(actDealRec.get("id")))
+			{
+				actOppType = ifnull(actDealRec.get("Stage"), "").toString();
+				if(actOppType != "") { actTask.put("Task_Opportunity", actOppType); }
+			}
+			actPipeline = automation.resolveDealPipeline(dealId.toString());
+			if(actPipeline != "") { actTask.put("Task_Pipeline", actPipeline); }
+			if(ownerId != "") { actTask.put("Owner", ownerId); }
+			actResp = zoho.crm.createRecord("Tasks", actTask);
+			info "processContact: created Sequence Activation Task resp=" + actResp;
+		}
+
+		// ---- 6b. Self-heal: collapse duplicate open Sequence Activation Tasks created by a
+		//          CONCURRENT processContact run. On lead-convert, processLead's inline
+		//          processContact() call and the WF001b2 Contacts-create trigger can both pass the
+		//          dedup check above before either commits createRecord -> two identical tasks.
+		//          Deterministic: keep the lowest-id open task; Defer the rest. A Deferred task is
+		//          skipped by handleTaskCompletion (Status=Deferred -> return), so a deferred
+		//          duplicate never activates; the write is suppressed so WF008 does not re-fire.
+		dupeOpen = List();
+		dupeKeep = 999999999999999999;
+		sweepTasks = zoho.crm.getRelatedRecords("Tasks", "Deals", dealId.toLong());
+		if(isNull(sweepTasks) || sweepTasks.size() == 0 || sweepTasks.toString().startsWith("{\"code\""))
+		{
+			sweepTasks = zoho.crm.searchRecords("Tasks", "(What_Id:equals:" + dealId + ")");
+		}
+		if(!isNull(sweepTasks) && sweepTasks.size() > 0 && !sweepTasks.toString().startsWith("{\"code\""))
+		{
+			for each stk in sweepTasks
+			{
+				stWho = "";
+				stWhoL = stk.get("Who_Id");
+				if(!isNull(stWhoL) && !isNull(stWhoL.get("id"))) { stWho = stWhoL.get("id").toString(); }
+				stStatus = ifnull(stk.get("Status"), "").toString();
+				if(stWho == cleanId && ifnull(stk.get("Task_Type"), "").toString() == "Sequence Activation" && ifnull(stk.get("Task_Sequence_Stage"), "").toString() == contactStage && (stStatus == "Not Started" || stStatus == "In Progress"))
+				{
+					sIdL = stk.get("id").toString().toLong();
+					if(sIdL < dupeKeep) { dupeKeep = sIdL; }
+					dupeOpen.add(stk.get("id").toString());
+				}
+			}
+		}
+		if(dupeOpen.size() > 1)
+		{
+			for each dOpen in dupeOpen
+			{
+				if(dOpen.toLong() != dupeKeep)
+				{
+					zoho.crm.updateRecord("Tasks", dOpen.toLong(), {"Status":"Deferred", "Blocks_Sequence":"No"}, {"trigger": List()});
+					automation.logAutomationEvent("processContact", "Tasks", dOpen, "activation_dedupe", "deferred_duplicate", {"contact":cleanId, "kept":dupeKeep.toString()});
+				}
+			}
+		}
+	}
+}

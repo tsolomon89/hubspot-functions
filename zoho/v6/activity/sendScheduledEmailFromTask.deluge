@@ -1,0 +1,71 @@
+void automation.sendScheduledEmailFromTask(string taskIdStr)
+{
+	// =========================================================================
+	// sendScheduledEmailFromTask  (WFC-SchedEmail — date-based on Task.Due_Date)
+	//
+	// Fires when a scheduled-send wake-up Task's Due_Date is reached. Validates the
+	// Task, parses the "ScheduledSend|stage=..|step=..|kind=.." payload, and delegates
+	// ENTIRELY to sendSequencedEmail(..., taskId) — which owns template resolution,
+	// idempotency, the send, and turning THIS Task into the Completed audit record.
+	// On a successful post-call follow-up send, marks the Contact sequence Complete.
+	// =========================================================================
+
+	info "VERSION: v6-contact-centric";
+
+	taskId = 0;
+	if(!isNull(taskIdStr) && taskIdStr != "") { taskId = taskIdStr.toLong(); }
+	if(taskId == 0) { return; }
+
+	task = zoho.crm.getRecordById("Tasks", taskId);
+	if(isNull(task) || isNull(task.get("id"))) { return; }
+
+	desc = ifnull(task.get("Description"), "").toString();
+	status = ifnull(task.get("Status"), "").toString();
+	taskStatus = ifnull(task.get("Task_Status"), "").toString();
+	if(!desc.contains("ScheduledSend|"))
+	{
+		automation.logAutomationEvent("sendScheduledEmailFromTask", "Tasks", taskId.toString(), "guard", "not_scheduled_send", null);
+		return;
+	}
+	// Tasks has no Stale field; refuse to send any superseded/terminal scheduled-send Task. A
+	// superseded wake-up is marked native Status Cancelled/Deferred AND/OR custom Task_Status Closed.
+	if(status == "Completed" || status == "Cancelled" || status == "Deferred" || taskStatus == "Closed")
+	{
+		automation.logAutomationEvent("sendScheduledEmailFromTask", "Tasks", taskId.toString(), "guard", "not_actionable_status", {"status":status, "task_status":taskStatus});
+		return;
+	}
+
+	contactId = "";
+	whoLookup = task.get("Who_Id");
+	if(!isNull(whoLookup) && !isNull(whoLookup.get("id"))) { contactId = whoLookup.get("id").toString(); }
+	dealId = "";
+	whatLookup = task.get("What_Id");
+	if(!isNull(whatLookup) && !isNull(whatLookup.get("id"))) { dealId = whatLookup.get("id").toString(); }
+	if(contactId == "" || dealId == "")
+	{
+		automation.logAutomationEvent("sendScheduledEmailFromTask", "Tasks", taskId.toString(), "guard", "missing_links", {"contact":contactId, "deal":dealId});
+		return;
+	}
+
+	// parse payload "ScheduledSend|stage=<>|step=<>|kind=<>"
+	stage = "";
+	step = 0;
+	kind = "";
+	parts = desc.getPrefix("\n").toList("|");
+	for each p in parts
+	{
+		if(p.startsWith("stage=")) { stage = p.removeFirstOccurence("stage="); }
+		else if(p.startsWith("step=")) { step = p.removeFirstOccurence("step=").toLong(); }
+		else if(p.startsWith("kind=")) { kind = p.removeFirstOccurence("kind="); }
+	}
+
+	// delegate everything (template / idempotency / send / audit-Task update) to sendSequencedEmail
+	msgId = automation.sendSequencedEmail(contactId, dealId, stage, step, kind, taskId.toString(), "");
+
+	if(msgId != "" && kind == "postcall")
+	{
+		// post-call follow-up terminal: the Contact sequence is now Complete.
+		zoho.crm.updateRecord("Contacts", contactId.toLong(), {"Sequence_State": "Complete"}, {"trigger": List()});
+	}
+	automation.logAutomationEvent("sendScheduledEmailFromTask", "Tasks", taskId.toString(), "delegated", if(msgId != "", "sent", "not_sent"), {"contact":contactId, "deal":dealId, "kind":kind});
+}

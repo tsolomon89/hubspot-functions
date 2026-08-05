@@ -1,0 +1,29 @@
+string automation.computeProductKey(string rawName)
+{
+	// =========================================================================
+	// _util_computeProductKey   (VERSION: v6-product-deal)
+	//
+	// Pure normaliser: collapse a product display name into a stable, lowercase,
+	// underscore-delimited key for deterministic Deal keying / grouping.
+	//   "Jurnii UX"      -> "jurnii_ux"
+	//   "Jurnii 360"     -> "jurnii_360"
+	//   "Jurnii Cortex"  -> "jurnii_cortex"
+	//   "Partnership"    -> "partnership"
+	//
+	// No CRM reads, no writes. Callers that must map a plan-variant name to its
+	// canonical family should go through resolveDealProduct FIRST, then key the
+	// canonical name it returns -- never key a raw variant name here (e.g.
+	// "Jurnii UX - Fixed" -> "jurnii_ux_fixed" would NOT equal "jurnii_ux").
+	//
+	// (No `info` VERSION banner on purpose: this is a hot pure helper called in
+	//  loops and a banner would spam the function log -- same rationale as
+	//  _util_logAutomationEvent.)
+	// =========================================================================
+	nm = ifnull(rawName, "").toString().trim();
+	if(nm == "") { return ""; }
+	key = nm.toLowerCase();
+	key = key.replaceAll("[^a-z0-9]+", "_");   // any run of non-alphanumerics -> single _
+	key = key.replaceAll("^_+", "");           // strip leading _
+	key = key.replaceAll("_+$", "");           // strip trailing _
+	return key;
+}

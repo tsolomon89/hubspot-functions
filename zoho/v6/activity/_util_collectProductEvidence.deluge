@@ -1,0 +1,171 @@
+string automation.collectProductEvidence(string moduleName, string recordId)
+{
+	// =========================================================================
+	// _util_collectProductEvidence   (VERSION: v6-product-deal)
+	//
+	// THE single source of truth for "which fields carry product evidence" on a
+	// given record. Swap the field wiring here later without touching the engine
+	// (normalizeToProductQuoteTuples) or any consumer.
+	//
+	// Returns raw, distinct (case-insensitive) product name / key strings seen on
+	// the record. This is product-INTEREST evidence only; contract TERMS are
+	// collected separately by the A/E/R group reader inlined in
+	// normalizeToProductQuoteTuples (formerly the _util_collectLegacyQuoteEvidence helper).
+	//
+	// Per module:
+	//   Leads:    Product_Interest (multiselect; jsonarray or bracketed string) +
+	//             Acquisition_/Expansion_/Renewal_ Quote_Plan_Products (single picklist)
+	//   Contacts: Products_Linked (junction jsonarray of {name}) +
+	//             Product_Interest_Staging (comma-string mirror)
+	//   Deals:    Deal_Product (lookup .name) + Deal_Product_Key +
+	//             child Quotes' Quote_Product (lookup .name; fetch Quote if omitted)
+	//   Accounts: union of each related Contact's Products_Linked +
+	//             Product_Interest_Staging, plus each related Deal's Deal_Product_Key
+	//
+	// Cleaning: drop "", "-None-", "null"; fix "Jurnii Cortext" -> "Jurnii Cortex".
+	//
+	// Returns a JSON string (parse with .toMap()):  { "raw": [ <string>, ... ] }
+	// =========================================================================
+	r = Map();
+	rawOut = List();
+	r.put("raw", rawOut);
+
+	mod = ifnull(moduleName, "").toString().trim();
+	rid = ifnull(recordId, "").toString().replaceAll("zcrm_", "").trim();
+	if(mod == "" || rid == "" || !rid.matches("[0-9]+")) { return r.toString(); }
+
+	// candidate name tokens are gathered raw, then cleaned + de-duped at the end
+	candidates = List();
+
+	if(mod == "Leads")
+	{
+		rec = zoho.crm.getRecordById("Leads", rid.toLong());
+		if(!isNull(rec) && !isNull(rec.get("id")))
+		{
+			// Product_Interest multiselect: may be List "[a, b]" or bracketed String.
+			piRaw = rec.get("Product_Interest");
+			if(!isNull(piRaw))
+			{
+				piCleaned = piRaw.toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll(";", ",").replaceAll("\"", "").replaceAll("'", "");
+				for each tok in piCleaned.toList(",") { candidates.add(tok.trim()); }
+			}
+			// A/E/R group Plan Products (single picklist each) -> product bucket, so a
+			// Lead with only a Renewal group (no Product_Interest) still yields a product.
+			leadGroups = {"Acquisition", "Expansion", "Renewal"};
+			for each grp in leadGroups
+			{
+				gpRaw = rec.get(grp + "_Quote_Plan_Products");
+				if(!isNull(gpRaw))
+				{
+					gpTok = gpRaw.toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll("\"", "").replaceAll("'", "").trim();
+					if(gpTok != "") { candidates.add(gpTok); }
+				}
+			}
+		}
+	}
+	else if(mod == "Contacts")
+	{
+		rec = zoho.crm.getRecordById("Contacts", rid.toLong());
+		if(!isNull(rec) && !isNull(rec.get("id")))
+		{
+			plRaw = rec.get("Products_Linked");
+			if(!isNull(plRaw))
+			{
+				plStr = plRaw.toString();
+				// native List-of-maps form "[{name=Jurnii UX, id=..}]" -> iterate the VALUE
+				// directly (its toString is NOT valid JSON, so never re-parse the string).
+				// Mirrors the proven pattern in processDeal Section 1.
+				if(plStr.startsWith("[") && plStr.contains("{"))
+				{
+					for each item in plRaw
+					{
+						if(!isNull(item) && !isNull(item.get("name"))) { candidates.add(item.get("name").toString().trim()); }
+					}
+				}
+				else if(plStr != "" && plStr != "null")
+				{
+					plCleaned = plStr.removeFirstOccurence("[").removeLastOccurence("]").replaceAll(";", ",").replaceAll("\"", "").replaceAll("'", "");
+					for each tok in plCleaned.toList(",") { candidates.add(tok.trim()); }
+				}
+			}
+			pisRaw = rec.get("Product_Interest_Staging");
+			if(!isNull(pisRaw))
+			{
+				pisCleaned = pisRaw.toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll(";", ",").replaceAll("\"", "").replaceAll("'", "");
+				for each tok in pisCleaned.toList(",") { candidates.add(tok.trim()); }
+			}
+		}
+	}
+	else if(mod == "Deals")
+	{
+		rec = zoho.crm.getRecordById("Deals", rid.toLong());
+		if(!isNull(rec) && !isNull(rec.get("id")))
+		{
+			dpLookup = rec.get("Deal_Product");
+			if(!isNull(dpLookup) && !isNull(dpLookup.get("name"))) { candidates.add(dpLookup.get("name").toString().trim()); }
+			dpk = ifnull(rec.get("Deal_Product_Key"), "").toString().trim();
+			if(dpk != "") { candidates.add(dpk); }
+
+			quotes = zoho.crm.getRelatedRecords("Quotes", "Deals", rid.toLong());
+			if(!isNull(quotes) && quotes.size() > 0 && !quotes.toString().startsWith("{\"code\""))
+			{
+				for each q in quotes
+				{
+					qpLookup = q.get("Quote_Product");
+					if(isNull(qpLookup) || isNull(qpLookup.get("name")))
+					{
+						qid = ifnull(q.get("id"), "").toString();
+						if(qid != "" && qid.matches("[0-9]+"))
+						{
+							qFull = zoho.crm.getRecordById("Quotes", qid.toLong());
+							if(!isNull(qFull)) { qpLookup = qFull.get("Quote_Product"); }
+						}
+					}
+					if(!isNull(qpLookup) && !isNull(qpLookup.get("name"))) { candidates.add(qpLookup.get("name").toString().trim()); }
+				}
+			}
+		}
+	}
+	else if(mod == "Accounts")
+	{
+		// Reuse the Contacts branch per related contact (DRY + reliable field reads via
+		// getRecordById inside the recursive call), then add existing Deal product keys.
+		contacts = zoho.crm.getRelatedRecords("Contacts", "Accounts", rid.toLong());
+		if(!isNull(contacts) && contacts.size() > 0 && !contacts.toString().startsWith("{\"code\""))
+		{
+			for each c in contacts
+			{
+				cid = ifnull(c.get("id"), "").toString();
+				if(cid != "" && cid.matches("[0-9]+"))
+				{
+					cEv = automation.collectProductEvidence("Contacts", cid).toMap();
+					cEvRaw = cEv.get("raw");
+					if(!isNull(cEvRaw)) { for each nm in cEvRaw { candidates.add(nm.toString()); } }
+				}
+			}
+		}
+		deals = zoho.crm.getRelatedRecords("Deals", "Accounts", rid.toLong());
+		if(!isNull(deals) && deals.size() > 0 && !deals.toString().startsWith("{\"code\""))
+		{
+			for each d in deals
+			{
+				dpk = ifnull(d.get("Deal_Product_Key"), "").toString().trim();
+				if(dpk != "") { candidates.add(dpk); }
+			}
+		}
+	}
+
+	// clean + distinct (case-insensitive). seenKeys holds lowercased accepted tokens.
+	seenKeys = List();
+	for each cand in candidates
+	{
+		nm = ifnull(cand, "").toString().trim();
+		if(nm == "" || nm == "-None-" || nm == "null") { continue; }
+		if(nm == "Jurnii Cortext") { nm = "Jurnii Cortex"; }
+		lk = nm.toLowerCase();
+		if(!seenKeys.contains(lk)) { seenKeys.add(lk); rawOut.add(nm); }
+	}
+
+	r.put("raw", rawOut);
+	return r.toString();
+}

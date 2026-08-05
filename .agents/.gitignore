@@ -1,0 +1,4 @@
+# Ignore large local context folders
+context/activity-workflows/emails/
+context/brand-guide/
+context/zoho-backups/

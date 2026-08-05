@@ -1,0 +1,80 @@
+void automation.sendDemoReminder(string dealIdStr)
+{
+	// =========================================================================
+	// sendDemoReminder  (WF010c — Deals, date-based on Deal.Demo_Reminder_Send_At)
+	//
+	// Date-based workflows cannot be bound to the Meetings/Tasks modules, so WF010c
+	// stays on Deals and fires on the Deal's Demo_Reminder_Send_At. The Meeting/Event
+	// remains the UPSTREAM source of truth: handleMeetingEvent writes the demo summary
+	// mirrors (Demo_Start_DateTime, Demo_Reminder_Send_At) onto the Deal from the Event,
+	// and clears Demo_Reminder_Send_At when the meeting is Cancelled.
+	// This function gates on those mirrors + the Primary Contact's Stage — no
+	// Demo_Outcome / Demo_Status / Demo_Meeting_ID.
+	//
+	// Binding: Module = Deals, date field = Demo_Reminder_Send_At,
+	//   function = sendDemoReminder, arg dealIdStr <- ${Deals.id}.  (unchanged)
+	//
+	// Guards:
+	//   Automation_Suppressed != true
+	//   Demo_Start_DateTime still in the future (an upcoming demo exists)
+	//   Deal Primary Contact exists, State = Open, and Stage not past Demo Confirmation
+	//     (a contact past Demo Confirmation means the demo already happened)
+	// =========================================================================
+
+	info "VERSION: v6-contact-centric";
+
+	dealId = 0;
+	if(!isNull(dealIdStr) && dealIdStr != "") { dealId = dealIdStr.toLong(); }
+	if(dealId == 0) { return; }
+
+	deal = zoho.crm.getRecordById("Deals", dealId);
+	if(isNull(deal) || isNull(deal.get("id"))) { return; }
+
+	if(ifnull(deal.get("Automation_Suppressed"), false).toString() == "true")
+	{
+		automation.logAutomationEvent("sendDemoReminder", "Deals", dealId.toString(), "guard", "skip_suppressed", null);
+		return;
+	}
+
+	// Upcoming demo? (mirror of Meeting Start_DateTime)
+	demoStart = deal.get("Demo_Start_DateTime");
+	if(isNull(demoStart))
+	{
+		automation.logAutomationEvent("sendDemoReminder", "Deals", dealId.toString(), "guard", "skip_no_demo_start", null);
+		return;
+	}
+	startDt = demoStart.toString().toDateTime("yyyy-MM-dd'T'HH:mm:ssXXX");
+	if(startDt < zoho.currenttime)
+	{
+		automation.logAutomationEvent("sendDemoReminder", "Deals", dealId.toString(), "guard", "skip_start_passed", {"start":demoStart.toString()});
+		return;
+	}
+
+	primaryId = "";
+	cnLookup = deal.get("Contact_Name");
+	if(!isNull(cnLookup) && !isNull(cnLookup.get("id"))) { primaryId = cnLookup.get("id").toString(); }
+	if(primaryId == "")
+	{
+		automation.logAutomationEvent("sendDemoReminder", "Deals", dealId.toString(), "guard", "no_primary_contact", null);
+		return;
+	}
+	primary = zoho.crm.getRecordById("Contacts", primaryId.toLong());
+	if(isNull(primary) || ifnull(primary.get("State"), "").toString() != "Open")
+	{
+		automation.logAutomationEvent("sendDemoReminder", "Deals", dealId.toString(), "guard", "primary_not_open", {"contact":primaryId});
+		return;
+	}
+
+	// Demo already concluded? A Contact past Demo Confirmation means the demo happened (replaces the
+	// retired Deal.Demo_Outcome gate; the Event is the source of truth, mirrored onto the Contact Stage).
+	stageRanks = {"Marketing Consent":1, "Demo Booking":2, "Demo Confirmation":3, "Demo Hosted":4, "Proposal Preparation":5, "Commercial Agreement":6, "Onboarding":7, "Renewal":8};
+	primaryStage = ifnull(primary.get("Stage"), "").toString();
+	if(ifnull(stageRanks.get(primaryStage), 0).toLong() > 3)
+	{
+		automation.logAutomationEvent("sendDemoReminder", "Deals", dealId.toString(), "guard", "skip_demo_phase_passed", {"contact":primaryId, "stage":primaryStage});
+		return;
+	}
+
+	automation.sendSequencedEmail(primaryId, dealId.toString(), "Demo Confirmation", 0, "demo_reminder", "", "");
+	automation.logAutomationEvent("sendDemoReminder", "Deals", dealId.toString(), "reminder", "sent", {"contact":primaryId});
+}

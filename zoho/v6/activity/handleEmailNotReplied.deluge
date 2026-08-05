@@ -1,0 +1,15 @@
+void automation.handleEmailNotReplied(string relatedDealIdStr, string relatedContactIdStr)
+{
+	// =========================================================================
+	// handleEmailNotReplied — WF009c wrapper
+	//
+	// Thin entry point invoked by WF009c (Emails / Outgoing email / Unreplied
+	// within N days). Delegates to handleEmailEvent with
+	// eventType="not replied" hardcoded so the workflow UI does not bind a
+	// static literal that becomes immutable post-save. emailRecordIdStr is
+	// hardcoded to "0" because the Emails module exposes no Id merge field;
+	// the core only uses it for logging.
+	// =========================================================================
+
+	automation.handleEmailEvent("0", "not replied", relatedDealIdStr, relatedContactIdStr);
+}

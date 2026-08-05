@@ -1,0 +1,743 @@
+void automation.processLead(string lead_id)
+{
+	// =========================================================================
+	// processLead  (Contact-centric)
+	//
+	// Constructs/reuses the Contact–Account–Deal graph and maps Lead data, then
+	// hands off reconciliation + activation to processContact (which calls
+	// processDeal, the sole rollup owner). processLead only preserves Lead Product links;
+	// it does not own Contact Roles (related list), Primary Contact, Opportunity/Account rollup,
+	// or activation.
+	//
+	// Pipeline:
+	//   1. Read Lead; resolve Contact_Role from Job_Title; derive Account_Key
+	//   2. Resolve / create the canonical Account
+	//   3. Convert the Lead (creates Contact + links to canonical Account)
+	//   4. Enrich Contact from Lead (idempotent, never regress Stage)
+	//   5. PER-PRODUCT FAN-OUT: normalizeToProductQuoteTuples("Leads", lead_id) yields
+	//      one bucket per resolved Product (product-interest-only or with contract terms).
+	//      For each bucket: createOrReuseProductDeal (Deal = Account x Product), seed
+	//      Lead-only Deal fields, then processDeal (import_bootstrap when terms exist,
+	//      plain reconcile otherwise). Unresolved evidence + conflicts -> Manual Review.
+	//   6. processContact(newContactId) fires via WF001b2 (Contacts-create) -> activation.
+	//
+	// v6-product-deal fan-out: the single account-level "::active" Deal is GONE. A Deal is
+	// ALWAYS Account x Product (Deal_Key = accountKey::productKey via createOrReuseProductDeal).
+	// The inline flat termsEncoded builder is GONE; normalizeToProductQuoteTuples (adapter) now
+	// owns evidence collection + encoding. No legacy migration / no "::active" handling (fresh org).
+	//
+	// Graph enrichment writes suppress Contact workflow recursion; Contact create is the
+	// single deterministic downstream step (processLead -> processContact -> processDeal).
+	//
+	// REQUIRED ZOHO CRM SETTING:
+	// - Accounts.Account_Key UNIQUE
+	// - Deals.Deal_Key UNIQUE
+	// =========================================================================
+	info "VERSION: v6-product-deal";
+
+	if(lead_id == null || lead_id == "") { return; }
+	cleanId = lead_id.replaceAll("zcrm_", "").trim();
+
+	leadRecord = zoho.crm.getRecordById("Leads", cleanId.toLong());
+	if(leadRecord.get("id") == null)
+	{
+		info "Lead not found.";
+		return;
+	}
+
+	stageRanks = {"Marketing Consent":1, "Demo Booking":2, "Demo Confirmation":3, "Demo Hosted":4, "Proposal Preparation":5, "Commercial Agreement":6, "Onboarding":7, "Renewal":8};
+
+	// ---- 1. Read Lead ----
+	website = ifnull(leadRecord.get("Website"), "").toString().trim();
+	email = ifnull(leadRecord.get("Email"), "").toString().trim();
+	company = ifnull(leadRecord.get("Company"), "").toString().trim();
+	phone = ifnull(leadRecord.get("Phone"), "").toString().trim();
+	leadStage = ifnull(leadRecord.get("Stage"), "").toString().trim();
+	leadSource = ifnull(leadRecord.get("Lead_Source"), "").toString().trim();
+	leadLostReasons = ifnull(leadRecord.get("Lost_Reasons"), "").toString().trim();
+	leadJobTitle = ifnull(leadRecord.get("Job_Title"), "").toString().trim();
+	personalPhone = ifnull(leadRecord.get("Personal_Phone"), "").toString().trim();
+	leadReferrer = ifnull(leadRecord.get("Lead_Referrer"), "").toString().trim();
+	importedRecordType = ifnull(leadRecord.get("Imported_Record_Type"), "").toString().trim();
+	leadCompanyTier = ifnull(leadRecord.get("Company_Tier"), "").toString().trim();
+	// General-marketing consent checkbox (two-state: true or blank/null; no false state).
+	leadMktConsent = leadRecord.get("Contact_Marketing_Consent");
+	// CONTRACT EVIDENCE (canonical v6): the Lead's structured contract terms live in the
+	// Acquisition_/Expansion_/Renewal_ Quote groups ({G}_Quote_ACV, _Contract_Date_Start/_End,
+	// _Plan_Products/_Plan_Type/_Plan_Brands/_Plan_Frequency, _Stage, ...). We do NOT read them
+	// inline here and we do NOT write any legacy Contract_Initial_*/Current_* Deal ledger — that
+	// ledger is derived from Confirmed Quotes downstream. Instead the adapter
+	// automation.normalizeToProductQuoteTuples("Leads", id) reads those groups (inline;
+	// formerly the collectLegacyQuoteEvidence helper) and returns per-product tuples that feed
+	// the import_bootstrap Quote engine in processDeal (step 6c below). Quote_Target_ACV is a Company-Tier benchmark
+	// derived in processDeal from the Account tier, so it is intentionally NEVER read here.
+	mqCompletedAt = null;
+	mqVal = leadRecord.get("Contact_Completed_Marketing_Qualification_At");
+	if(mqVal != null)
+	{
+		mqCompletedAt = mqVal.toString();
+		if(!mqCompletedAt.contains("T"))
+		{
+			mqCompletedAt = mqVal.toDateTime().toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+		}
+	}
+	dbCompletedAt = null;
+	dbVal = leadRecord.get("Contact_Completed_Demo_Booking_At");
+	if(dbVal != null)
+	{
+		dbCompletedAt = dbVal.toString();
+		if(!dbCompletedAt.contains("T"))
+		{
+			dbCompletedAt = dbVal.toDateTime().toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+		}
+	}
+	dcCompletedAt = null;
+	dcVal = leadRecord.get("Contact_Completed_Demo_Confirmation_At");
+	if(dcVal != null)
+	{
+		dcCompletedAt = dcVal.toString();
+		if(!dcCompletedAt.contains("T"))
+		{
+			dcCompletedAt = dcVal.toDateTime().toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+		}
+	}
+	dhCompletedAt = null;
+	dhVal = leadRecord.get("Contact_Completed_Demo_Hosted_At");
+	if(dhVal != null)
+	{
+		dhCompletedAt = dhVal.toString();
+		if(!dhCompletedAt.contains("T"))
+		{
+			dhCompletedAt = dhVal.toDateTime().toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+		}
+	}
+	ppCompletedAt = null;
+	ppVal = leadRecord.get("Contact_Completed_Proposal_Preparation_At");
+	if(ppVal != null)
+	{
+		ppCompletedAt = ppVal.toString();
+		if(!ppCompletedAt.contains("T"))
+		{
+			ppCompletedAt = ppVal.toDateTime().toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+		}
+	}
+	caCompletedAt = null;
+	caVal = leadRecord.get("Contact_Completed_Commercial_Agreement_At");
+	if(caVal != null)
+	{
+		caCompletedAt = caVal.toString();
+		if(!caCompletedAt.contains("T"))
+		{
+			caCompletedAt = caVal.toDateTime().toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+		}
+	}
+	obCompletedAt = null;
+	obVal = leadRecord.get("Contact_Completed_Onboarding_At");
+	if(obVal != null)
+	{
+		obCompletedAt = obVal.toString();
+		if(!obCompletedAt.contains("T"))
+		{
+			obCompletedAt = obVal.toDateTime().toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+		}
+	}
+	rnCompletedAt = null;
+	rnVal = leadRecord.get("Contact_Completed_Renewal_At");
+	if(rnVal != null)
+	{
+		rnCompletedAt = rnVal.toString();
+		if(!rnCompletedAt.contains("T"))
+		{
+			rnCompletedAt = rnVal.toDateTime().toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+		}
+	}
+
+	// AOR fields from Lead (lists for multiselect)
+	leadContactAORContinent = List();
+	leadContactAORCountry = List();
+	leadContactAORRegion = List();
+	leadContactAORSubRegion = List();
+	if(leadRecord.get("Contact_AOR_Continent") != null) { for each item in leadRecord.get("Contact_AOR_Continent") { leadContactAORContinent.add(item.toString()); } }
+	if(leadRecord.get("Contact_AOR_Country") != null) { for each item in leadRecord.get("Contact_AOR_Country") { leadContactAORCountry.add(item.toString()); } }
+	if(leadRecord.get("Contact_AOR_Region") != null) { for each item in leadRecord.get("Contact_AOR_Region") { leadContactAORRegion.add(item.toString()); } }
+	if(leadRecord.get("Contact_AOR_Sub_Region") != null) { for each item in leadRecord.get("Contact_AOR_Sub_Region") { leadContactAORSubRegion.add(item.toString()); } }
+	leadContactAORRegional = leadRecord.get("Contact_AOR_Regional");
+	leadRoleAOR = ifnull(leadRecord.get("Role_AOR"), "").toString().trim();
+
+	// Company AOO fields from Lead (lists for multiselect)
+	leadCompanyAOOContinent = List();
+	leadCompanyAOORegion = List();
+	leadCompanyAOOCountry = List();
+	leadCompanyAOOSubRegion = List();
+	if(leadRecord.get("Company_AOO_Continent") != null) { for each item in leadRecord.get("Company_AOO_Continent") { leadCompanyAOOContinent.add(item.toString()); } }
+	if(leadRecord.get("Company_AOO_Region") != null) { for each item in leadRecord.get("Company_AOO_Region") { leadCompanyAOORegion.add(item.toString()); } }
+	if(leadRecord.get("Company_AOO_Country") != null) { for each item in leadRecord.get("Company_AOO_Country") { leadCompanyAOOCountry.add(item.toString()); } }
+	if(leadRecord.get("Company_AOO_Sub_Region") != null) { for each item in leadRecord.get("Company_AOO_Sub_Region") { leadCompanyAOOSubRegion.add(item.toString()); } }
+
+	// Expansion fields from Lead (lists for multiselect)
+	leadCompanyExpansionContinent = List();
+	leadCompanyExpansionCountry = List();
+	leadCompanyExpansionRegion = List();
+	leadCompanyExpansionSubRegion = List();
+	if(leadRecord.get("Company_Expansion_Continent") != null) { for each item in leadRecord.get("Company_Expansion_Continent") { leadCompanyExpansionContinent.add(item.toString()); } }
+	if(leadRecord.get("Company_Expansion_Country") != null) { for each item in leadRecord.get("Company_Expansion_Country") { leadCompanyExpansionCountry.add(item.toString()); } }
+	if(leadRecord.get("Company_Expansion_Region") != null) { for each item in leadRecord.get("Company_Expansion_Region") { leadCompanyExpansionRegion.add(item.toString()); } }
+	if(leadRecord.get("Company_Expansion_Sub_Region") != null) { for each item in leadRecord.get("Company_Expansion_Sub_Region") { leadCompanyExpansionSubRegion.add(item.toString()); } }
+	leadCompanyExpansionRegional = leadRecord.get("Company_Expansion_Regional");
+	leadCompanyExpansionTimeline = leadRecord.get("Company_Expansion_Timeline");
+
+	// ---- 1b. Resolve Contact_Role from Job_Title and stamp on Lead BEFORE conversion ----
+	// Inlined here because standalone cross-function calls silently fail in some CRM configs.
+	// Stamping Lead.Contact_Role ensures Zoho's native field mapping carries it to Contact.
+	leadContactRole = ifnull(leadRecord.get("Contact_Role1"), "").toString().trim();
+	if(leadJobTitle != "" && leadContactRole == "")
+	{
+		resolvedRole = "Decision Maker";
+		titleKey = leadJobTitle.trim().toLowerCase();
+
+		dmTitles = {"automation & ai transformation director","casino director","chief architect","chief commercial officer","chief customer officer","chief data officer","chief executive officer","chief financial officer","chief marketing officer","chief online gaming","chief operating officer","chief product officer","chief revenue officer","chief strategy officer","chief systems officer","chief technology officer","chief trading officer","chief transformation officer","co-founder","commercial director","commerical director","company director","customer experience director","data director","design director","digital director","digital experience director","director of digital product","director of gaming","director of information technology","director of operations","director of product","director of product & operations management","director of product analysis","director of product operations","director of strategy & customer experience","director of technology","director of ux & growth","director product & tech","director product & technology","experimentation lead","founder","fp&a director","gaming director","general manager","global cmo","global cxo","global director of product support & services","global head of product","global product director","global product manager","group cfo","group chief operating officer","group gaming director emea","group head of commercial gaming operations","group product manager","group strategy director","group trading director","growth director","head of acquisition","head of analytics","head of bi","head of brand","head of brand & creative","head of brand marketing","head of casino","head of casino business development","head of commercial","head of crm","head of cro","head of customer experience","head of customer marketing","head of customer value management","head of cx","head of data platform","head of design","head of digital","head of digital product","head of engineering","head of finance","head of gaming","head of gaming commercial","head of gaming operations","head of gaming product","head of group marketing","head of growth","head of igaming","head of infrastructure","head of internal audit","head of international horse racing","head of marketing","head of online","head of online & customer acquisition","head of online casino operations","head of product","head of product design","head of product marketing","head of program product + chief of staff","head of promotions","head of proposition","head of research","head of retention","head of special product development","head of sports","head of sportsbook","head of strategy & performance","head of technology","head of ux","lifecycle director","manager of global product management","managing director","market manager","marketing director","operational product supplier manager","owner","performance marketing director","president","product design director","product director","product management lead","product operations director","promotions director","proposition director","regional director","revenue director","senior global brand manager","senior ia & ai business transformation architect","senior product manager","senior vice president product development","sportsbook director","svp product","ux director","vice managing director","vice president","vice president & general manager","vice president marketing","vice president of commercials","vice president of finance","vice president of global operations & media","vice president of operations","vice president of pricing strategy","vice president of product","vice president of product development","vice president of sales & marketing","vice president product management","vice president risk","vp customer experience","vp growth","vp product"};
+		if(dmTitles.contains(titleKey))
+		{
+			resolvedRole = "Decision Maker";
+		}
+		else
+		{
+			euTitles = {"advanced analytics lead","ai & automation lead","ai lead","analytics engineer","attribution manager","behavioural analyst","betting operations manager","bi analyst","bi developer","bonus manager","brand & marketing director","brand & product marketing lead","business operations manager","campaign manager","casino manager","casino product manager","commercial analyst","competitor intelligence analyst","country manager","crm director","crm manager","cro director","cro manager","cro product manager","customer excellence department head","customer experience insights manager","customer experience manager","customer insights product owner","customer journey manager","cx manager","data layer specialist","data visualisation analyst","design lead","design manager","design systems engineer","design systems lead","digital analyst","digital product manager","director customer experience & strategy","director of applied intelligence","director of cx & optimisation","director of digital marketing","director of marketing","director of marketing & affiliation","director of marketing communications","director of poker & bingo","director of poker operations","director of sportsbook","director of strategy & business delivery","director of user experience","experience researcher","experimentation manager","frontend developer","gaming product manager","generosity analytics & segmentation senior manager","go-to-market manager","head of experience","head of generosity transformation","head of performance","head of pricing strategy & insights","head of product analytics","head of product growth","head of sales","head of seo","head of trade marketing","head of ux & design","head trader","igaming product manager","information & product analysis specialist manager","interaction designer","lead product designer","lifecycle manager","live casino manager","manager egaming","manager product management","manager ux/ui & da gaming","market analyst","marketing analyst","marketing operations manager","offer manager","optimisation manager","paid search executive","planning & execution director","player engagement manager","pricing analyst","pricing strategy director","product & design operations specialist","product & experience operations manager","product analyst","product analytics","product designer","product experience director","product insights manager","product manager","product manager & qa lead","product marketing manager","product operations manager","product owner","promotions manager","proposition manager","regional head of digital","research manager","retention manager","senior crm marketing specialist","senior cvm manager","senior director sportsbook product","senior generosity transformation manager","senior product designer","senior product development manager","senior project leader","senior research manager","senior ux researcher","sports director","sportsbook operations manager","sportsbook product manager","sportsbook trading manager","tagging specialist","tracking specialist","trading manager","ui designer","user experience research manager","user research lead","user research manager","user researcher","ux analyst","ux architect","ux designer","ux researcher","voice of customer manager","web analyst","web developer","website manager","website product manager"};
+			if(euTitles.contains(titleKey))
+			{
+				resolvedRole = "End User";
+			}
+			else
+			{
+				infTitles = {"account executive","acquisition manager","administrative assistant","art director","associate director of product","bi manager","brand manager","business development director","business development executive","campaign strategy manager","chief assurance officer","chief of staff","client director","client partner","commercial finance manager","commercial manager","commercial planning manager","compliance manager","compliance product manager","consultant","creative director","creative lead","customer operations manager","data analyst","delivery director","deputy director","designer","director","director & general manager","director of corporate compliance","director of corporate security","director of engineering","director of generosity transformation","director of hospitality & general services","director of hotel sales","director of payments","director of people & culture","director of product compliance","director of product design","director of product development","director of product management","director of project management","director of trading strategy","engineering manager","experience director (product, cx, data, research & pmo)","finance business partner","fp&a manager","freelance writer","frontend lead","head cashier","head of affiliates","head of aml","head of aml, fraud & risk","head of b2b","head of backend engineering","head of business development","head of compliance","head of corporate communications","head of creative","head of creative research & insights","head of customer care","head of customer excellence","head of customer service","head of customer support","head of customer support & vip accounts management","head of facility & workplace strategy","head of greyhound racing operations","head of human resources","head of investor relations & capital deployment","head of legal","head of liquidity","head of live casino","head of operations","head of operations & support","head of partnerships","head of people & culture","head of propositions","head of social","head of streaming operations","head of support department","head of trading","head of trading & risk","head of vip","head of vip services","human resources business partner","human resources director","insight manager","legal counsel","lifecycle marketing manager","live ops product manager","live ops product manager, head of content","m&a principal","marketing manager","obg strategy","paid search manager","paid social manager","payment product manager","performance marketing manager","player experience lead","player operations manager","player protection lead","player value manager","poker product manager","principal product manager","product & customer support manager","product & insight director","product lead","product release manager","program manager","regulatory affairs manager","responsible gambling manager","safer gambling analyst","safer gambling lead","sales manager","senior business development manager","senior commercial manager","senior ecommerce consultant","senior graphic designer","senior legal & regulatory counsel","senior manager","senior manager new business & sales executive","senior product owner","senior sales manager","sportsbook property director kentucky","strategy consultant","supplier manager","team lead hr business partner","technical director","trading graduate","uk news editor","ux/ui designer","vice president of human resources","vip manager"};
+				if(infTitles.contains(titleKey))
+				{
+					resolvedRole = "Influencer";
+				}
+			}
+		}
+
+		info "Resolved Contact_Role for Lead: title='" + leadJobTitle + "' → role='" + resolvedRole + "'";
+		leadStampResp = zoho.crm.updateRecord("Leads", cleanId.toLong(), {"Contact_Role1": resolvedRole});
+		info "Lead Contact_Role stamp resp: " + leadStampResp;
+		leadContactRole = resolvedRole;
+	}
+
+	// Lead.Product_Interest is a Multiselect picklist of SKU Product names.
+	// D4 FIX (2026-06-22): build the staging string by stripping brackets/quotes and
+	// splitting on comma. This handles get() returning either a real List ("[a, b]") or a
+	// bracketed String, WITHOUT iterating a possibly-String value (which would yield
+	// characters). Replaces the prior fragile munge + phantom "Product_Interest1" read
+	// that left Product Interest links unavailable after conversion.
+	leadPIStr = "";
+	leadPIRaw = leadRecord.get("Product_Interest");
+	if(leadPIRaw != null)
+	{
+		leadPICleaned = leadPIRaw.toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll(";", ",").replaceAll("\"", "").replaceAll("'", "").trim();
+		if(leadPICleaned != "")
+		{
+			for each piTok in leadPICleaned.toList(",")
+			{
+				piTrim = piTok.trim();
+				if(piTrim != "" && piTrim != "-None-")
+				{
+					leadPIStr = leadPIStr + if(leadPIStr != "", ", ", "") + piTrim;
+				}
+			}
+		}
+	}
+	info "Lead PI parsed string='" + leadPIStr + "'";
+
+	// ---- 1c. Import-contract tuple extraction: REMOVED (v6-product-deal) ----
+	// The inline flat single-Deal termsEncoded builder that lived here is DELETED. Evidence
+	// collection (Product_Interest + the Acquisition/Expansion/Renewal Quote groups)
+	// and the "~"/";" encoding are now owned by the adapter automation.normalizeToProductQuoteTuples
+	// ("Leads", lead_id), which returns PER-PRODUCT buckets (each with its own terms_encoded), the
+	// unresolved list, and the plan-type conflicts list. See step 6 (per-product fan-out). This keeps
+	// a single source of truth for evidence -> tuple encoding shared with processContact/processDeal.
+
+	// ---- 2. Derive Account_Key ----
+	normalizedDomain = "";
+	if(website != "")
+	{
+		normalizedDomain = website.toLowerCase().replaceAll("https://", "").replaceAll("http://", "").replaceAll("www.", "");
+		if(normalizedDomain.contains("/")) { normalizedDomain = normalizedDomain.toList("/").get(0); }
+	}
+	else if(email != "" && email.contains("@"))
+	{
+		domainPart = email.getSuffix("@").toLowerCase();
+		freeDomains = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"};
+		if(!freeDomains.contains(domainPart)) { normalizedDomain = domainPart; }
+	}
+
+	accountKey = "";
+	if(normalizedDomain != "") { accountKey = normalizedDomain; }
+	else if(company != "") { accountKey = company.replaceAll("[\\(\\)\\:\\,]", "").trim().toLowerCase(); }
+	else { accountKey = "unknown::" + cleanId; }
+	if(accountKey.length() > 200) { accountKey = accountKey.substring(0, 200); }
+
+	// ---- 3. Resolve / create canonical Account ----
+	accountId = "";
+	accountRecord = null;
+
+	searchAcc = zoho.crm.searchRecords("Accounts", "(Account_Key:equals:" + accountKey + ")");
+	if(searchAcc != null && searchAcc.size() > 0 && !searchAcc.toString().startsWith("{\"code\""))
+	{
+		accountRecord = searchAcc.get(0);
+		accountId = accountRecord.get("id").toString();
+	}
+
+	if(accountId == "" && normalizedDomain != "")
+	{
+		searchAcc = zoho.crm.searchRecords("Accounts", "(Website:equals:" + normalizedDomain + ")");
+		if(searchAcc != null && searchAcc.size() > 0 && !searchAcc.toString().startsWith("{\"code\""))
+		{
+			accountRecord = searchAcc.get(0);
+			accountId = accountRecord.get("id").toString();
+		}
+	}
+
+	if(accountId == "" && company != "")
+	{
+		safeCompany = company.replaceAll("[\\(\\)\\:\\,]", "").trim();
+		searchAcc = zoho.crm.searchRecords("Accounts", "(Account_Name:equals:" + safeCompany + ")");
+		if(searchAcc != null && searchAcc.size() > 0 && !searchAcc.toString().startsWith("{\"code\""))
+		{
+			accountRecord = searchAcc.get(0);
+			accountId = accountRecord.get("id").toString();
+		}
+	}
+
+	if(accountId == "")
+	{
+		createAccMap = Map();
+		createAccMap.put("Account_Key", accountKey);
+		createAccMap.put("Account_Name", if(company != "", company, accountKey));
+		if(website != "") { createAccMap.put("Website", website); }
+		if(phone != "") { createAccMap.put("Phone", phone); }
+		if(importedRecordType != "") { createAccMap.put("Account_Source_Class", importedRecordType); }
+		// Seed Company_Tier at Account creation so it is authoritative BEFORE the product
+		// fan-out: processDeal(import_bootstrap) derives Quote_Target_ACV from the Account
+		// tier. Seeding here (not only in 6a below) avoids imported Quotes getting Target ACV 0.
+		if(leadCompanyTier != "") { createAccMap.put("Company_Tier", leadCompanyTier); }
+		if(leadCompanyAOOContinent.size() > 0) { createAccMap.put("Company_AOO_Continent", leadCompanyAOOContinent); }
+		if(leadCompanyAOORegion.size() > 0) { createAccMap.put("Company_AOO_Region", leadCompanyAOORegion); }
+		if(leadCompanyAOOCountry.size() > 0) { createAccMap.put("Company_AOO_Country", leadCompanyAOOCountry); }
+		if(leadCompanyAOOSubRegion.size() > 0) { createAccMap.put("Company_AOO_Sub_Region", leadCompanyAOOSubRegion); }
+		if(leadCompanyExpansionContinent.size() > 0) { createAccMap.put("Company_Expansion_Continent", leadCompanyExpansionContinent); }
+		if(leadCompanyExpansionCountry.size() > 0) { createAccMap.put("Company_Expansion_Country", leadCompanyExpansionCountry); }
+		if(leadCompanyExpansionRegion.size() > 0) { createAccMap.put("Company_Expansion_Region", leadCompanyExpansionRegion); }
+		if(leadCompanyExpansionSubRegion.size() > 0) { createAccMap.put("Company_Expansion_Sub_Region", leadCompanyExpansionSubRegion); }
+		if(leadCompanyExpansionRegional != null) { createAccMap.put("Company_Expansion_Regional", leadCompanyExpansionRegional); }
+		if(leadCompanyExpansionTimeline != null) { createAccMap.put("Company_Expansion_Timeline", leadCompanyExpansionTimeline); }
+
+		accCreateRes = zoho.crm.createRecord("Accounts", createAccMap);
+		if(accCreateRes.get("id") != null)
+		{
+			accountId = accCreateRes.get("id").toString();
+		}
+		else if(accCreateRes.get("code") == "DUPLICATE_DATA" && accCreateRes.get("details") != null)
+		{
+			accountId = accCreateRes.get("details").get("id").toString();
+		}
+
+		if(accountId == "")
+		{
+			postSearch = zoho.crm.searchRecords("Accounts", "(Account_Key:equals:" + accountKey + ")");
+			if(postSearch != null && postSearch.size() > 0 && !postSearch.toString().startsWith("{\"code\""))
+			{
+				accountId = postSearch.get(0).get("id").toString();
+			}
+		}
+
+		if(accountId != "") { accountRecord = zoho.crm.getRecordById("Accounts", accountId.toLong()); }
+	}
+	else
+	{
+		updAcc = Map();
+		if(ifnull(accountRecord.get("Account_Key"), "") != accountKey) { updAcc.put("Account_Key", accountKey); }
+		if(phone != "" && ifnull(accountRecord.get("Phone"), "") != phone) { updAcc.put("Phone", phone); }
+		if(importedRecordType != "" && ifnull(accountRecord.get("Account_Source_Class"), "") != importedRecordType) { updAcc.put("Account_Source_Class", importedRecordType); }
+		if(leadCompanyAOOContinent.size() > 0 && (accountRecord.get("Company_AOO_Continent") == null || accountRecord.get("Company_AOO_Continent").size() == 0)) { updAcc.put("Company_AOO_Continent", leadCompanyAOOContinent); }
+		if(leadCompanyAOORegion.size() > 0 && (accountRecord.get("Company_AOO_Region") == null || accountRecord.get("Company_AOO_Region").size() == 0)) { updAcc.put("Company_AOO_Region", leadCompanyAOORegion); }
+		if(leadCompanyAOOCountry.size() > 0 && (accountRecord.get("Company_AOO_Country") == null || accountRecord.get("Company_AOO_Country").size() == 0)) { updAcc.put("Company_AOO_Country", leadCompanyAOOCountry); }
+		if(leadCompanyAOOSubRegion.size() > 0 && (accountRecord.get("Company_AOO_Sub_Region") == null || accountRecord.get("Company_AOO_Sub_Region").size() == 0)) { updAcc.put("Company_AOO_Sub_Region", leadCompanyAOOSubRegion); }
+		if(leadCompanyExpansionContinent.size() > 0 && (accountRecord.get("Company_Expansion_Continent") == null || accountRecord.get("Company_Expansion_Continent").size() == 0)) { updAcc.put("Company_Expansion_Continent", leadCompanyExpansionContinent); }
+		if(leadCompanyExpansionCountry.size() > 0 && (accountRecord.get("Company_Expansion_Country") == null || accountRecord.get("Company_Expansion_Country").size() == 0)) { updAcc.put("Company_Expansion_Country", leadCompanyExpansionCountry); }
+		if(leadCompanyExpansionRegion.size() > 0 && (accountRecord.get("Company_Expansion_Region") == null || accountRecord.get("Company_Expansion_Region").size() == 0)) { updAcc.put("Company_Expansion_Region", leadCompanyExpansionRegion); }
+		if(leadCompanyExpansionSubRegion.size() > 0 && (accountRecord.get("Company_Expansion_Sub_Region") == null || accountRecord.get("Company_Expansion_Sub_Region").size() == 0)) { updAcc.put("Company_Expansion_Sub_Region", leadCompanyExpansionSubRegion); }
+		if(leadCompanyExpansionRegional != null && accountRecord.get("Company_Expansion_Regional") == null) { updAcc.put("Company_Expansion_Regional", leadCompanyExpansionRegional); }
+		if(leadCompanyExpansionTimeline != null && accountRecord.get("Company_Expansion_Timeline") == null) { updAcc.put("Company_Expansion_Timeline", leadCompanyExpansionTimeline); }
+		// Seed Company_Tier onto a reused Account when it has none, BEFORE the product fan-out,
+		// so processDeal(import_bootstrap) can derive Quote_Target_ACV from a live Account tier.
+		if(leadCompanyTier != "" && ifnull(accountRecord.get("Company_Tier"), "").toString().trim() == "") { updAcc.put("Company_Tier", leadCompanyTier); }
+		if(updAcc.size() > 0)
+		{
+			zoho.crm.updateRecord("Accounts", accountId.toLong(), updAcc, {"trigger": List()});
+			accountRecord = zoho.crm.getRecordById("Accounts", accountId.toLong());
+		}
+	}
+
+	if(accountId == "" || accountId == "null")
+	{
+		info "FAILED: Account resolution failed. Lead not converted.";
+		return;
+	}
+
+	// ---- 4. Convert Lead ----
+	contactId = "";
+	if(email != "")
+	{
+		searchCon = zoho.crm.searchRecords("Contacts", "(Email:equals:" + email + ")");
+		if(searchCon != null && searchCon.size() > 0 && !searchCon.toString().startsWith("{\"code\""))
+		{
+			contactId = searchCon.get(0).get("id").toString();
+		}
+	}
+
+	// ---- Capture per-product evidence + contract tuples from the LEAD *before* convert ----
+	// Deluge getRecordById on a CONVERTED lead returns null (converted leads are excluded from
+	// default reads), so the evidence adapter MUST read the lead while it is still un-converted.
+	// Capture the buckets now; the post-convert fan-out (section 6) consumes these.
+	tuplesJson = automation.normalizeToProductQuoteTuples("Leads", cleanId);
+	tuples = tuplesJson.toMap();
+	prodBuckets = ifnull(tuples.get("products"), List());
+	unresolvedList = ifnull(tuples.get("unresolved"), List());
+	conflictList = ifnull(tuples.get("conflicts"), List());
+	info "pre-convert normalize: products=" + prodBuckets.size() + " unresolved=" + unresolvedList.size() + " conflicts=" + conflictList.size();
+
+	convertMap = Map();
+	convertMap.put("overwrite", false);
+	convertMap.put("notify_lead_owner", false);
+	convertMap.put("notify_new_entity_owner", false);
+	convertMap.put("Accounts", accountId);
+	if(contactId != "") { convertMap.put("Contacts", contactId); }
+
+	convertRes = zoho.crm.convertLead(cleanId.toLong(), convertMap);
+	info "Convert Response: " + convertRes;
+
+	newContactId = contactId;
+	if(convertRes.get("Contacts") != null)
+	{
+		newContactId = convertRes.get("Contacts").toString();
+	}
+	if(newContactId == "" || newContactId == "null")
+	{
+		info "Conversion failed or no contact id.";
+		return;
+	}
+
+	// ---- 5. Enrich Contact (idempotent, never regress Stage) ----
+	contactRecord = zoho.crm.getRecordById("Contacts", newContactId.toLong());
+	updCon = Map();
+
+	accNameMap = contactRecord.get("Account_Name");
+	if(accNameMap == null || ifnull(accNameMap.get("id"), "").toString() != accountId)
+	{
+		updCon.put("Account_Name", accountId);
+	}
+
+	if(leadStage == "") { leadStage = "Marketing Consent"; }
+
+	currentContactStage = ifnull(contactRecord.get("Stage"), "").toString().trim();
+	if(currentContactStage == "")
+	{
+		updCon.put("Stage", leadStage);
+	}
+	else
+	{
+		curRank = ifnull(stageRanks.get(currentContactStage), 1);
+		leadRank = ifnull(stageRanks.get(leadStage), 1);
+		if(leadRank > curRank) { updCon.put("Stage", leadStage); }
+	}
+
+	if(leadLostReasons != "")
+	{
+		// Lead arrived already lost — propagate to the Contact
+		if(ifnull(contactRecord.get("State"), "") != "Lost") { updCon.put("State", "Lost"); }
+		if(ifnull(contactRecord.get("Status"), "") != "Closed") { updCon.put("Status", "Closed"); }
+		if(ifnull(contactRecord.get("Lost_Reasons"), "") == "") { updCon.put("Lost_Reasons", leadLostReasons); }
+	}
+	else
+	{
+		if(ifnull(contactRecord.get("State"), "") == "") { updCon.put("State", "Open"); }
+		if(ifnull(contactRecord.get("Status"), "") == "") { updCon.put("Status", "New"); }
+	}
+
+	// Propagate Lead Job_Title to Contact if Contact's is blank
+	cJobTitle = ifnull(contactRecord.get("Job_Title"), "").toString().trim();
+	if(leadJobTitle != "" && cJobTitle == "")
+	{
+		updCon.put("Job_Title", leadJobTitle);
+		cJobTitle = leadJobTitle;
+	}
+
+	// Resolve and populate custom Contact_Role field. Always write if we resolved a role,
+	// since Zoho's Lead→Contact field mapping does not reliably populate this on convert.
+	contactCurrentRole = ifnull(contactRecord.get("Contact_Role1"), "").toString().trim();
+	info "Contact " + newContactId + " current Contact_Role1='" + contactCurrentRole + "' resolved leadContactRole='" + leadContactRole + "'";
+	if(leadContactRole != "" && contactCurrentRole == "")
+	{
+		updCon.put("Contact_Role1", leadContactRole);
+	}
+	if(personalPhone != "" && ifnull(contactRecord.get("Personal_Phone"), "") == "")
+	{
+		updCon.put("Personal_Phone", personalPhone);
+	}
+	if(leadReferrer != "" && ifnull(contactRecord.get("Lead_Referrer"), "") == "")
+	{
+		updCon.put("Lead_Referrer", leadReferrer);
+	}
+	// Carry affirmative general-marketing consent from the Lead.
+	// Zoho checkbox semantics here are true or blank.
+	// Only copy true into a blank Contact field. Never fabricate consent,
+	// never clear existing consent, and never overwrite Contact-side updates.
+	if(leadMktConsent == true && contactRecord.get("Marketing_Consent") == null)
+	{
+		updCon.put("Marketing_Consent", true);
+	}
+	// Product_Interest_Staging is a read-only formula. Lead Product Interest is
+	// preserved below by creating Contacts_X_Products junction rows.
+	if(importedRecordType != "" && ifnull(contactRecord.get("Contact_Source_Class"), "") != importedRecordType)
+	{
+		updCon.put("Contact_Source_Class", importedRecordType);
+	}
+	if(leadContactAORContinent.size() > 0 && (contactRecord.get("Contact_AOR_Continent") == null || contactRecord.get("Contact_AOR_Continent").size() == 0)) { updCon.put("Contact_AOR_Continent", leadContactAORContinent); }
+	if(leadContactAORCountry.size() > 0 && (contactRecord.get("Contact_AOR_Country") == null || contactRecord.get("Contact_AOR_Country").size() == 0)) { updCon.put("Contact_AOR_Country", leadContactAORCountry); }
+	if(leadContactAORRegion.size() > 0 && (contactRecord.get("Contact_AOR_Region") == null || contactRecord.get("Contact_AOR_Region").size() == 0)) { updCon.put("Contact_AOR_Region", leadContactAORRegion); }
+	if(leadContactAORSubRegion.size() > 0 && (contactRecord.get("Contact_AOR_Sub_Region") == null || contactRecord.get("Contact_AOR_Sub_Region").size() == 0)) { updCon.put("Contact_AOR_Sub_Region", leadContactAORSubRegion); }
+	if(leadContactAORRegional != null && contactRecord.get("Contact_AOR_Regional") == null) { updCon.put("Contact_AOR_Regional", leadContactAORRegional); }
+	if(leadRoleAOR != "" && ifnull(contactRecord.get("Role_AOR"), "") == "") { updCon.put("Role_AOR", leadRoleAOR); }
+	if(mqCompletedAt != null && contactRecord.get("Contact_Completed_Marketing_Qualification_At") == null) { updCon.put("Contact_Completed_Marketing_Qualification_At", mqCompletedAt); }
+	if(dbCompletedAt != null && contactRecord.get("Contact_Completed_Demo_Booking_At") == null) { updCon.put("Contact_Completed_Demo_Booking_At", dbCompletedAt); }
+	if(dcCompletedAt != null && contactRecord.get("Contact_Completed_Demo_Confirmation_At") == null) { updCon.put("Contact_Completed_Demo_Confirmation_At", dcCompletedAt); }
+	if(dhCompletedAt != null && contactRecord.get("Contact_Completed_Demo_Hosted_At") == null) { updCon.put("Contact_Completed_Demo_Hosted_At", dhCompletedAt); }
+	if(ppCompletedAt != null && contactRecord.get("Contact_Completed_Proposal_Preparation_At") == null) { updCon.put("Contact_Completed_Proposal_Preparation_At", ppCompletedAt); }
+	if(caCompletedAt != null && contactRecord.get("Contact_Completed_Commercial_Agreement_At") == null) { updCon.put("Contact_Completed_Commercial_Agreement_At", caCompletedAt); }
+	if(obCompletedAt != null && contactRecord.get("Contact_Completed_Onboarding_At") == null) { updCon.put("Contact_Completed_Onboarding_At", obCompletedAt); }
+	if(rnCompletedAt != null && contactRecord.get("Contact_Completed_Renewal_At") == null) { updCon.put("Contact_Completed_Renewal_At", rnCompletedAt); }
+
+	if(updCon.size() > 0)
+	{
+		// Suppress Contact workflow trigger to prevent processContact from racing
+		// against this same processLead run (which would read Deal Product_Details=0
+		// before our step 11 writes them and clobber Amount with 0).
+		suppressTrigger = Map();
+		suppressTrigger.put("trigger", List());
+		contactUpdResp = zoho.crm.updateRecord("Contacts", newContactId.toLong(), updCon, suppressTrigger);
+		info "Contact update resp (incl. Contact_Role, trigger suppressed): " + contactUpdResp;
+	}
+
+	// ---- 6. PER-PRODUCT DEAL FAN-OUT (v6-product-deal) ----
+	// The single account-level "::active" Deal is GONE. normalizeToProductQuoteTuples owns evidence
+	// collection + encoding and returns one bucket per RESOLVED Product (each with its own
+	// terms_encoded, "" for product-interest-only), plus the unresolved evidence and plan-type
+	// conflict lists. For each bucket we guarantee the Deal = Account x Product box via
+	// createOrReuseProductDeal (Deal_Key = accountKey::productKey), seed the Lead-only Deal fields
+	// the helper does not set, then hand off to processDeal (import_bootstrap when the bucket carries
+	// contract terms, plain reconcile otherwise). No generic Account-level Deal is ever created.
+	accountName = if(company != "", company, accountKey);
+	if(accountRecord != null && ifnull(accountRecord.get("Account_Name"), "") != "") { accountName = accountRecord.get("Account_Name").toString(); }
+
+	noTrig = Map();
+	noTrig.put("trigger", List());
+
+	// prodBuckets / unresolvedList / conflictList were captured PRE-convert (before convertLead)
+	// because getRecordById on a converted Lead returns null. Do NOT re-read the lead here.
+	info "6: fan-out using pre-convert tuples: products=" + prodBuckets.size() + " unresolved=" + unresolvedList.size() + " conflicts=" + conflictList.size();
+
+	// Unresolved product evidence -> Contact-only Manual Review (no Deal exists for it). Never discard.
+	for each ur in unresolvedList
+	{
+		urRaw = ifnull(ur.get("raw"), "").toString().trim();
+		urReason = ifnull(ur.get("reason"), "").toString().trim();
+		if(urRaw != "")
+		{
+			automation.createManualReview(newContactId, "", "product_unresolved", "Lead product evidence '" + urRaw + "' could not be resolved to a canonical Product (reason: " + urReason + "). Resolve and re-run.");
+			automation.logAutomationEvent("processLead", "Contacts", newContactId, "product_unresolved", urReason, {"raw":urRaw});
+		}
+	}
+
+	// Fan out one Product Deal per resolved bucket.
+	for each bucket in prodBuckets
+	{
+		bProductId = ifnull(bucket.get("product_id"), "").toString().trim();
+		bProductName = ifnull(bucket.get("product_name"), "").toString().trim();
+		bProductKey = ifnull(bucket.get("product_key"), "").toString().trim();
+		bTermsEncoded = ifnull(bucket.get("terms_encoded"), "").toString();
+		if(bProductKey == "") { continue; }
+
+		cprJson = automation.createOrReuseProductDeal(accountId, accountKey, bProductId, bProductName, bProductKey, accountName);
+		cpr = cprJson.toMap();
+		if(ifnull(cpr.get("valid"), "false") != "true")
+		{
+			automation.createManualReview(newContactId, "", "product_unresolved", "Could not create/reuse the Product Deal for '" + bProductName + "' (" + bProductKey + "): " + ifnull(cpr.get("reason"), "") + ".");
+			automation.logAutomationEvent("processLead", "Contacts", newContactId, "product_deal_unavailable", ifnull(cpr.get("reason"), "").toString(), {"product_key":bProductKey});
+			continue;
+		}
+		dealId = ifnull(cpr.get("deal_id"), "").toString().trim();
+		if(dealId == "" || dealId == "null") { continue; }
+
+		// Seed Lead-only Deal fields the helper does not set (suppress triggers; idempotent).
+		// createOrReuseProductDeal already sets Deal_Name/Account_Name/Deal_Key/Deal_Product/
+		// Deal_Product_Key/Opportunity_State=Open/Opportunity_Status=New/Closing_Date.
+		seedDeal = Map();
+		seedDeal.put("Contact_Name", newContactId);
+		if(leadSource != "") { seedDeal.put("Lead_Source", leadSource); }
+		// Company_Tier mirror on the Deal (Account is authoritative; see 6a). Target ACV benchmark only.
+		if(leadCompanyTier != "") { seedDeal.put("Company_Tier", leadCompanyTier); }
+		if(leadLostReasons != "")
+		{
+			// Lead arrived already lost -> the Product Deal is Lost/Closed (Deals never Won).
+			seedDeal.put("Opportunity_State", "Lost");
+			seedDeal.put("Opportunity_Status", "Closed");
+			seedDeal.put("Lost_Reasons", leadLostReasons);
+		}
+		zoho.crm.updateRecord("Deals", dealId.toLong(), seedDeal, noTrig);
+
+		// Hand off to processDeal (single commercial owner). import_bootstrap when this bucket
+		// carries contract terms; plain reconcile otherwise.
+		if(bTermsEncoded != "")
+		{
+			importCtx = Map();
+			importCtx.put("source", "import_bootstrap");
+			importCtx.put("sourceModule", "Leads");
+			importCtx.put("sourceRecordId", cleanId);
+			importCtx.put("contactId", newContactId);
+			// NOTE: opportunityType is intentionally NOT passed. Quote_Type is now per-term
+				// (encoded at index 0 of the 11-field termsEncoded string) and processDeal 5b derives
+				// it per Quote; a single importCtx-level opportunityType would be wrong for mixed
+				// A/E/R buckets and must never override the per-term Quote_Type.
+			importCtx.put("termsEncoded", bTermsEncoded);
+			impResp = automation.processDeal(dealId, importCtx.toString());
+			info "6: import_bootstrap processDeal (" + bProductKey + ") resp=" + impResp;
+		}
+		else
+		{
+			// Pass the controlling Contact so the scaffold Quote (processDeal 8z) binds it.
+			plainCtx = Map();
+			plainCtx.put("contactId", newContactId);
+			plainResp = automation.processDeal(dealId, plainCtx.toString());
+			info "6: plain processDeal (" + bProductKey + ") resp=" + plainResp;
+		}
+	}
+
+	// Plan-type conflicts (Product-Interest vs contract tuple plan type). One review per family.
+	// Conflicts are family-level (the term was skipped, so no Quote/Deal owns them); route each as a
+	// Contact-only Manual Review [contract_product_conflict] so it is never silently dropped.
+	for each cf in conflictList
+	{
+		cfFamily = ifnull(cf.get("family"), "").toString().trim();
+		cfDetail = ifnull(cf.get("detail"), "").toString().trim();
+		automation.createManualReview(newContactId, "", "contract_product_conflict", "Lead Product Interest conflicts with the imported contract plan type for '" + cfFamily + "'. " + cfDetail + " No Quote was created for this term; reconcile the exact Product before bootstrapping.");
+		automation.logAutomationEvent("processLead", "Contacts", newContactId, "contract_product_conflict", cfFamily, {"detail":cfDetail});
+	}
+
+	// ---- 6a. Company Tier: the ACCOUNT is authoritative (SAFETY NET) ----
+	// Primary seeding now happens at Account create/reuse ABOVE (before the product fan-out) so
+	// processDeal(import_bootstrap) sees a live Account tier when deriving Quote_Target_ACV. This
+	// block remains as an idempotent safety net for paths that bypass the create/reuse seeding.
+	// Company_Tier is an Account-level attribute; Deal.Company_Tier is only a mirror/cache for the
+	// Target-ACV benchmark. Seed the Lead's tier onto the canonical ACCOUNT when the Account has
+	// none, so the Account becomes the live source of truth. processDeal §8a2 then keeps the Deal
+	// mirror in sync with the Account (including clearing it when the Account tier is removed) and
+	// derives the pipeline Amount from the Account tier. No conflict review: there is no manual
+	// Deal-level tier override, so the Account tier is always authoritative and never "conflicts".
+	if(accountId != "" && accountId != "null" && leadCompanyTier != "")
+	{
+		accTierRec = zoho.crm.getRecordById("Accounts", accountId.toLong());
+		accTierCur = ifnull(accTierRec.get("Company_Tier"), "").toString().trim();
+		if(accTierCur == "")
+		{
+			zoho.crm.updateRecord("Accounts", accountId.toLong(), {"Company_Tier": leadCompanyTier}, {"trigger": List()});
+			info "6a: seeded Account Company_Tier=" + leadCompanyTier + " on " + accountId;
+		}
+	}
+
+	// ---- 6b. Link the Contact to EACH resolved Product via the writable Products_Linked junction
+	//          (Contacts_X_Products / Products12) so the Contact carries product evidence for
+	//          activation. prodBuckets already covers BOTH Product_Interest AND the A/E/R
+	//          Quote_Plan_Products (collectProductEvidence reads both), so A/E/R-only imports also
+	//          give the Contact product evidence -> processContact (step 7) can resolve their
+	//          Product Deals and activate. Product_Interest_Staging is a READ-ONLY FORMULA mirror of
+	//          these links and must NEVER be written directly. Idempotent (no duplicate links);
+	//          unresolved SKUs are routed to Manual Review by the step-6 fan-out (never here). ----
+	if(newContactId != "" && newContactId != "null" && prodBuckets.size() > 0)
+	{
+		alreadyLinkedIds = List();
+		exConLinks = zoho.crm.getRelatedRecords("Products12", "Contacts", newContactId.toLong());
+		if(isNull(exConLinks) || exConLinks.size() == 0 || exConLinks.toString().startsWith("{\"code\""))
+		{
+			exConLinks = zoho.crm.getRelatedRecords("Products", "Contacts", newContactId.toLong());
+		}
+		if(!isNull(exConLinks) && exConLinks.size() > 0 && !exConLinks.toString().startsWith("{\"code\""))
+		{
+			for each exl in exConLinks
+			{
+				exlId = "";
+				if(!isNull(exl.get("id"))) { exlId = exl.get("id").toString(); }
+				exlProd = exl.get("Product_Details");
+				if(!isNull(exlProd) && !isNull(exlProd.get("id"))) { exlId = exlProd.get("id").toString(); }
+				exlPI = exl.get("Product_Interest");
+				if(!isNull(exlPI) && !isNull(exlPI.get("id"))) { exlId = exlPI.get("id").toString(); }
+				if(exlId != "") { alreadyLinkedIds.add(exlId); }
+			}
+		}
+		exJunctionLinks = zoho.crm.searchRecords("Contacts_X_Products", "(Contacts:equals:" + newContactId + ")");
+		if(!isNull(exJunctionLinks) && exJunctionLinks.size() > 0 && !exJunctionLinks.toString().startsWith("{\"code\""))
+		{
+			for each exj in exJunctionLinks
+			{
+				exjProdId = "";
+				exjPI = exj.get("Product_Interest");
+				if(!isNull(exjPI) && !isNull(exjPI.get("id"))) { exjProdId = exjPI.get("id").toString(); }
+				if(exjProdId != "" && !alreadyLinkedIds.contains(exjProdId)) { alreadyLinkedIds.add(exjProdId); }
+			}
+		}
+		for each lb in prodBuckets
+		{
+			lbProdId = ifnull(lb.get("product_id"), "").toString().trim();
+			if(lbProdId == "" || !lbProdId.matches("[0-9]+")) { continue; }
+			if(alreadyLinkedIds.contains(lbProdId)) { continue; }
+			linkPIMap = Map();
+			linkPIMap.put("Contacts", newContactId);
+			linkPIMap.put("Product_Interest", lbProdId);
+			linkPI = zoho.crm.createRecord("Contacts_X_Products", linkPIMap);
+			alreadyLinkedIds.add(lbProdId);
+			info "6b: linked Product '" + ifnull(lb.get("product_name"), lbProdId).toString() + "' (" + lbProdId + ") to Contact " + newContactId + " resp=" + linkPI;
+		}
+	}
+
+	// ---- 6c. Imported-contract bootstrap hand-off: REMOVED (v6-product-deal) ----
+	// The flat single-Deal import_bootstrap call and the iConflict/cConflict createAuxTask reviews
+	// that lived here are DELETED. The per-product fan-out (step 6) now performs, per resolved Product
+	// Deal, the import_bootstrap processDeal (when that bucket carries terms) and routes plan-type
+	// conflicts + unresolved evidence via createManualReview. There is no account-level Deal to host a
+	// single flat import call, and terms are encoded per-bucket by normalizeToProductQuoteTuples.
+
+	// ---- 7. Contact activation handoff ----
+	// The per-product fan-out (step 6) created the Product Deals and step 6b linked the Contact to
+	// each resolved Product, so the Contact now carries product evidence. Run processContact ONCE
+	// here so activation / [multi_product_sequence_ambiguous] evaluates AFTER that evidence exists.
+	// WF001b2 fires processContact on Contact CREATE -- before these links exist -- so that run
+	// returns mql_no_product_deal and never activates; the product fan-out now happens post-convert,
+	// which is why the old "do not call inline" guidance no longer holds. processContact dedups
+	// Sequence Activation Tasks and runs a duplicate sweep, so the concurrent WF001b2 run cannot
+	// create a second activation Task. A multi-product Decision Maker gets the ambiguity review,
+	// never an auto-picked sequence; a non-DM gets no activation.
+	if(newContactId != "" && newContactId != "null")
+	{
+		automation.processContact(newContactId);
+	}
+
+	// ---- 8. Account rollup (EXPLICIT -- does not depend on WF001c firing on Account edits) ----
+	// Now that every Product Deal + Quote exists and the Contact has been reconciled/activated,
+	// refresh Account.State / Account_Status directly. rollupAccountState reads each Deal via
+	// getRecordById (robust to getRelatedRecords field omission) and writes trigger-suppressed, so
+	// the Account lands at Prospect / Active Customer / Churned even though WF001c/processAccount
+	// does not re-fire on API Account edits in this org.
+	if(accountId != "" && accountId != "null")
+	{
+		automation.rollupAccountState(accountId);
+	}
+}

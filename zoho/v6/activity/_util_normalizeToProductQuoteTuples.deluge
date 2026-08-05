@@ -1,0 +1,226 @@
+string automation.normalizeToProductQuoteTuples(string moduleName, string recordId)
+{
+	// =========================================================================
+	// _util_normalizeToProductQuoteTuples   (VERSION: v6-product-quote-11field)
+	//
+	// THE engine that turns raw product evidence + structured contract terms into
+	// resolved, per-product quote tuples ready for the Product Deal / Quote layer.
+	//
+	// Steps:
+	//   pe = collectProductEvidence(module, id).raw   (interest names/keys)
+	//   legacy A/E/R contract terms are collected INLINE below (folded 2026-07-16
+	//   from the former single-caller _util_collectLegacyQuoteEvidence helper).
+	//   collectProductEvidence stays a helper (it is self-recursive).
+	//   1) resolve each interest name -> product bucket (or unresolved)
+	//   2) resolve each term family -> bucket (or unresolved + skip);
+	//      else ENCODE the term into that product's bucket.
+	//
+	// ENCODING (must match processDeal 5b parser EXACTLY): 11 "~"-joined fields
+	// in THIS order; every blank field becomes "_"; multiple terms for one
+	// product joined by ";".
+	//   0 quoteType   (from term.term: Acquisition|Expansion|Renewal)
+	//   1 family      (canonical product NAME)
+	//   2 planType    (term.type: Fixed|Flex|_)
+	//   3 brands      (term.brands: integer|_)
+	//   4 dateStart   (term.start: yyyy-MM-dd|_)
+	//   5 dateEnd     (term.end: yyyy-MM-dd|_)
+	//   6 acv         (term.acv: number|_)
+	//   7 freq        (term.freq: 4x/2x/1x per day|_)
+	//   8 tier        (always "Base")
+	//   9 dateRenewal (term.date_renewal: yyyy-MM-dd|_)
+	//  10 stage       (term.stage: Draft|Negotiation|...|Closed Lost|_)
+	//
+	// ACV: the A/E/R Plan Products group is SINGLE-select, so each term is
+	// single-product; ACV is always included when present (no multi-family
+	// blanking). pi_for_conflict is "" from the adapter, so no conflict fires.
+	//
+	// Returns a JSON string (parse with .toMap()):
+	//   {
+	//     "products":   [ { product_key, product_id, product_name,
+	//                       terms_encoded, has_terms } ],
+	//     "unresolved": [ { raw, reason } ],
+	//     "conflicts":  [ { family, detail } ]
+	//   }
+	// Buckets with no terms (interest-only) are valid (has_terms="false",
+	// terms_encoded="").
+	// =========================================================================
+	out = Map();
+	productsOut = List();
+	unresolved = List();
+	conflicts = List();
+	out.put("products", productsOut);
+	out.put("unresolved", unresolved);
+	out.put("conflicts", conflicts);
+
+	mod = ifnull(moduleName, "").toString().trim();
+	rid = ifnull(recordId, "").toString().replaceAll("zcrm_", "").trim();
+	if(mod == "" || rid == "" || !rid.matches("[0-9]+")) { return out.toString(); }
+
+	pe = automation.collectProductEvidence(mod, rid).toMap();
+	peRaw = ifnull(pe.get("raw"), List());
+
+	// ---- INLINED _util_collectLegacyQuoteEvidence (single-caller; folded 2026-07-16) ----
+	// Extract split-contract TERMS from the Lead A/E/R quote groups (Acquisition_/
+	// Expansion_/Renewal_). These group fields live ONLY on Leads, so non-Lead modules
+	// yield no terms. Per group, {P}Quote_Plan_Products (SINGLE picklist) gates emission;
+	// "term" carries the quote-type group name; tier is always "Base". rid is already
+	// validated numeric above. Locals prefixed lqe_ to stay isolated in this larger scope.
+	leTerms = List();
+	if(mod == "Leads")
+	{
+		lqe_lead = zoho.crm.getRecordById("Leads", rid.toLong());
+		if(!isNull(lqe_lead) && !isNull(lqe_lead.get("id")))
+		{
+			lqe_groups = {"Acquisition", "Expansion", "Renewal"};
+			for each lqe_grp in lqe_groups
+			{
+				lqe_p = lqe_grp + "_";
+
+				// Plan Products is a SINGLE picklist; strip bracket/quote noise if present.
+				lqe_famRaw = lqe_lead.get(lqe_p + "Quote_Plan_Products");
+				lqe_fam = "";
+				if(!isNull(lqe_famRaw))
+				{
+					lqe_fam = lqe_famRaw.toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll("\"", "").replaceAll("'", "").trim();
+				}
+				if(lqe_fam == "Jurnii Cortext") { lqe_fam = "Jurnii Cortex"; }
+				if(lqe_fam == "" || lqe_fam == "-None-" || lqe_fam == "null") { continue; }
+
+				lqe_type = ifnull(lqe_lead.get(lqe_p + "Quote_Plan_Type"), "").toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll("\"", "").trim();
+				if(lqe_type == "Flexible") { lqe_type = "Flex"; }
+
+				lqe_brands = ifnull(lqe_lead.get(lqe_p + "Quote_Plan_Brands"), "").toString().trim();
+				if(lqe_brands == "null") { lqe_brands = ""; }
+
+				lqe_startV = lqe_lead.get(lqe_p + "Quote_Contract_Date_Start");
+				lqe_start = ""; if(lqe_startV != null) { lqe_start = lqe_startV.toString().trim(); if(lqe_start.contains("T")) { lqe_start = lqe_start.getPrefix("T"); } }
+
+				lqe_endV = lqe_lead.get(lqe_p + "Quote_Contract_Date_End");
+				lqe_end = ""; if(lqe_endV != null) { lqe_end = lqe_endV.toString().trim(); if(lqe_end.contains("T")) { lqe_end = lqe_end.getPrefix("T"); } }
+
+				lqe_renewalV = lqe_lead.get(lqe_p + "Quote_Contract_Date_Renewal");
+				lqe_renewal = ""; if(lqe_renewalV != null) { lqe_renewal = lqe_renewalV.toString().trim(); if(lqe_renewal.contains("T")) { lqe_renewal = lqe_renewal.getPrefix("T"); } }
+				if(lqe_renewal == "null") { lqe_renewal = ""; }
+
+				lqe_acv = ifnull(lqe_lead.get(lqe_p + "Quote_ACV"), "").toString().trim();
+				if(lqe_acv == "null") { lqe_acv = ""; }
+
+				lqe_freq = ifnull(lqe_lead.get(lqe_p + "Quote_Plan_Frequency"), "").toString().trim();
+				if(lqe_freq == "-None-") { lqe_freq = ""; }
+
+				lqe_stage = ifnull(lqe_lead.get(lqe_p + "Quote_Stage"), "").toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll("\"", "").trim();
+				if(lqe_stage == "-None-" || lqe_stage == "null") { lqe_stage = ""; }
+
+				lqe_t = Map();
+				lqe_t.put("term", lqe_grp);
+				lqe_t.put("family", lqe_fam);
+				lqe_t.put("type", lqe_type);
+				lqe_t.put("brands", lqe_brands);
+				lqe_t.put("start", lqe_start);
+				lqe_t.put("end", lqe_end);
+				lqe_t.put("date_renewal", lqe_renewal);
+				lqe_t.put("acv", lqe_acv);
+				lqe_t.put("freq", lqe_freq);
+				lqe_t.put("tier", "Base");
+				lqe_t.put("stage", lqe_stage);
+				leTerms.add(lqe_t);
+			}
+		}
+	}
+
+	// buckets keyed by product_key; parallel maps preserve insertion + payload
+	bucketKeys = List();
+	bucketById = Map();      // product_key -> product_id
+	bucketByName = Map();    // product_key -> product_name (canonical)
+	bucketTerms = Map();     // product_key -> encoded terms string
+
+	// ---- (1) product-interest evidence -> buckets ----
+	for each nm in peRaw
+	{
+		name = ifnull(nm, "").toString().trim();
+		if(name == "") { continue; }
+		res = automation.resolveDealProduct(name).toMap();
+		if(ifnull(res.get("valid"), "false").toString() == "true")
+		{
+			pk = ifnull(res.get("product_key"), "").toString();
+			if(pk != "" && !bucketKeys.contains(pk))
+			{
+				bucketKeys.add(pk);
+				bucketById.put(pk, ifnull(res.get("product_id"), "").toString());
+				bucketByName.put(pk, ifnull(res.get("product_name"), "").toString());
+				bucketTerms.put(pk, "");
+			}
+		}
+		else
+		{
+			u = Map();
+			u.put("raw", name);
+			u.put("reason", ifnull(res.get("reason"), "product_unresolved").toString());
+			unresolved.add(u);
+		}
+	}
+
+	// ---- (2) contract terms -> resolve, encode into buckets ----
+	for each t in leTerms
+	{
+		fam = ifnull(t.get("family"), "").toString().trim();
+		if(fam == "") { continue; }
+		rr = automation.resolveDealProduct(fam).toMap();
+		if(ifnull(rr.get("valid"), "false").toString() != "true")
+		{
+			u = Map();
+			u.put("raw", fam);
+			u.put("reason", ifnull(rr.get("reason"), "product_unresolved").toString());
+			unresolved.add(u);
+			continue;
+		}
+
+		// ensure a bucket exists for this resolved product
+		pk = ifnull(rr.get("product_key"), "").toString();
+		if(pk == "") { continue; }
+		if(!bucketKeys.contains(pk))
+		{
+			bucketKeys.add(pk);
+			bucketById.put(pk, ifnull(rr.get("product_id"), "").toString());
+			bucketByName.put(pk, ifnull(rr.get("product_name"), "").toString());
+			bucketTerms.put(pk, "");
+		}
+
+		// gather + encode (single-select group: acv always included when present)
+		tQuoteType = ifnull(t.get("term"), "").toString().trim();
+		tType = ifnull(t.get("type"), "").toString().trim();
+		tBrands = ifnull(t.get("brands"), "").toString().trim();
+		tStart = ifnull(t.get("start"), "").toString().trim();
+		tEnd = ifnull(t.get("end"), "").toString().trim();
+		tAcv = ifnull(t.get("acv"), "").toString().trim();
+		tFreq = ifnull(t.get("freq"), "").toString().trim();
+		tTier = ifnull(t.get("tier"), "Base").toString().trim();
+		if(tTier == "") { tTier = "Base"; }
+		tRenewal = ifnull(t.get("date_renewal"), "").toString().trim();
+		tStage = ifnull(t.get("stage"), "").toString().trim();
+
+		// 11-field order: quoteType~family~planType~brands~start~end~acv~freq~tier~dateRenewal~stage
+		enc = if(tQuoteType != "", tQuoteType, "_") + "~" + ifnull(rr.get("product_name"), fam).toString() + "~" + if(tType != "", tType, "_") + "~" + if(tBrands != "", tBrands, "_") + "~" + if(tStart != "", tStart, "_") + "~" + if(tEnd != "", tEnd, "_") + "~" + if(tAcv != "", tAcv, "_") + "~" + if(tFreq != "", tFreq, "_") + "~" + tTier + "~" + if(tRenewal != "", tRenewal, "_") + "~" + if(tStage != "", tStage, "_");
+
+		existing = ifnull(bucketTerms.get(pk), "").toString();
+		if(existing != "") { bucketTerms.put(pk, existing + ";" + enc); } else { bucketTerms.put(pk, enc); }
+	}
+
+	// ---- assemble products output ----
+	for each pk in bucketKeys
+	{
+		p = Map();
+		p.put("product_key", pk);
+		p.put("product_id", ifnull(bucketById.get(pk), "").toString());
+		p.put("product_name", ifnull(bucketByName.get(pk), "").toString());
+		encTerms = ifnull(bucketTerms.get(pk), "").toString();
+		p.put("terms_encoded", encTerms);
+		p.put("has_terms", if(encTerms != "", "true", "false"));
+		productsOut.add(p);
+	}
+
+	out.put("products", productsOut);
+	out.put("unresolved", unresolved);
+	out.put("conflicts", conflicts);
+	return out.toString();
+}

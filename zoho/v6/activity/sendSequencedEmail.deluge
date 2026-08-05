@@ -1,0 +1,431 @@
+string automation.sendSequencedEmail(string contactIdStr, string dealIdStr, string stage, int step, string kind, string existingAuditTaskId, string openerVariant)
+{
+	// =========================================================================
+	// sendSequencedEmail  (sole email owner)
+	//
+	// Resolves ONE canonical template, sends it to the Contact, and produces exactly
+	// ONE Completed "Email Sent" audit Task — AFTER a confirmed send. Owns ALL email
+	// idempotency, template resolution, the Send Mail API call, and audit Task
+	// creation/update. Absorbs _util_buildSendKey, _util_sendTemplateToContact,
+	// _util_resolveTemplate.
+	//
+	// existingAuditTaskId:
+	//   ""      -> immediate send; create a NEW Completed audit Task on success.
+	//   taskId  -> scheduled send; UPDATE that wake-up Task into the audit record.
+	//
+	// Returns the Zoho message_id on success, else "".
+	// =========================================================================
+
+	info "VERSION: v6-contact-centric";
+
+	contactId = 0;
+	if(!isNull(contactIdStr) && contactIdStr != "") { contactId = contactIdStr.toLong(); }
+	dealId = 0;
+	if(!isNull(dealIdStr) && dealIdStr != "") { dealId = dealIdStr.toLong(); }
+	auditTaskId = ifnull(existingAuditTaskId, "").toString();
+
+	automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "entry", "in_progress", {"deal":dealId.toString(), "stage":stage, "step":step, "kind":kind, "existingTask":auditTaskId});
+
+	if(contactId == 0 || dealId == 0)
+	{
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "guard", "skip_missing_ids", {"deal":dealId.toString()});
+		return "";
+	}
+
+	// ---- resolve canonical template key (absorbed _util_resolveTemplate) ----
+	// key = <stage-slug>:<step>:<kind>. Sequence_Type is NOT in the key (one shared chain).
+	k = ifnull(kind, "").toString().trim();
+	stageRaw = ifnull(stage, "").toString().trim();
+	slugMap = Map();
+	slugMap.put("Marketing Consent",    "marketing-consent");
+	slugMap.put("Demo Booking",         "demo-booking");
+	slugMap.put("Demo Confirmation",    "demo-confirmation");
+	slugMap.put("Demo Hosted",          "demo-hosted");
+	slugMap.put("Proposal Preparation", "proposal-preparation");
+	slugMap.put("Commercial Agreement", "commercial-agreement");
+	slugMap.put("Onboarding",           "onboarding");
+	slugMap.put("Renewal",              "renewal");
+	stageSlug = ifnull(slugMap.get(stageRaw), "").toString();
+
+	canonicalKey = "";
+	if(k == "demo_confirmation")                    { canonicalKey = "demo-confirmation:0:confirmation"; }
+	else if(k == "demo_reminder")                   { canonicalKey = "demo-confirmation:0:reminder"; }
+	else if(k == "demo_no_show")                    { canonicalKey = "demo-confirmation:0:no-show"; }
+	else if(k == "demo_post_demo")                  { canonicalKey = "proposal-preparation:0:post-demo"; }
+	else if(k == "commercials_terms")               { canonicalKey = "commercial-agreement:0:proposal-sent"; }
+	else if(k == "commercials_signed_confirmation") { canonicalKey = "onboarding:0:signed-confirmation"; }
+	else if(stageSlug != "")
+	{
+		// email entry (opener) shares :1:initial; post-cadence terminal shares :K:final.
+		if(k == "opener")        { canonicalKey = stageSlug + ":1:initial"; }
+		else if(k == "postcall") { canonicalKey = stageSlug + ":5:final"; }
+		else if(k == "cadence" && step >= 1 && step <= 5)
+		{
+			kindWord = "follow-up";
+			if(step == 1)      { kindWord = "initial"; }
+			else if(step == 5) { kindWord = "final"; }
+			canonicalKey = stageSlug + ":" + step + ":" + kindWord;
+		}
+	}
+
+	// ---- V5 TEMPLATE REGISTRY (generated 2026-06-15) — canonical key -> Zoho template id ----
+	templateRegistry = Map();
+	templateRegistry.put("marketing-consent:1:initial", "991103000001478002");
+	templateRegistry.put("marketing-consent:2:follow-up", "991103000001467002");
+	templateRegistry.put("marketing-consent:3:follow-up", "991103000001484001");
+	templateRegistry.put("marketing-consent:4:follow-up", "991103000001474007");
+	templateRegistry.put("marketing-consent:5:final", "991103000001485001");
+	templateRegistry.put("demo-booking:1:initial", "991103000001476004");
+	templateRegistry.put("demo-booking:2:follow-up", "991103000001478005");
+	templateRegistry.put("demo-booking:3:follow-up", "991103000001486001");
+	templateRegistry.put("demo-booking:4:follow-up", "991103000001487001");
+	templateRegistry.put("demo-booking:5:final", "991103000001478008");
+	templateRegistry.put("demo-hosted:1:initial", "991103000001476007");
+	templateRegistry.put("demo-hosted:2:follow-up", "991103000001470002");
+	templateRegistry.put("demo-hosted:3:follow-up", "991103000001477003");
+	templateRegistry.put("demo-hosted:4:follow-up", "991103000001471007");
+	templateRegistry.put("demo-hosted:5:final", "991103000001488001");
+	templateRegistry.put("commercial-agreement:1:initial", "991103000001480002");
+	templateRegistry.put("commercial-agreement:2:follow-up", "991103000001469004");
+	templateRegistry.put("commercial-agreement:3:follow-up", "991103000001486004");
+	templateRegistry.put("commercial-agreement:4:follow-up", "991103000001483002");
+	templateRegistry.put("commercial-agreement:5:final", "991103000001480005");
+	templateRegistry.put("renewal:1:initial", "991103000001486007");
+	templateRegistry.put("renewal:2:follow-up", "991103000001489001");
+	templateRegistry.put("renewal:3:follow-up", "991103000001484004");
+	templateRegistry.put("renewal:4:follow-up", "991103000001486010");
+	templateRegistry.put("renewal:5:final", "991103000001484007");
+	templateRegistry.put("demo-confirmation:0:confirmation", "991103000001474010");
+	templateRegistry.put("demo-confirmation:0:reminder", "991103000001487004");
+	templateRegistry.put("demo-confirmation:0:no-show", "991103000001476010");
+	templateRegistry.put("proposal-preparation:0:post-demo", "991103000001484010");
+	templateRegistry.put("commercial-agreement:0:proposal-sent", "991103000001475003");
+	templateRegistry.put("onboarding:0:signed-confirmation", "991103000001488004");
+	// ---- Warm/Cold OPENER variants (created 2026-07-20). Key = <base opener key>:<variant>.
+	//      Selected only for kind == "opener" via the Activation Task's latest Note (see the
+	//      variant override below). The base :1:initial key still drives SendKey + audit, so
+	//      the variant only swaps the template id — exactly one opener per activation. ----
+	templateRegistry.put("marketing-consent:1:initial:warm", "991103000002749002");
+	templateRegistry.put("marketing-consent:1:initial:cold", "991103000002750001");
+	templateRegistry.put("demo-booking:1:initial:warm", "991103000002751001");
+	templateRegistry.put("demo-booking:1:initial:cold", "991103000002752001");
+	templateRegistry.put("demo-hosted:1:initial:warm", "991103000002753001");
+	templateRegistry.put("demo-hosted:1:initial:cold", "991103000002749005");
+	templateRegistry.put("commercial-agreement:1:initial:warm", "991103000002754001");
+	templateRegistry.put("commercial-agreement:1:initial:cold", "991103000002755001");
+	templateRegistry.put("renewal:1:initial:warm", "991103000002756001");
+	templateRegistry.put("renewal:1:initial:cold", "991103000002757001");
+	templateId = ifnull(templateRegistry.get(canonicalKey), "").toString();
+
+	// ---- missing/invalid template: sole owner of this handling (KISS for every caller) ----
+	if(canonicalKey == "" || templateId == "")
+	{
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "guard", "template_missing", {"stage":stage, "step":step, "kind":kind, "key":canonicalKey});
+		automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "Missing/invalid email template for key '" + canonicalKey + "' (stage=" + stage + ", step=" + step + ", kind=" + kind + ").");
+		return "";
+	}
+
+	// ---- OPENER Warm/Cold VARIANT OVERRIDE (first email only; idempotency-safe) ----
+	// Swaps ONLY the template id for the opener; canonicalKey (and thus SendKey + the audit
+	// Task) is unchanged, so exactly one opener sends per activation regardless of variant.
+	// The variant is chosen upstream from the Activation Task's latest Note; a both-value
+	// conflict never routes here (handleTaskCompletion blocks activation), so only
+	// warm/cold/"" reach this point. A missing variant template falls back to the base opener.
+	openerVar = ifnull(openerVariant, "").toString().trim().toLowerCase();
+	if(k == "opener" && (openerVar == "warm" || openerVar == "cold"))
+	{
+		variantKey = canonicalKey + ":" + openerVar;
+		variantId = ifnull(templateRegistry.get(variantKey), "").toString();
+		if(variantId != "")
+		{
+			templateId = variantId;
+			automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "opener_variant", "selected_" + openerVar, {"key":canonicalKey, "variantKey":variantKey, "templateId":templateId});
+		}
+		else
+		{
+			automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "opener_variant", "fallback_default_missing_" + openerVar, {"key":canonicalKey, "variantKey":variantKey, "templateId":templateId});
+		}
+	}
+
+	// ---- SendKey (absorbed _util_buildSendKey) — key-based, NOT the volatile template id ----
+	sendKey = contactId.toString() + "|" + dealId.toString() + "|" + canonicalKey;
+
+	// ---- idempotency: a Completed "Email Sent" audit with this SendKey already exists? ----
+	existingTasks = zoho.crm.getRelatedRecords("Tasks", "Deals", dealId);
+	if(isNull(existingTasks) || existingTasks.size() == 0 || existingTasks.toString().startsWith("{\"code\""))
+	{
+		existingTasks = zoho.crm.searchRecords("Tasks", "(What_Id:equals:" + dealId + ")");
+	}
+	if(!isNull(existingTasks) && existingTasks.size() > 0 && !existingTasks.toString().startsWith("{\"code\""))
+	{
+		for each tk in existingTasks
+		{
+			if(tk.get("id").toString() != auditTaskId && ifnull(tk.get("Status"), "").toString() == "Completed" && ifnull(tk.get("Task_Type"), "").toString() == "Email Sent" && ifnull(tk.get("Description"), "").toString().contains("SendKey: " + sendKey))
+			{
+				automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "idempotency_skip", "already_sent", {"sendKey":sendKey});
+				return "";
+			}
+		}
+	}
+
+	// ---- contact and send-time guards ----
+	// ROBUSTNESS: a deeply-nested dispatch (the commercial:signed side email runs
+	// Call -> routeContactSequence -> processDeal -> routeContactSequence -> here, one level deeper
+	// than commercial:sent) can make the native getRecordById return null, which previously DROPPED
+	// the send SILENTLY (no log, no review) — this is how commercials_signed_confirmation went
+	// missing. Fall back to the out-of-process REST GET (unaffected by the nested-runtime object
+	// limit), and never fail silently: raise a review if the Contact still cannot be read.
+	contact = zoho.crm.getRecordById("Contacts", contactId);
+	if(isNull(contact) || isNull(contact.get("id")))
+	{
+		crReadResp = invokeurl
+		[
+			url: "https://www.zohoapis.eu/crm/v6/Contacts/" + contactId
+			type: GET
+			connection: "zoho_crm"
+		];
+		if(!isNull(crReadResp) && !isNull(crReadResp.get("data")) && crReadResp.get("data").size() > 0) { contact = crReadResp.get("data").get(0); }
+		crRecovered = "false";
+		if(!isNull(contact) && !isNull(contact.get("id"))) { crRecovered = "true"; }
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "contact_read_fallback", crRecovered, {"deal":dealId.toString(), "key":canonicalKey});
+	}
+	if(isNull(contact) || isNull(contact.get("id")))
+	{
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "guard", "contact_unreadable", {"deal":dealId.toString(), "key":canonicalKey});
+		automation.createManualReview(contactId.toString(), dealId.toString(), "email_contact_unreadable", "Sequenced email '" + canonicalKey + "' was not sent: the Contact could not be read at send time (native getRecordById + REST GET both returned null, typically a deeply-nested dispatch). Re-trigger to send.");
+		return "";
+	}
+
+	// =========================================================================
+	// SEND-TIME ACTIVATION GATE — independent of the caller.
+	//
+	// INVARIANT: no automated sequence email may be sent until the Contact's
+	// activation Task has been explicitly completed with a valid Task Sequence Type.
+	//
+	// This re-reads the authoritative evidence itself rather than trusting the
+	// caller, because the caller is exactly what failed: routeContactSequence sent
+	// onboarding:0:signed-confirmation from OUTSIDE its own dispatch gate. Any
+	// second gate that trusts its arguments would have passed that call through.
+	// Sequence_Activated_At is written only by routeContactSequence's activate:*
+	// block; blank means activation never happened, whatever the Contact's
+	// Sequence_State / Sequence_Type / Stage claim.
+	//
+	// Blocked = NO send, NO audit Task, NO sequence advance, and a visible Manual
+	// Review naming the contact, the attempted step and the missing condition.
+	// =========================================================================
+	activatedAt = ifnull(contact.get("Sequence_Activated_At"), "").toString().trim();
+	if(activatedAt == "")
+	{
+		blockedSeqState = ifnull(contact.get("Sequence_State"), "").toString();
+		blockedSeqType = ifnull(contact.get("Sequence_Type"), "").toString();
+		// Caller attribution: Deluge cannot introspect its call stack, so derive the
+		// origin from the call's own shape. Each kind is reachable from exactly one
+		// dispatch site, and a non-blank existingAuditTaskId only ever comes from the
+		// scheduled-send wake-up path.
+		callerHint = "routeContactSequence (cadence dispatch)";
+		if(auditTaskId != "")                           { callerHint = "sendScheduledEmailFromTask (Task " + auditTaskId + ")"; }
+		else if(k == "commercials_signed_confirmation") { callerHint = "routeContactSequence (commercial:signed side email)"; }
+		else if(k == "commercials_terms")               { callerHint = "routeContactSequence (commercial:sent side email)"; }
+		else if(k == "demo_reminder")                   { callerHint = "sendDemoReminder (scheduled)"; }
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "guard", "blocked_not_activated", {"deal":dealId.toString(), "key":canonicalKey, "stage":stage, "step":step, "kind":kind, "seq_state":blockedSeqState, "seq_type":blockedSeqType, "caller":callerHint});
+		automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "[send_blocked_not_activated] Blocked a sequenced email to this Contact: attempted step '" + canonicalKey + "' (stage=" + stage + ", step=" + step + ", kind=" + kind + "), called from " + callerHint + ". Missing condition: Sequence_Activated_At is blank — the Sequence Activation Task was never completed with a valid Task Sequence Type. Contact reports Sequence_State=" + blockedSeqState + " / Sequence_Type=" + blockedSeqType + ". No email was sent and no sequence state was advanced. To send: complete the Contact's Sequence Activation Task (Task_Sequence_Type = Email/Call/Manual, Task_State = Won).");
+		return "";
+	}
+
+	contactEmail = ifnull(contact.get("Email"), "").toString();
+	if(contactEmail == "")
+	{
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "guard", "no_contact_email", {"key":canonicalKey});
+		automation.createManualReview(contactId.toString(), dealId.toString(), "email_no_recipient", "Sequenced email '" + canonicalKey + "' was not sent: the Contact has no Email address. Add an email, then re-trigger.");
+		return "";
+	}
+	// These emails are B2B sales, pipeline, transactional, or operational emails.
+	// They are intentionally not gated by Contacts.Marketing_Consent.
+	// Marketing_Consent records affirmative consent for future general-marketing
+	// campaigns only. A future promotional campaign sender must require
+	// Marketing_Consent == true. The no-recipient guard above and all applicable
+	// suppression, unsubscribe, opt-out, invalid-address, and DNC controls remain
+	// authoritative where implemented.
+
+	// ---- "from" = Deal Owner (absorbed _util_sendTemplateToContact) ----
+	deal = zoho.crm.getRecordById("Deals", dealId);
+
+	// PIPELINE DEFENCE (defence-in-depth): a Partnership (or unresolved) Deal must never send a
+	// B2B sequence email, even if an upstream gate is bypassed. Keyed on Deal_Product_Key.
+	// ROBUSTNESS: Deluge getRecordById can return the Deal with Deal_Product_Key BLANK in deeply-
+	// nested runs (e.g. the commercial:signed side email dispatched via
+	// Call -> routeContactSequence -> processDeal -> routeContactSequence). A blank key makes
+	// pipelineForProductKey("") resolve non-B2B and would DROP a legitimate B2B send silently, which
+	// is exactly how commercials_signed_confirmation went missing. When the key reads blank, fall
+	// back to the REST-backed resolveDealPipeline before deciding (never guess a template).
+	sendPipeline = "B2B";
+	pipelineVia = "default";
+	if(!isNull(deal) && !isNull(deal.get("id")))
+	{
+		sendDpk = ifnull(deal.get("Deal_Product_Key"), "").toString().trim();
+		if(sendDpk != "")
+		{
+			sendPipeline = automation.pipelineForProductKey(sendDpk);
+			pipelineVia = "product_key";
+		}
+		else
+		{
+			sendPipeline = automation.resolveDealPipeline(dealId.toString());
+			pipelineVia = "rest_fallback";
+			automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "pipeline_fallback", ifnull(sendPipeline, "").toString(), {"deal":dealId.toString(), "key":canonicalKey, "reason":"blank_deal_product_key"});
+		}
+	}
+	if(sendPipeline != "B2B")
+	{
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "guard", "blocked_non_b2b_pipeline", {"deal":dealId.toString(), "pipeline":ifnull(sendPipeline, "").toString(), "via":pipelineVia, "key":canonicalKey});
+		// Genuine Partnership block is expected and stays silent; an UNRESOLVED pipeline means the
+		// send was dropped without a clean decision -> surface a review rather than fail silently.
+		if(sendPipeline == "" || sendPipeline == "Unresolved" || sendPipeline == "-None-")
+		{
+			automation.createManualReview(contactId.toString(), dealId.toString(), "email_pipeline_unresolved", "Sequenced email '" + canonicalKey + "' was not sent because the Deal pipeline could not be resolved (got '" + ifnull(sendPipeline, "").toString() + "', via " + pipelineVia + "). Verify Deal_Product_Key / pipeline, then re-trigger.");
+		}
+		return "";
+	}
+
+	ownerEmail = "";
+	ownerName = "";
+	ownerId = "";
+	if(!isNull(deal) && !isNull(deal.get("id")))
+	{
+		ownerLookup = deal.get("Owner");
+		if(!isNull(ownerLookup))
+		{
+			ownerEmail = ifnull(ownerLookup.get("email"), "").toString();
+			ownerName = ifnull(ownerLookup.get("name"), "").toString();
+			if(!isNull(ownerLookup.get("id"))) { ownerId = ownerLookup.get("id").toString(); }
+		}
+	}
+	if(ownerEmail == "") { ownerEmail = "timothy@jurnii.io"; ownerName = "Timothy Solomon"; }
+
+	sendItem = Map();
+	fromMap = Map();
+	fromMap.put("email", ownerEmail);
+	if(ownerName != "") { fromMap.put("user_name", ownerName); }
+	sendItem.put("from", fromMap);
+	toList = List();
+	toEntry = Map();
+	toEntry.put("email", contactEmail);
+	toList.add(toEntry);
+	sendItem.put("to", toList);
+	templateRef = Map();
+	templateRef.put("id", templateId);
+	sendItem.put("template", templateRef);
+	dataList = List();
+	dataList.add(sendItem);
+	sendPayload = Map();
+	sendPayload.put("data", dataList);
+
+	sendResp = null;
+	try
+	{
+		sendResp = invokeurl
+		[
+			url    : "https://www.zohoapis.eu/crm/v3/Contacts/" + contactId + "/actions/send_mail"
+			type   : POST
+			parameters : sendPayload.toString()
+			headers : {"Content-Type":"application/json"}
+			connection: "zoho_crm"
+		];
+	}
+	catch (e)
+	{
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "send", "invokeurl_failed", {"error":e.toString(), "to":contactEmail, "template":canonicalKey, "templateId":templateId});
+		sendResp = null;
+	}
+
+	sentMessageId = "";
+	try
+	{
+		if(!isNull(sendResp) && sendResp.toString().startsWith("{") && !isNull(sendResp.get("data")) && sendResp.get("data").size() > 0)
+		{
+			firstResult = sendResp.get("data").get(0);
+			if(!isNull(firstResult.get("details")) && firstResult.get("details").get("message_id") != null)
+			{
+				sentMessageId = firstResult.get("details").get("message_id").toString();
+			}
+		}
+	}
+	catch (e)
+	{
+		sentMessageId = "";
+	}
+
+	if(sentMessageId == "")
+	{
+		// failure: never create a successful audit; leave a scheduled Task retryable.
+		if(auditTaskId != "")
+		{
+			oldDesc = "";
+			oldT = zoho.crm.getRecordById("Tasks", auditTaskId.toLong());
+			if(!isNull(oldT)) { oldDesc = ifnull(oldT.get("Description"), "").toString(); }
+			zoho.crm.updateRecord("Tasks", auditTaskId.toLong(), {"Description": oldDesc + "\nSend failed at " + zoho.currenttime.toString() + " (retryable)."});
+		}
+		// sole owner of invalid-template handling: surface a visible Manual Review on Send-Mail error
+		automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "Send Mail API failed for key '" + canonicalKey + "' (templateId " + templateId + "); see logs.");
+		automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "send", "failed", {"template":canonicalKey, "templateId":templateId, "sendKey":sendKey});
+		return "";
+	}
+
+	// ---- success: one audit Task ----
+	// activity mirror fields (automation-owned) for the email audit Task
+	emDeal = zoho.crm.getRecordById("Deals", dealId);
+	emPipeline = "";
+	emOpp = "";
+	if(!isNull(emDeal) && !isNull(emDeal.get("id")))
+	{
+		// F3 FIX: Deluge getRecordById omits the special Pipeline field; resolve via the shared
+		// REST-backed resolver (never emDeal.get("Pipeline"), which returns blank).
+		emPipeline = automation.resolveDealPipeline(dealId.toString());
+		emOpp = ifnull(emDeal.get("Stage"), "").toString();
+	}
+	auditDesc = "SendKey: " + sendKey + "\nMessage ID: " + sentMessageId;
+	if(auditTaskId != "")
+	{
+		// scheduled path: turn the wake-up Task INTO the audit record
+		upd = Map();
+		upd.put("Status", "Completed");
+		upd.put("Task_Type", "Email Sent");
+		upd.put("Task_Sequence_Stage", ifnull(stage, "").toString());
+		upd.put("Blocks_Sequence", "No");
+		upd.put("Subject", "Email Sent: " + canonicalKey);
+		upd.put("Description", auditDesc);
+		// email-as-Task: SEND completed (native Status), result pending reply -> Task_State Open
+		upd.put("Task_State", "Open");
+		upd.put("Task_Status", "New");
+		if(ifnull(stage, "").toString() != "") { upd.put("Task_Stage", stage); }
+		if(emPipeline != "") { upd.put("Task_Pipeline", emPipeline); }
+		if(emOpp != "") { upd.put("Task_Opportunity", emOpp); }
+		zoho.crm.updateRecord("Tasks", auditTaskId.toLong(), upd);
+	}
+	else
+	{
+		// immediate path: create a new Completed audit Task
+		tkMap = Map();
+		tkMap.put("Subject", "Email Sent: " + canonicalKey);
+		tkMap.put("Status", "Completed");
+		tkMap.put("What_Id", dealId);
+		tkMap.put("$se_module", "Deals");
+		tkMap.put("Who_Id", contactId);
+		tkMap.put("Task_Sequence_Managed", true);
+		tkMap.put("Task_Type", "Email Sent");
+		tkMap.put("Task_Sequence_Stage", ifnull(stage, "").toString());
+		tkMap.put("Blocks_Sequence", "No");
+		tkMap.put("Description", auditDesc);
+		// email-as-Task: SEND completed (native Status), result pending reply -> Task_State Open
+		tkMap.put("Task_State", "Open");
+		tkMap.put("Task_Status", "New");
+		if(ifnull(stage, "").toString() != "") { tkMap.put("Task_Stage", stage); }
+		if(emPipeline != "") { tkMap.put("Task_Pipeline", emPipeline); }
+		if(emOpp != "") { tkMap.put("Task_Opportunity", emOpp); }
+		if(ownerId != "") { tkMap.put("Owner", ownerId); }
+		zoho.crm.createRecord("Tasks", tkMap);
+	}
+
+	automation.logAutomationEvent("sendSequencedEmail", "Contacts", contactId.toString(), "send", "complete", {"template":canonicalKey, "templateId":templateId, "message_id":sentMessageId, "sendKey":sendKey});
+	return sentMessageId;
+}

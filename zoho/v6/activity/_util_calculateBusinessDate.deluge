@@ -1,0 +1,89 @@
+string automation.calculateBusinessDate(date startDate, int offset, string calcMode)
+{
+	// =========================================================================
+	// _util_calculateBusinessDate
+	//
+	// Compute a future or past datetime offset by N days, skipping weekends when
+	// in business-day mode. Used by routeContactSequence / handle* / send*
+	// to schedule next actions, demo reminders, and commercial follow-ups.
+	//
+	// mode values:
+	//   "business_days"          - skip Saturday and Sunday
+	//   "business_days_minus_AM" - same as business_days, then snap time to 09:00 local
+	//   "calendar_days"          - straight calendar add (no skipping)
+	//
+	// offset may be negative (e.g., -1 for "one business day before").
+	// =========================================================================
+
+	info "VERSION: v6-shared-utility";
+
+	if(isNull(startDate))
+	{
+		startDate = zoho.currentdate;
+	}
+	
+	if(isNull(calcMode))
+	{
+		calcMode = "business_days";
+	}
+	else if(calcMode == "")
+	{
+		calcMode = "business_days";
+	}
+
+	resStr = "";
+
+	if(calcMode == "calendar_days")
+	{
+		resDate = startDate.addDay(offset);
+		datePortion = resDate.toString("yyyy-MM-dd");
+		resStr = datePortion + " 00:00:00";
+	}
+	else
+	{
+		stepDir = 1;
+		absOffset = offset;
+		if(offset < 0)
+		{
+			stepDir = -1;
+			absOffset = 0 - offset;
+		}
+
+		iterDate = startDate;
+		daysAdded = 0;
+		
+		// Zoho Deluge does not support 'while' loops. 
+		// Using a static list for up to 100 iterations.
+		counterList = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100};
+		
+		for each  iterStep in counterList
+		{
+			if(daysAdded >= absOffset)
+			{
+				break;
+			}
+			
+			iterDate = iterDate.addDay(stepDir);
+			dayName = iterDate.toString("EEEE");
+			if(dayName != "Saturday")
+			{
+				if(dayName != "Sunday")
+				{
+					daysAdded = daysAdded + 1;
+				}
+			}
+		}
+
+		datePortionIter = iterDate.toString("yyyy-MM-dd");
+		if(calcMode == "business_days_minus_AM")
+		{
+			resStr = datePortionIter + " 09:00:00";
+		}
+		else
+		{
+			resStr = datePortionIter + " 00:00:00";
+		}
+	}
+
+	return resStr;
+}

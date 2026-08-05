@@ -1,0 +1,181 @@
+string automation.matchDraftQuotes(string dealIdStr, string productId, string oppType, string activityKey, string extraQuoteIdsCsv)
+{
+	// =========================================================================
+	// _util_matchDraftQuotes   (canonical Draft-Quote resolver)
+	//
+	// ONE idempotent matcher for both newly-created and previously-created Draft
+	// Quotes. Used by handleTaskCompletion's Draft Commercials fallback (reuse-vs-
+	// create) AND its final package verification, so the two never disagree.
+	//
+	// A Quote is a MATCH only when ALL of these hold EXACTLY:
+	//   - belongs to this Deal
+	//   - Opportunity_Type == oppType
+	//   - Quote_Stage == "Draft"
+	//   - Quote_Product == productId
+	//   - has >= 1 Quoted_Items line for productId with a valid ( > 0 ) price
+	//   - the normalised Quote_Applied_Activity_Keys contains the EXACT activityKey
+	//
+	// REUSABLE = matches everything above EXCEPT the activity key (key absent). The
+	// caller may adopt a single reusable Quote by appending the key; it never invents
+	// one and never picks arbitrarily.
+	//
+	// Robustness (the two bugs this fixes):
+	//   RETRIEVAL — invokeurl v6 GET is read-after-write for a quote created THIS run;
+	//     a native getRecordById fallback covers existing quotes on re-run (the Draft
+	//     path previously had NO fallback and silently skipped the quote).
+	//   APPLIED-KEY PARSING — this org stores the key delimiter as a LITERAL backslash-n
+	//     (verified live), so splitting on "\n" alone never matched a key written by an
+	//     earlier run. Literal "\n", CRLF and CR are all normalised before the split.
+	//
+	// extraQuoteIdsCsv: comma-separated quote ids to also evaluate (e.g. a quote created
+	//   THIS run whose Deal-Quotes related list may still lag). "" if none.
+	//
+	// Returns JSON (parse with .toMap()):
+	//   {"matched":[id,...], "reusable":[id,...], "candidates":[{"id","accepted","reason"},...]}
+	// =========================================================================
+	dealId = 0;
+	if(!isNull(dealIdStr) && dealIdStr != "") { dealId = dealIdStr.toLong(); }
+	nlChar = hextoText("0A");           // real newline
+	litBsN = hextoText("5C5C6E");       // regex "\\n" -> matches a LITERAL backslash-n delimiter
+	crlf = hextoText("0D0A");
+	crChar = hextoText("0D");
+
+	matched = List();
+	reusable = List();
+	candidates = List();
+
+	pid = ifnull(productId, "").toString().trim();
+	oppKey = ifnull(oppType, "").toString().trim();
+	akey = ifnull(activityKey, "").toString().trim();
+	if(dealId == 0 || pid == "")
+	{
+		res0 = Map();
+		res0.put("matched", matched);
+		res0.put("reusable", reusable);
+		res0.put("candidates", candidates);
+		return res0.toString();
+	}
+
+	// ---- candidate id set: Deal-Quotes related list + any explicitly-passed ids ----
+	candidateIds = List();
+	dealQuotes = zoho.crm.getRelatedRecords("Quotes", "Deals", dealId);
+	if(!isNull(dealQuotes) && dealQuotes.size() > 0 && !dealQuotes.toString().startsWith("{\"code\""))
+	{
+		for each dq in dealQuotes
+		{
+			dqid = "";
+			if(!isNull(dq.get("id"))) { dqid = dq.get("id").toString(); }
+			if(dqid != "" && !candidateIds.contains(dqid)) { candidateIds.add(dqid); }
+		}
+	}
+	extraCsv = ifnull(extraQuoteIdsCsv, "").toString().trim();
+	if(extraCsv != "")
+	{
+		for each ex in extraCsv.toList(",")
+		{
+			exId = ifnull(ex, "").toString().trim();
+			if(exId != "" && !candidateIds.contains(exId)) { candidateIds.add(exId); }
+		}
+	}
+
+	for each qId in candidateIds
+	{
+		// ---- robust retrieval: invokeurl (fresh, read-after-write) then getRecordById (existing) ----
+		qFull = Map();
+		qResp = invokeurl
+		[
+			url: "https://www.zohoapis.eu/crm/v6/Quotes/" + qId
+			type: GET
+			connection: "zoho_crm"
+		];
+		if(!isNull(qResp) && !isNull(qResp.get("data")) && qResp.get("data").size() > 0) { qFull = qResp.get("data").get(0); }
+		if(isNull(qFull) || isNull(qFull.get("id"))) { qFull = zoho.crm.getRecordById("Quotes", qId.toLong()); }
+		if(isNull(qFull) || isNull(qFull.get("id")))
+		{
+			cU = Map();
+			cU.put("id", qId);
+			cU.put("accepted", false);
+			cU.put("reason", "unreadable");
+			candidates.add(cU);
+			continue;
+		}
+
+		reason = "";
+		// deal
+		qDealId = "";
+		qDeal = qFull.get("Deal_Name");
+		if(!isNull(qDeal) && !isNull(qDeal.get("id"))) { qDealId = qDeal.get("id").toString(); }
+		if(qDealId != dealId.toString()) { reason = "deal_mismatch:" + qDealId; }
+		// opportunity type
+		qOpp = ifnull(qFull.get("Opportunity_Type"), "").toString();
+		if(reason == "" && qOpp != oppKey) { reason = "opp_mismatch:" + qOpp; }
+		// stage
+		qStage = ifnull(qFull.get("Quote_Stage"), "").toString();
+		if(reason == "" && qStage != "Draft") { reason = "stage_not_draft:" + qStage; }
+		// product
+		qProdId = "";
+		qProd = qFull.get("Quote_Product");
+		if(!isNull(qProd) && !isNull(qProd.get("id"))) { qProdId = qProd.get("id").toString(); }
+		if(reason == "" && qProdId != pid) { reason = "product_mismatch:" + qProdId; }
+		// >= 1 valid priced line for the product
+		if(reason == "")
+		{
+			pricedLine = false;
+			qLines = qFull.get("Quoted_Items");
+			if(!isNull(qLines) && qLines.size() > 0)
+			{
+				for each ql in qLines
+				{
+					lpId = "";
+					lp = ql.get("Product_Name");
+					if(!isNull(lp) && !isNull(lp.get("id"))) { lpId = lp.get("id").toString(); }
+					lTotal = ifnull(ql.get("Total"), 0);
+					lNet = ifnull(ql.get("Net_Total"), 0);
+					lList = ifnull(ql.get("List_Price"), 0);
+					if(lpId == pid && (lTotal > 0 || lNet > 0 || lList > 0)) { pricedLine = true; }
+				}
+			}
+			if(pricedLine != true) { reason = "no_valid_priced_line"; }
+		}
+		// exact activity key (robust parse: literal \n, CRLF, CR all -> newline, then split)
+		keyOk = false;
+		if(reason == "")
+		{
+			keysRaw = ifnull(qFull.get("Quote_Applied_Activity_Keys"), "").toString();
+			keysNorm = keysRaw.replaceAll(litBsN, nlChar).replaceAll(crlf, nlChar).replaceAll(crChar, nlChar);
+			for each kLine in keysNorm.toList(nlChar)
+			{
+				if(kLine.trim() == akey) { keyOk = true; }
+			}
+		}
+
+		cRec = Map();
+		cRec.put("id", qId);
+		if(reason != "")
+		{
+			cRec.put("accepted", false);
+			cRec.put("reason", reason);
+		}
+		else if(keyOk == true)
+		{
+			cRec.put("accepted", true);
+			cRec.put("reason", "match");
+			matched.add(qId);
+		}
+		else
+		{
+			cRec.put("accepted", false);
+			cRec.put("reason", "activity_key_absent");
+			reusable.add(qId);
+		}
+		candidates.add(cRec);
+	}
+
+	automation.logAutomationEvent("matchDraftQuotes", "Deals", dealId.toString(), "resolve", matched.size().toString() + "matched_" + reusable.size().toString() + "reusable", {"product":pid, "opp":oppKey, "key":akey, "candidates":candidates.toString()});
+
+	res = Map();
+	res.put("matched", matched);
+	res.put("reusable", reusable);
+	res.put("candidates", candidates);
+	return res.toString();
+}

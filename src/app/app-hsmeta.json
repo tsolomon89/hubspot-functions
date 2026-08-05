@@ -1,0 +1,40 @@
+{
+  "uid": "commercial_operations_automation_app",
+  "type": "app",
+  "config": {
+    "name": "Commercial Operations Automation",
+    "description": "Commercial Operations Automation for HubSpot integration.",
+    "distribution": "private",
+    "auth": {
+      "type": "static",
+      "requiredScopes": [
+        "crm.objects.contacts.read",
+        "crm.objects.contacts.write",
+        "crm.objects.companies.read",
+        "crm.objects.companies.write",
+        "crm.objects.deals.read",
+        "crm.objects.deals.write",
+        "crm.schemas.custom.read",
+        "crm.schemas.deals.read",
+        "crm.schemas.companies.read",
+        "crm.schemas.contacts.read",
+        "automation"
+      ],
+      "optionalScopes": [],
+      "conditionallyRequiredScopes": []
+    },
+    "permittedUrls": {
+      "fetch": [
+        "https://api.hubapi.com"
+      ],
+      "iframe": [],
+      "img": []
+    },
+    "support": {
+      "supportEmail": "t.l.c.solomon@gmail.com",
+      "documentationUrl": "https://example.com/docs",
+      "supportUrl": "https://example.com/support",
+      "supportPhone": "+18005555555"
+    }
+  }
+}

@@ -1,0 +1,152 @@
+string automation.resolveActivityLoss(string lostReason, string scope, string hasNextStep, string finalCommercial, string meetingContext)
+{
+	// =========================================================================
+	// _util_resolveActivityLoss
+	//
+	// SINGLE SOURCE OF TRUTH for how an ACTIVITY-level Lost (Task_State /
+	// Call_Task_State / Meeting_Task_State = "Lost") resolves. Pure: no CRM
+	// reads/writes. The caller (handler) supplies context and executes the action.
+	//
+	// GOVERNING RULE (user-locked 2026-06-20): Lost is module-relative and NEVER
+	// auto-cascades upward. Activity Lost is local by default. The Lost Reason does
+	// NOT decide propagation by itself; the helper escalates to Contact/Deal ONLY
+	// when the caller passes an explicit scope, or for the specific reason+condition
+	// branches below. The Deal is NEVER closed from a Lost Reason alone.
+	//
+	// Inputs:
+	//   lostReason       canonical *_Lost_Reasons value (or "")
+	//   scope            "activity" (default) | "contact" | "deal"  (caller override)
+	//   hasNextStep      "true"/"false" — does the cadence have a next step (No Response)
+	//   finalCommercial  "true"/"false" — final opportunity-level commercial loss confirmed
+	//   meetingContext   "true"/"false" — caller is a meeting/Event (No Meeting / Demo => reschedule)
+	//
+	// Returns a JSON string (Zoho 'automation' functions may return only void/string).
+	// Caller parses with .toMap(). Map contents:
+	//   action   "continue_cadence" | "contact_lost" | "deal_lost" | "manual_review"
+	//            | "find_decision_maker" | "data_repair" | "suppress" | "none"
+	//   contactLostReason / dealLostReason   canonical value to write (when applicable)
+	//   blocksSequence   "true"/"false"      review task should block the sequence
+	//   reason           short log token
+	// =========================================================================
+
+	rsn   = ifnull(lostReason, "").toString().trim();
+	scp   = ifnull(scope, "activity").toString().trim().toLowerCase();
+	hasNext = ifnull(hasNextStep, "false").toString().trim().toLowerCase();
+	isFinal = ifnull(finalCommercial, "false").toString().trim().toLowerCase();
+	isMeeting = ifnull(meetingContext, "false").toString().trim().toLowerCase();
+
+	r = Map();
+	r.put("action", "manual_review");
+	r.put("contactLostReason", "");
+	r.put("dealLostReason", "");
+	r.put("blocksSequence", "true");
+	r.put("reason", "default_manual_review");
+
+	// ---- Explicit caller scope overrides the reason branch (caller knows best) ----
+	if(scp == "deal")
+	{
+		r.put("action", "deal_lost");
+		r.put("dealLostReason", rsn);
+		r.put("reason", "scope_deal");
+		return r.toString();
+	}
+	if(scp == "contact")
+	{
+		r.put("action", "contact_lost");
+		r.put("contactLostReason", rsn);
+		r.put("reason", "scope_contact");
+		return r.toString();
+	}
+
+	// ---- scope == activity (default): branch on the canonical Lost Reason ----
+	commercialFinalReasons = {"Terms Rejected", "Churned / Did Not Renew"};
+	contextReasons         = {"No Fit", "No Commercial Interest", "No Budget"};
+
+	if(rsn == "No Response")
+	{
+		if(hasNext == "true")
+		{
+			// attempt failed but the sequence can still try — keep going, stay local
+			r.put("action", "continue_cadence");
+			r.put("blocksSequence", "false");
+			r.put("reason", "no_response_continue");
+		}
+		else
+		{
+			// sequence exhausted for this Contact -> Contact Lost (Deal handled by viability rollup)
+			r.put("action", "contact_lost");
+			r.put("contactLostReason", "No Response");
+			r.put("blocksSequence", "false");
+			r.put("reason", "no_response_exhausted");
+		}
+	}
+	else if(rsn == "No Authority")
+	{
+		// not viable as buyer/DM -> find another decision maker; Deal stays Open
+		r.put("action", "find_decision_maker");
+		r.put("reason", "no_authority");
+	}
+	else if(contextReasons.contains(rsn))
+	{
+		// person-fit vs account-fit is ambiguous from automation -> human decides
+		r.put("action", "manual_review");
+		r.put("reason", "needs_context");
+	}
+	else if(commercialFinalReasons.contains(rsn))
+	{
+		if(isFinal == "true")
+		{
+			r.put("action", "deal_lost");
+			r.put("dealLostReason", rsn);
+			r.put("blocksSequence", "false");
+			r.put("reason", "commercial_final");
+		}
+		else
+		{
+			r.put("action", "manual_review");
+			r.put("reason", "commercial_review");
+		}
+	}
+	else if(rsn == "Invalid / Bad Data")
+	{
+		r.put("action", "data_repair");
+		r.put("reason", "bad_data");
+	}
+	else if(rsn == "Duplicate / Test Record")
+	{
+		// suppress/dedupe locally — not a commercial loss
+		r.put("action", "suppress");
+		r.put("blocksSequence", "false");
+		r.put("reason", "duplicate");
+	}
+	else if(rsn == "No Meeting / Demo")
+	{
+		if(isMeeting == "true")
+		{
+			// no-show / no meeting -> reschedule, keep cadence alive; Contact stays Open
+			r.put("action", "continue_cadence");
+			r.put("blocksSequence", "false");
+			r.put("reason", "no_meeting_reschedule");
+		}
+		else
+		{
+			r.put("action", "manual_review");
+			r.put("reason", "no_meeting_review");
+		}
+	}
+	else if(rsn == "N/A" || rsn == "")
+	{
+		// nothing to propagate; purely local, no action
+		r.put("action", "none");
+		r.put("blocksSequence", "false");
+		r.put("reason", "na_local");
+	}
+	else
+	{
+		// any other reason (incl. unmapped) -> human decides
+		r.put("action", "manual_review");
+		r.put("reason", "default_manual_review");
+	}
+
+	return r.toString();
+}

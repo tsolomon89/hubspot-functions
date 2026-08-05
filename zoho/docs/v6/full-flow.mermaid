@@ -1,0 +1,56 @@
+flowchart TD
+    classDef live fill:#e8f5ff,stroke:#1f6feb,color:#0b1f33
+    classDef gate fill:#fff4ce,stroke:#9a6700,color:#2f2100
+    classDef retired fill:#f6f8fa,stroke:#8c959f,color:#24292f
+    classDef review fill:#ffebe9,stroke:#cf222e,color:#24292f
+
+    Lead["Lead intake<br/>Product_Interest names"]:::live
+    ProcessLead["processLead<br/>convert to Contact + Account + Deal"]:::live
+    Contact["Contact<br/>Products_Linked<br/>Product_Interest_Staging"]:::live
+    Deal["Deal<br/>Opportunity state/stage<br/>Amount + ledgers"]:::live
+
+    Lead --> ProcessLead --> Contact
+    ProcessLead --> Deal
+
+    Task["Task completed<br/>Task_Contract_Products<br/>multi-select picklist names"]:::live
+    Call["Call Won/Lost<br/>Call_Task_Contract_Products<br/>multi-select picklist names"]:::live
+    Event["Event Won/Lost/Open<br/>Meeting_Task_Stage<br/>Meeting_Task_Contract_Products"]:::live
+
+    Task --> Adapter["Activity adapters<br/>contextJson.products = Product names"]:::live
+    Call --> Adapter
+    Event --> Adapter
+
+    Adapter --> Router["routeContactSequence<br/>Contact state machine"]:::live
+    Router --> ProcessDeal["processDeal<br/>resolve Product_Name/Product_Code<br/>link Contact + Deal Products"]:::live
+
+    ProcessDeal --> ProductCheck{"Product resolved<br/>and unambiguous?"}:::gate
+    ProductCheck -- no --> ManualReview["Manual Review Task<br/>no arbitrary Product selection"]:::review
+    ProductCheck -- yes --> QuoteUpsert["Per-Product Quote upsert<br/>Quote_Product + Quoted_Items"]:::live
+
+    QuoteUpsert --> KeyWrite["Write Quote_Applied_Activity_Keys<br/>same request as Quote mutation"]:::live
+    KeyWrite --> VerifyQuote{"Readback verifies<br/>exact key + header Product + line Product"}:::gate
+    VerifyQuote -- no --> ManualReview
+    VerifyQuote -- yes --> Recompute["Recompute Amount<br/>and contract ledgers"]:::live
+
+    Recompute --> CommercialGate{"Quote lifecycle gate"}:::gate
+    CommercialGate -- Delivered ready --> Sent["commercial:sent<br/>Commercial Agreement"]:::live
+    CommercialGate -- Confirmed with dates --> Signed["commercial:signed<br/>Onboarding/RTP floor"]:::live
+    CommercialGate -- Closed Lost only --> LostReview["Exclude from Amount<br/>preserve viability rules"]:::live
+    CommercialGate -- no transition --> Done["Reconciled"]:::live
+
+    Sent --> Router
+    Signed --> Router
+
+    QuoteEdit["WF021 Quote create/edit<br/>handleQuoteStageChange"]:::gate
+    QuoteEdit --> MoveCheck{"Quote_Last_Deal_ID<br/>vs Deal_Name"}:::gate
+    MoveCheck -- no move --> ProcessDeal
+    MoveCheck -- moved --> OldNew["processDeal old role<br/>then new role<br/>verify marker"]:::live
+    MoveCheck -- unlinked --> OldOnly["processDeal old role<br/>clear marker"]:::live
+
+    WF020["WF020 Quote_Stage field update<br/>legacy until cutover"]:::retired
+    WF004["WF004 Commercials_Status<br/>legacy wrapper until cutover"]:::retired
+    WF020 -. disable after gates .-> QuoteEdit
+    WF004 -. disable after gates .-> Router
+
+    RetiredFields["Retired/DEP labels<br/>Commercials_Status<br/>Meeting_Type<br/>Conversion_Outcome"]:::retired
+    Phantom["Do not write<br/>Commercials_*_At<br/>Signed_At<br/>Intent_To_Sign<br/>activity marker fields"]:::retired

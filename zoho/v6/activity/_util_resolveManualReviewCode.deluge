@@ -1,0 +1,45 @@
+string automation.resolveManualReviewCode(string codeKey)
+{
+	// =========================================================================
+	// _util_resolveManualReviewCode   (VERSION: v6-product-deal)
+	//
+	// Canonical registry of Manual Review codes (spec 06/08 + plan Part B). Returns
+	// the code as a bracketed token "[code]" intended to be the LEADING token of a
+	// createAuxTask note. createAuxTask already dedups a reused Manual Review on its
+	// leading [token] (see createAuxTask append-issue logic), so routing every
+	// review reason through this registry gives idempotent, greppable review notes
+	// with NO change to createAuxTask's signature.
+	//
+	// Prefer the createManualReview() wrapper for the common path; call this
+	// directly only when you need the raw "[code]" string.
+	//
+	// Unknown keys are never silently swallowed: they are logged and returned as a
+	// normalised bracketed literal so the reason still surfaces on the task.
+	// =========================================================================
+	key = ifnull(codeKey, "").toString().trim().toLowerCase();
+	key = key.replaceAll("[^a-z0-9_]+", "_").replaceAll("^_+", "").replaceAll("_+$", "");
+	if(key == "") { return "[manual_review]"; }
+
+	// canonical set (spec 06/08 recommended codes + plan Part B additions)
+	known = {
+		"missing_product_interest",
+		"product_unresolved",
+		"quote_missing_contact",
+		"non_decision_maker_quote_contact",
+		"duplicate_product_deal",
+		"duplicate_open_quote",
+		"quote_product_mismatch",
+		"activity_product_mismatch",
+		"expansion_downgrade_attempt",
+		"renewal_date_invalid",
+		"quote_lifecycle_conflict",
+		"target_acv_unresolved",
+		"multi_product_sequence_ambiguous",
+		"contract_product_conflict",
+		"conflicting_opening_variant"
+	};
+	if(known.contains(key)) { return "[" + key + "]"; }
+
+	automation.logAutomationEvent("resolveManualReviewCode", "-", "-", "unknown_review_code", "passthrough", {"key":key});
+	return "[" + key + "]";
+}

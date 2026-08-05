@@ -1,0 +1,1042 @@
+void automation.handleTaskCompletion(string taskIdStr)
+{
+	// =========================================================================
+	// handleTaskCompletion  (Contact-centric)
+	//
+	// WF008: fires when the canonical Task command fields change.
+	// Identifies the Contact (Who_Id) and Deal (What_Id) and applies the command.
+	//
+	// AUDIT GUARD: an "Email Sent" Task is the email audit record only -> return
+	// immediately, never advance the sequence.
+	// SCHEDULED-SEND GUARD: a "ScheduledSend|..." wake-up Task is handled by
+	// sendScheduledEmailFromTask -> return.
+	//
+	// Activation (Task_Type = "Sequence Activation"):
+	//   Task_Sequence_Type = Email  -> activate:email
+	//   Task_Sequence_Type = Call   -> activate:call
+	//   Task_Sequence_Type = Manual -> activate:manual
+	// Non-activation tasks:
+	//   Task_State = Won  -> Task_Type success behaviour
+	//   Task_State = Lost -> activity-local loss handling via Task_Lost_Reasons
+	//   Task_State = Open -> no terminal transition
+	// Positive Task_Type success behaviour:
+	//   "Onboarding Setup"  -> Contact Sequence_State = Complete (terminal; Renewal is date-driven)
+	//   "Send Commercials"  -> Quote Delivered + commercial:sent routing
+	//   "Data Repair"/"Review Reply"/"Enrichment" -> resume the Contact sequence
+	//   "Draft Commercials" -> create/surface "Send Commercials" task; stay at Proposal Preparation
+	//   "Manual Review"/"Suppression Review" -> resume when Task_State = Won
+	//   generic sequence-managed type -> task:positive (advance) where Task_State = Won is the gate
+	// =========================================================================
+
+	info "VERSION: v6-contact-centric";
+
+	taskId = 0;
+	if(!isNull(taskIdStr) && taskIdStr != "") { taskId = taskIdStr.toLong(); }
+	automation.logAutomationEvent("handleTaskCompletion", "Tasks", ifnull(taskId, "").toString(), "entry", "in_progress", null);
+	if(taskId == 0) { return; }
+
+	task = zoho.crm.getRecordById("Tasks", taskId);
+	if(isNull(task) || isNull(task.get("id"))) { return; }
+
+	tType = ifnull(task.get("Task_Type"), "").toString();
+	tDesc = ifnull(task.get("Description"), "").toString();
+
+	// ---- AUDIT GUARD: email audit Task never advances the sequence ----
+	if(tType == "Email Sent")
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "audit_guard", "email_audit_no_advance", null);
+		return;
+	}
+	// ---- SCHEDULED-SEND GUARD: wake-up Task is handled by the send wrapper ----
+	if(tDesc.contains("ScheduledSend|"))
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "scheduled_send_guard", "skip", null);
+		return;
+	}
+
+	tSeqManaged = ifnull(task.get("Task_Sequence_Managed"), false).toString();
+	knownTypes = {"Sequence Activation", "Data Repair", "Enrichment", "Review Reply", "Draft Commercials", "Send Commercials", "Onboarding Setup", "Manual Review", "Suppression Review"};
+	if(tSeqManaged != "true" && !knownTypes.contains(tType))
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "skip_not_sequence_managed", {"task_type":tType});
+		return;
+	}
+
+	whatLookup = task.get("What_Id");
+	seModule   = ifnull(task.get("$se_module"), "").toString();
+	if(seModule != "Deals" || isNull(whatLookup) || isNull(whatLookup.get("id")))
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "skip_no_related_deal", {"se_module":seModule});
+		return;
+	}
+	dealId = whatLookup.get("id").toLong();
+
+	whoLookup = task.get("Who_Id");
+	if(isNull(whoLookup) || isNull(whoLookup.get("id")))
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "skip_no_contact", null);
+		return;
+	}
+	contactId = whoLookup.get("id").toLong();
+
+	tStatus  = ifnull(task.get("Status"), "").toString();
+	taskSeqType = ifnull(task.get("Task_Sequence_Type"), "").toString().trim();
+	if(taskSeqType == "-None-") { taskSeqType = ""; }
+	taskState = ifnull(task.get("Task_State"), "").toString().trim();
+	if(taskState == "-None-") { taskState = ""; }
+	taskReason = ifnull(task.get("Task_Lost_Reasons"), "").toString().trim();
+	if(taskReason == "-None-") { taskReason = ""; }
+	if(tStatus == "Deferred")
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "skip_deferred", null);
+		return;
+	}
+	if(tType != "Sequence Activation" && taskState == "")
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "skip_no_task_state", {"status":tStatus});
+		return;
+	}
+
+	contact = zoho.crm.getRecordById("Contacts", contactId);
+	if(isNull(contact) || isNull(contact.get("id")))
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "contact_not_found", {"contact":contactId.toString()});
+		return;
+	}
+	contactStage = ifnull(contact.get("Stage"), "").toString();
+	contactSeqState = ifnull(contact.get("Sequence_State"), "").toString();
+
+	// ---- stale: task belongs to a Stage the Contact has left.
+	//      Sequence Activation is EXEMPT — it deliberately adopts Task_Sequence_Stage onto the
+	//      Contact (see the activation block below), so a mismatch must not skip it here. ----
+	taskStage = ifnull(task.get("Task_Sequence_Stage"), "").toString();
+	if(tType != "Sequence Activation" && taskStage != "" && taskStage != contactStage)
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "skip_stale_stage", {"task_stage":taskStage, "contact_stage":contactStage});
+		return;
+	}
+
+	noTrigger = Map();
+	noTrigger.put("trigger", List());
+
+	// =====================================================================
+	// ACTIVATION
+	// =====================================================================
+	if(tType == "Sequence Activation")
+	{
+		taskStatusMirror = ifnull(task.get("Task_Status"), "").toString().trim();
+		if(taskState == "Won" && taskStatusMirror == "Closed")
+		{
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "activation_already_processed", {"status":tStatus});
+			return;
+		}
+
+		// ---- HARDENED COMMIT MODEL: Task_Sequence_Type is the route PARAMETER; Task_State = Won is the
+		//      COMMIT. Editing Task_Sequence_Type alone (State not yet Won) is a NO-OP — do not start the
+		//      sequence or defer sibling activation tasks until the rep commits with Task_State = Won. ----
+		if(taskState != "Won")
+		{
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "activation_awaiting_commit", ifnull(taskSeqType, "").toString(), {"contact":contactId.toString(), "task_state":taskState});
+			return;
+		}
+
+		// ---- D1 FIX (2026-06-22): race-proof backstop. processContact §6b tries to defer
+		//      duplicate activation tasks at creation, but two concurrent processContact runs
+		//      (processLead's inline call + the WF001b2 Contacts-create trigger) can both create
+		//      one before either sweep sees the other, leaving TWO "Not Started" tasks (observed
+		//      in E2E). Here, at the single-threaded human completion point, defer EVERY other
+		//      open Sequence Activation task for this Contact + Stage so only THIS task activates. ----
+		sibTasks = zoho.crm.getRelatedRecords("Tasks", "Deals", dealId);
+		if(isNull(sibTasks) || sibTasks.size() == 0 || sibTasks.toString().startsWith("{\"code\"")) { sibTasks = zoho.crm.searchRecords("Tasks", "(What_Id:equals:" + dealId + ")"); }
+		if(!isNull(sibTasks) && sibTasks.size() > 0 && !sibTasks.toString().startsWith("{\"code\""))
+		{
+			for each sib in sibTasks
+			{
+				sibId = "";
+				if(!isNull(sib.get("id"))) { sibId = sib.get("id").toString(); }
+				sibWho = "";
+				sibWhoL = sib.get("Who_Id");
+				if(!isNull(sibWhoL) && !isNull(sibWhoL.get("id"))) { sibWho = sibWhoL.get("id").toString(); }
+				sibStatus = ifnull(sib.get("Status"), "").toString();
+				if(sibId != "" && sibId != taskId.toString() && sibWho == contactId.toString() && ifnull(sib.get("Task_Type"), "").toString() == "Sequence Activation" && ifnull(sib.get("Task_Sequence_Stage"), "").toString() == taskStage && (sibStatus == "Not Started" || sibStatus == "In Progress"))
+				{
+					zoho.crm.updateRecord("Tasks", sibId.toLong(), {"Status":"Deferred", "Blocks_Sequence":"No"}, noTrigger);
+					automation.logAutomationEvent("handleTaskCompletion", "Tasks", sibId, "activation_dedupe", "deferred_sibling", {"contact":contactId.toString(), "kept":taskId.toString()});
+				}
+			}
+		}
+
+		// ---- 1. Resolve route: Task_Sequence_Type is the route parameter for this Won commit.
+		//      Task_State = Won with a blank/invalid route -> reopen the activation task and raise a
+		//      Manual Review so the rep picks a route, then commits Task_State = Won again. ----
+		routeType = taskSeqType;
+		if(routeType != "Email" && routeType != "Call" && routeType != "Manual")
+		{
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "[activation_no_route] Activation task " + taskId + " was set to Task State = Won without choosing Task Sequence Type. Choose Email / Call / Manual, then set Task State = Won again.");
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "activation_no_route", ifnull(taskSeqType, "").toString(), {"contact":contactId.toString()});
+			return;
+		}
+
+		// ---- 2. Idempotency BEFORE any route mutation: Email/Call already Running -> close the
+		//         command task without routing again. Manual is allowed even when Running. ----
+		if((routeType == "Email" || routeType == "Call") && contactSeqState == "Running")
+		{
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Won", "Task_Status":"Closed", "Status":"Completed"}, noTrigger);
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "idempotency_skip", routeType, {"contact":contactId.toString()});
+			return;
+		}
+
+		// ---- 3. Stage adoption: the Activation Task's business Stage (Task_Sequence_Stage) wins
+		//         onto Contact.Stage so the sequence enters at the intended stage. ----
+		if(taskStage != "" && taskStage != contactStage)
+		{
+			zoho.crm.updateRecord("Contacts", contactId, {"Stage": taskStage}, noTrigger);
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "stage_adopted", taskStage, {"contact":contactId.toString(), "from":contactStage});
+		}
+
+		// ---- 4. Route exactly once (routeContactSequence owns the Contact.Sequence_* writes) ----
+		actTrig = "activate:email";
+		if(routeType == "Call") { actTrig = "activate:call"; }
+		else if(routeType == "Manual") { actTrig = "activate:manual"; }
+
+		// ---- 4a. Opening-email variant (EMAIL route only). The rep's LATEST native Note on this
+		//      Activation Task selects the opener: exact "warm"/"cold" -> variant; an explicit
+		//      both-value Note -> conflict (reopen this Task + Manual Review, do NOT activate);
+		//      no Note / prose / anything else -> default opener. Only the latest Note (max
+		//      Created_Time) is read, so older/leftover notes never select or conflict. Call and
+		//      Manual routes send no opener, so the Note is irrelevant to them. ----
+		actCtx = "{}";
+		if(routeType == "Email")
+		{
+			latestNote = "";
+			latestNoteNum = 0;
+			relNotes = zoho.crm.getRelatedRecords("Notes", "Tasks", taskId);
+			if(!isNull(relNotes) && relNotes.size() > 0 && !relNotes.toString().startsWith("{\"code\""))
+			{
+				for each nt in relNotes
+				{
+					ntAtRaw = ifnull(nt.get("Created_Time"), "").toString();
+					ntAtNum = 0;
+					if(ntAtRaw.length() >= 19)
+					{
+						ntDigits = ntAtRaw.substring(0, 19).replaceAll("[^0-9]", "");
+						if(ntDigits != "") { ntAtNum = ntDigits.toLong(); }
+					}
+					if(ntAtNum >= latestNoteNum)
+					{
+						latestNoteNum = ntAtNum;
+						ntBody = ifnull(nt.get("Note_Content"), "").toString();
+						if(ntBody.trim() == "") { ntBody = ifnull(nt.get("Note_Title"), "").toString(); }
+						latestNote = ntBody;
+					}
+				}
+			}
+			openerVariant = automation.resolveOpenerVariant(latestNote);
+			if(openerVariant == "conflict")
+			{
+				zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+				automation.createManualReview(contactId.toString(), dealId.toString(), "conflicting_opening_variant", "Activation task " + taskId + "'s latest Note names BOTH 'Warm' and 'Cold' as the opening-email variant, so the sequence was NOT activated. Edit the Note to contain only 'Warm' or 'Cold' (or remove it to use the standard opener), then set Task State = Won again.");
+				automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "activation_variant_conflict", "blocked", {"contact":contactId.toString(), "note":latestNote});
+				return;
+			}
+			if(openerVariant == "warm" || openerVariant == "cold")
+			{
+				actCtxMap = Map();
+				actCtxMap.put("opener_variant", openerVariant);
+				actCtx = actCtxMap.toString();
+			}
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "opener_variant_resolved", openerVariant, {"contact":contactId.toString(), "note":latestNote});
+		}
+
+		automation.routeContactSequence(contactId.toString(), dealId.toString(), actTrig, actCtx);
+		zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Won", "Task_Status":"Closed", "Status":"Completed"}, noTrigger);
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "activated", actTrig, {"contact":contactId.toString(), "deal":dealId.toString(), "route_via":"Task_Sequence_Type", "opener_variant":actCtx});
+		return;
+	}
+
+	// =====================================================================
+	// ACTIVITY-STATE SURFACE (non-activation): Task_State is primary.
+	//   Won  -> treat as positive completion (runs the Task_Type success behaviour below)
+	//   Lost -> activity-LOCAL via resolveActivityLoss (never closes the Deal from a reason alone)
+	//   Open -> not yet resolved; no terminal action
+	// =====================================================================
+	// idempotency: a terminal Task_State already processed (Task_Status mirror = Closed) must not
+	// re-route on a later edit (WF008 fires on create_or_edit). Native Status is automation-owned.
+	taskStatusMirror = ifnull(task.get("Task_Status"), "").toString().trim();
+	if((taskState == "Won" || taskState == "Lost") && taskStatusMirror == "Closed")
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "guard", "skip_state_already_processed", {"task_state":taskState});
+		return;
+	}
+	if(taskState == "Open")
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "state_open", "skip_no_terminal", {"contact":contactId.toString(), "type":tType});
+		return;
+	}
+	if(taskState == "Lost")
+	{
+		if(taskReason == "")
+		{
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", tType + " " + taskId + " was marked Lost without Task Lost Reasons. Add a canonical Lost Reason, then set Task_State=Lost again.");
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "state_lost", "missing_reason_reopened", {"contact":contactId.toString(), "type":tType});
+			return;
+		}
+		// hasNextStep reflects ACTUAL Contact-sequence exhaustion, not this single task. Only when the
+		// Contact sequence is Complete does No Response escalate to Contact Lost; otherwise stay local.
+		taskHasNext = "true";
+		if(contactSeqState == "Complete") { taskHasNext = "false"; }
+		lossRaw = automation.resolveActivityLoss(taskReason, "activity", taskHasNext, "false", "false");
+		loss = Map();
+		if(!isNull(lossRaw) && lossRaw.toString().trim() != "") { loss = lossRaw.toString().toMap(); }
+		act = ifnull(loss.get("action"), "manual_review").toString();
+		if(act == "contact_lost")
+		{
+			clr = ifnull(loss.get("contactLostReason"), "No Response").toString();
+			automation.routeContactSequence(contactId.toString(), dealId.toString(), "contactlost:" + clr, "{}");
+		}
+		else if(act == "continue_cadence")
+		{
+			automation.routeContactSequence(contactId.toString(), dealId.toString(), "resume", "{}");
+		}
+		else if(act == "find_decision_maker")
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", tType + " " + taskId + ": Find Decision Maker (No Authority) - reassign the buyer/decision maker. Deal stays Open.");
+		}
+		else if(act == "data_repair")
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Data Repair", tType + " " + taskId + ": bad data - repair before the sequence continues.");
+		}
+		else if(act == "suppress")
+		{
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "state_lost", "suppress", {"contact":contactId.toString(), "type":tType});
+		}
+		else
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", tType + " " + taskId + " marked Lost (" + taskReason + ") - review next step (continue, find another contact, or close the Contact). Deal stays Open.");
+		}
+		zoho.crm.updateRecord("Tasks", taskId, {"Task_Status":"Closed", "Status":"Completed"}, noTrigger);
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "state_lost", act, {"contact":contactId.toString(), "type":tType, "reason":taskReason});
+		return;
+	}
+	if(taskState != "Won")
+	{
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "unknown_state", taskState, {"contact":contactId.toString(), "type":tType});
+		return;
+	}
+
+	// Positive completion: mark processed, then run the Task_Type success behaviour.
+	// Commercial helper tasks close only after their Product/Quote package commits successfully.
+	if(tType != "Draft Commercials" && tType != "Send Commercials")
+	{
+		zoho.crm.updateRecord("Tasks", taskId, {"Task_Status":"Closed", "Status":"Completed"}, noTrigger);
+	}
+
+	// Build commercial evidence context once. Commercial helper Task types
+	// (Draft/Send Commercials) return before the generic branch below, so they
+	// must call processDeal directly when Product evidence is present.
+	taskActivityCtx = Map();
+	taskActivityCtx.put("source", "activity");
+	taskActivityCtx.put("sourceModule", "Tasks");
+	taskActivityCtx.put("sourceActivityId", taskId.toString());
+	taskActivityCtx.put("contactId", contactId.toString());
+	taskActivityCtx.put("activityState", "Won");
+	taskProductList = List();
+	rawTaskProds = task.get("Task_Contract_Products");
+	if(!isNull(rawTaskProds))
+	{
+		rawTaskProdsStr = rawTaskProds.toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll("\"", "").replaceAll("'", "").trim();
+		if(rawTaskProdsStr != "")
+		{
+			for each pv in rawTaskProdsStr.toList(",")
+			{
+				pvs = ifnull(pv, "").toString().trim();
+				if(pvs != "" && pvs != "-None-" && !taskProductList.contains(pvs)) { taskProductList.add(pvs); }
+			}
+		}
+	}
+	taskActivityCtx.put("products", taskProductList);
+	taskBrands = ifnull(task.get("Task_Contract_Brands"), "").toString().trim();
+	if(taskBrands == "-None-") { taskBrands = ""; }
+	if(taskBrands != "") { taskActivityCtx.put("numberOfBrands", taskBrands.toLong()); }
+	taskStart = ifnull(task.get("Task_Contract_Date_Start"), "").toString().trim();
+	if(taskStart == "-None-") { taskStart = ""; }
+	if(taskStart != "") { taskActivityCtx.put("contractDateStart", taskStart); }
+	taskEnd = ifnull(task.get("Task_Contract_Date_End"), "").toString().trim();
+	if(taskEnd == "-None-") { taskEnd = ""; }
+	if(taskEnd != "") { taskActivityCtx.put("contractDateEnd", taskEnd); }
+	taskFreq = ifnull(task.get("Task_Contract_Frequency"), "").toString().trim();
+	if(taskFreq == "-None-") { taskFreq = ""; }
+	if(taskFreq != "") { taskActivityCtx.put("frequency", taskFreq); }
+	hasTaskProductEvidence = taskProductList.size() > 0;
+
+	// =====================================================================
+	// OTHER TASK TYPES: Task_State = Won runs the Type success behaviour
+	// =====================================================================
+	if(tType == "Onboarding Setup")
+	{
+		cUpd = Map();
+		cUpd.put("Sequence_State", "Complete");
+		cUpd.put("Sequence_Stage", "None");
+		cUpd.put("Sequence_Step", "None");
+		zoho.crm.updateRecord("Contacts", contactId, cUpd, noTrigger);
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "task_complete", "onboarding_complete", {"contact":contactId.toString()});
+		return;
+	}
+
+	if(tType == "Send Commercials")
+	{
+		if(hasTaskProductEvidence)
+		{
+			pdRawSend = automation.processDeal(dealId.toString(), taskActivityCtx.toString());
+			pdSend = Map();
+			if(!isNull(pdRawSend) && pdRawSend.toString().trim() != "") { pdSend = pdRawSend.toString().toMap(); }
+			if(ifnull(pdSend.get("success"), false) != true)
+			{
+				automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "Send Commercials Task " + taskId + " could not apply Product evidence before sending. Resolve the Quote/Product issue and re-run.");
+				automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "send_commercials", "product_evidence_blocked", {"deal":dealId.toString(), "outcome":ifnull(pdSend.get("outcome"), "").toString()});
+				zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+				return;
+			}
+		}
+
+		sendDeal = zoho.crm.getRecordById("Deals", dealId);
+		sendQuoteOppType = "FTP";
+		if(!isNull(sendDeal) && ifnull(sendDeal.get("Stage"), "").toString() == "RTP") { sendQuoteOppType = "RTP"; }
+
+		sendReasons = List();
+		sendValidQuoteCount = 0;
+		sendDeliverQuoteIds = List();
+		sendRelevantQuoteIds = List();
+		dealQuotes = zoho.crm.getRelatedRecords("Quotes", "Deals", dealId);
+		if(!isNull(dealQuotes) && dealQuotes.size() > 0 && !dealQuotes.toString().startsWith("{\"code\""))
+		{
+			for each dq in dealQuotes
+			{
+				sqId = "";
+				if(!isNull(dq.get("id"))) { sqId = dq.get("id").toString(); }
+				if(sqId == "") { continue; }
+				sqFull = Map();
+				sqGetResp = invokeurl
+				[
+					url: "https://www.zohoapis.eu/crm/v6/Quotes/" + sqId
+					type: GET
+					connection: "zoho_crm"
+				];
+				if(!isNull(sqGetResp) && !isNull(sqGetResp.get("data")) && sqGetResp.get("data").size() > 0) { sqFull = sqGetResp.get("data").get(0); }
+				if(isNull(sqFull) || isNull(sqFull.get("id"))) { sqFull = zoho.crm.getRecordById("Quotes", sqId.toLong()); }
+				if(isNull(sqFull) || isNull(sqFull.get("id"))) { continue; }
+				sqOpp = ifnull(sqFull.get("Opportunity_Type"), "").toString();
+				sqStage = ifnull(sqFull.get("Quote_Stage"), "").toString();
+				if(sqOpp == sendQuoteOppType && (sqStage == "Draft" || sqStage == "Negotiation" || sqStage == "Delivered" || sqStage == "On Hold"))
+				{
+					sendRelevantQuoteIds.add(sqId);
+					if(sqStage == "On Hold")
+					{
+						sendReasons.add("quote_on_hold:" + sqId);
+					}
+					sqProdId = "";
+					sqProd = sqFull.get("Quote_Product");
+					if(!isNull(sqProd) && !isNull(sqProd.get("id"))) { sqProdId = sqProd.get("id").toString(); }
+					if(sqProdId == "")
+					{
+						sendReasons.add("quote_missing_product:" + sqId);
+					}
+					sqLineOk = false;
+					sqLines = sqFull.get("Quoted_Items");
+					if(!isNull(sqLines) && sqLines.size() > 0)
+					{
+						for each sl in sqLines
+						{
+							slProdId = "";
+							slProd = sl.get("Product_Name");
+							if(!isNull(slProd) && !isNull(slProd.get("id"))) { slProdId = slProd.get("id").toString(); }
+							if(slProdId != "" && slProdId == sqProdId) { sqLineOk = true; }
+						}
+					}
+					if(sqLineOk != true)
+					{
+						sendReasons.add("quote_missing_matching_line:" + sqId);
+					}
+					if(sqProdId != "" && sqLineOk == true)
+					{
+						sendValidQuoteCount = sendValidQuoteCount + 1;
+						if(sqStage == "Draft" || sqStage == "Negotiation") { sendDeliverQuoteIds.add(sqId); }
+					}
+				}
+			}
+		}
+		if(sendRelevantQuoteIds.size() == 0) { sendReasons.add("no_relevant_open_quotes"); }
+		if(sendValidQuoteCount == 0) { sendReasons.add("no_valid_product_quote"); }
+		if(sendReasons.size() > 0)
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "[send_commercials_package_blocked] Send Commercials Task " + taskId + " blocked: " + sendReasons.toString() + ". Correct the Quote package and re-run.");
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "send_commercials", "package_blocked", {"deal":dealId.toString(), "reasons":sendReasons.toString()});
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+			return;
+		}
+
+		for each deliverQid in sendDeliverQuoteIds
+		{
+			zoho.crm.updateRecord("Quotes", deliverQid.toLong(), {"Quote_Stage":"Delivered"}, noTrigger);
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "send_commercials", "quote_delivered", {"quote":deliverQid, "deal":dealId.toString()});
+		}
+
+		sendPostReasons = List();
+		postQuotes = zoho.crm.getRelatedRecords("Quotes", "Deals", dealId);
+		if(!isNull(postQuotes) && postQuotes.size() > 0 && !postQuotes.toString().startsWith("{\"code\""))
+		{
+			for each pq in postQuotes
+			{
+				pqId = "";
+				if(!isNull(pq.get("id"))) { pqId = pq.get("id").toString(); }
+				if(pqId == "") { continue; }
+				pqFull = Map();
+				pqGetResp = invokeurl
+				[
+					url: "https://www.zohoapis.eu/crm/v6/Quotes/" + pqId
+					type: GET
+					connection: "zoho_crm"
+				];
+				if(!isNull(pqGetResp) && !isNull(pqGetResp.get("data")) && pqGetResp.get("data").size() > 0) { pqFull = pqGetResp.get("data").get(0); }
+				if(isNull(pqFull) || isNull(pqFull.get("id"))) { pqFull = zoho.crm.getRecordById("Quotes", pqId.toLong()); }
+				if(isNull(pqFull) || isNull(pqFull.get("id"))) { continue; }
+				if(ifnull(pqFull.get("Opportunity_Type"), "").toString() == sendQuoteOppType)
+				{
+					pqStage = ifnull(pqFull.get("Quote_Stage"), "").toString();
+					if(pqStage == "Draft" || pqStage == "Negotiation" || pqStage == "On Hold") { sendPostReasons.add("quote_not_delivered:" + pqId + ":" + pqStage); }
+				}
+			}
+		}
+		if(sendPostReasons.size() > 0)
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "[send_commercials_delivery_blocked] Send Commercials Task " + taskId + " left relevant Quotes Draft/Negotiation/On Hold: " + sendPostReasons.toString() + ". Correct the package and re-run.");
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "send_commercials", "delivery_blocked", {"deal":dealId.toString(), "reasons":sendPostReasons.toString()});
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+			return;
+		}
+
+		pdRawSendGate = automation.processDeal(dealId.toString(), "{}");
+		pdSendGate = Map();
+		if(!isNull(pdRawSendGate) && pdRawSendGate.toString().trim() != "") { pdSendGate = pdRawSendGate.toString().toMap(); }
+		sendContactV = zoho.crm.getRecordById("Contacts", contactId);
+		sendDealV = zoho.crm.getRecordById("Deals", dealId);
+		sendContactStageV = "";
+		sendDealStageV = "";
+		if(!isNull(sendContactV) && !isNull(sendContactV.get("id"))) { sendContactStageV = ifnull(sendContactV.get("Stage"), "").toString(); }
+		if(!isNull(sendDealV) && !isNull(sendDealV.get("id"))) { sendDealStageV = ifnull(sendDealV.get("Opportunity_Stage"), "").toString(); }
+		if(ifnull(pdSendGate.get("success"), false) != true || sendContactStageV != "Commercial Agreement" || sendDealStageV != "Commercial Agreement")
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "[send_commercials_transition_blocked] Send Commercials Task " + taskId + " delivered the Quote package but Commercial Agreement transition was not verified. processDeal outcome=" + ifnull(pdSendGate.get("outcome"), "").toString() + ".");
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "send_commercials", "transition_blocked", {"deal":dealId.toString(), "outcome":ifnull(pdSendGate.get("outcome"), "").toString(), "contact_stage":sendContactStageV, "deal_stage":sendDealStageV});
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+			return;
+		}
+		zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Won", "Task_Status":"Closed", "Status":"Completed"}, noTrigger);
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "send_commercials", "commercial_sent", {"deal":dealId.toString(), "quotes":sendRelevantQuoteIds.toString()});
+		return;
+	}
+
+	if(tType == "Data Repair" || tType == "Review Reply" || tType == "Enrichment")
+	{
+		automation.routeContactSequence(contactId.toString(), dealId.toString(), "resume", "{}");
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "task_complete", "resumed", {"contact":contactId.toString(), "type":tType});
+		return;
+	}
+
+	if(tType == "Draft Commercials")
+	{
+		// Draft = internal draft ready, NOT customer-facing -> do not advance. Surface the
+		// Send Commercials task and stay at Proposal Preparation. The advance to Commercial
+		// Agreement happens only at the customer-facing boundary (Send Commercials completion /
+		// Quote_Stage=Delivered -> commercial:sent). createAuxTask dedups on the open task.
+		if(!hasTaskProductEvidence)
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "[draft_commercials_missing_products] Draft Commercials Task " + taskId + " has no Product evidence. Select Product(s) and re-run; no Quote or Send Commercials task was created.");
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "missing_product_evidence", {"deal":dealId.toString()});
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+			return;
+		}
+		if(hasTaskProductEvidence)
+		{
+			// Draft Commercials uses a direct, Task-evidence Quote package path. The full
+			// processDeal(activity) path is too heavy in this org and can terminate before
+			// returning, leaving the workflow unable to create a retryable review task.
+			pdRawDraft = "{}";
+			pdDraft = Map();
+			if(!isNull(pdRawDraft) && pdRawDraft.toString().trim() != "") { pdDraft = pdRawDraft.toString().toMap(); }
+			if(ifnull(pdDraft.get("success"), false) != true)
+			{
+				// Create the Draft Quote package directly from this Task, then let the existing
+				// package validation below decide whether Send Commercials can be surfaced.
+				fbReasons = List();
+				fbCreated = 0;
+				fbCreatedQuoteIds = List();
+				fbDeal = zoho.crm.getRecordById("Deals", dealId);
+				fbAccountId = "";
+				fbAccountName = "";
+				if(!isNull(fbDeal) && !isNull(fbDeal.get("id")))
+				{
+					fbAcc = fbDeal.get("Account_Name");
+					if(!isNull(fbAcc) && !isNull(fbAcc.get("id"))) { fbAccountId = fbAcc.get("id").toString(); fbAccountName = ifnull(fbAcc.get("name"), "").toString(); }
+				}
+				if(fbAccountId == "") { fbReasons.add("missing_account"); }
+				fbQuoteOppType = "FTP";
+				if(!isNull(fbDeal) && ifnull(fbDeal.get("Stage"), "").toString() == "RTP") { fbQuoteOppType = "RTP"; }
+				fbActivityKey = "Tasks:" + taskId.toString();
+				fbExistingQuotes = zoho.crm.getRelatedRecords("Quotes", "Deals", dealId);
+
+				if(fbAccountId != "")
+				{
+					for each fbProdNameRaw in taskProductList
+					{
+						fbSafeName = ifnull(fbProdNameRaw, "").toString().trim().replaceAll("  ", " ");
+						if(fbSafeName == "Jurni Cortex - Fixed") { fbSafeName = "Jurnii Cortex - Fixed"; }
+						if(fbSafeName == "Jurni Cortex - Flex") { fbSafeName = "Jurnii Cortex - Flex"; }
+						if(fbSafeName == "") { continue; }
+						fbMatches = zoho.crm.searchRecords("Products", "(Product_Name:equals:" + fbSafeName + ")");
+						fbProdId = "";
+						fbProdName = fbSafeName;
+						fbMatchCount = 0;
+						if(!isNull(fbMatches) && fbMatches.size() > 0 && !fbMatches.toString().startsWith("{\"code\""))
+						{
+							for each fm in fbMatches
+							{
+								if(ifnull(fm.get("Product_Name"), "").toString().trim() == fbSafeName)
+								{
+									fmActive = ifnull(fm.get("Product_Active"), false);
+									if(fmActive == true || fmActive == "true")
+									{
+										fbMatchCount = fbMatchCount + 1;
+										fbProdId = fm.get("id").toString();
+										fbProdName = ifnull(fm.get("Product_Name"), fbSafeName).toString();
+									}
+								}
+							}
+						}
+						if(fbMatchCount != 1 || fbProdId == "")
+						{
+							fbReasons.add("product_unresolved_or_ambiguous:" + fbSafeName);
+							continue;
+						}
+
+						// Link Products while we are here; Contacts_X_Products is the canonical
+						// junction behind Contact.Products_Linked / Product_Interest_Staging.
+						fbContactProductLinked = false;
+						fbConLinks = zoho.crm.getRelatedRecords("Products12", "Contacts", contactId);
+						if(!isNull(fbConLinks) && fbConLinks.size() > 0 && !fbConLinks.toString().startsWith("{\"code\""))
+						{
+							for each fcl in fbConLinks
+							{
+								fclProdId = "";
+								if(!isNull(fcl.get("id"))) { fclProdId = fcl.get("id").toString(); }
+								fclProd = fcl.get("Product_Details");
+								if(!isNull(fclProd) && !isNull(fclProd.get("id"))) { fclProdId = fclProd.get("id").toString(); }
+								fclPI = fcl.get("Product_Interest");
+								if(!isNull(fclPI) && !isNull(fclPI.get("id"))) { fclProdId = fclPI.get("id").toString(); }
+								if(fclProdId == fbProdId) { fbContactProductLinked = true; break; }
+							}
+						}
+						if(!fbContactProductLinked)
+						{
+							fbJunctionLinks = zoho.crm.searchRecords("Contacts_X_Products", "(Contacts:equals:" + contactId + ")");
+							if(!isNull(fbJunctionLinks) && fbJunctionLinks.size() > 0 && !fbJunctionLinks.toString().startsWith("{\"code\""))
+							{
+								for each fjl in fbJunctionLinks
+								{
+									fjlProdId = "";
+									fjlPI = fjl.get("Product_Interest");
+									if(!isNull(fjlPI) && !isNull(fjlPI.get("id"))) { fjlProdId = fjlPI.get("id").toString(); }
+									if(fjlProdId == fbProdId) { fbContactProductLinked = true; break; }
+								}
+							}
+						}
+						if(!fbContactProductLinked)
+						{
+							fbLinkCMap = Map();
+							fbLinkCMap.put("Contacts", contactId.toString());
+							fbLinkCMap.put("Product_Interest", fbProdId);
+							fbLinkC = zoho.crm.createRecord("Contacts_X_Products", fbLinkCMap);
+						}
+						zoho.crm.updateRelatedRecord("Products", fbProdId.toLong(), "Deals", dealId, Map());
+
+						// ---- canonical reuse detection (SAME resolver as the final verification below) ----
+						// matched  = a Draft Quote for this product already carries this Task's activity key.
+						// reusable = a valid priced Draft Quote for this product missing only the key (adopt it).
+						fbmRaw = automation.matchDraftQuotes(dealId.toString(), fbProdId, fbQuoteOppType, fbActivityKey, "");
+						fbm = Map();
+						if(!isNull(fbmRaw) && fbmRaw.toString().trim() != "") { fbm = fbmRaw.toString().toMap(); }
+						fbMatched = ifnull(fbm.get("matched"), List());
+						fbReusableQuoteIds = ifnull(fbm.get("reusable"), List());
+						fbQuoteAlreadyOk = (fbMatched.size() >= 1);
+						if(fbQuoteAlreadyOk == true)
+						{
+							fbCreated = fbCreated + 1;
+							continue;
+						}
+						if(fbReusableQuoteIds.size() == 1)
+						{
+							fbReuseQid = fbReusableQuoteIds.get(0).toString();
+							fbReuseFull = Map();
+							fbReuseGetResp = invokeurl
+							[
+								url: "https://www.zohoapis.eu/crm/v6/Quotes/" + fbReuseQid
+								type: GET
+								connection: "zoho_crm"
+							];
+							if(!isNull(fbReuseGetResp) && !isNull(fbReuseGetResp.get("data")) && fbReuseGetResp.get("data").size() > 0) { fbReuseFull = fbReuseGetResp.get("data").get(0); }
+							fbReuseKeys = ifnull(fbReuseFull.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+							fbReuseHasKey = false;
+							for each frk in fbReuseKeys.toList("\n")
+							{
+								if(frk.trim() == fbActivityKey) { fbReuseHasKey = true; }
+							}
+							fbReuseNewKeys = fbReuseKeys.trim();
+							if(fbReuseHasKey != true)
+							{
+								if(fbReuseNewKeys != "") { fbReuseNewKeys = fbReuseNewKeys + "\n" + fbActivityKey; }
+								else { fbReuseNewKeys = fbActivityKey; }
+							}
+							fbReuseUpd = Map();
+							fbReuseUpd.put("id", fbReuseQid);
+							fbReuseUpd.put("Quote_Applied_Activity_Keys", fbReuseNewKeys);
+							if(taskStart != "") { fbReuseUpd.put("Contract_Date_Start", taskStart); }
+							if(taskEnd != "") { fbReuseUpd.put("Contract_Date_End", taskEnd); }
+							fbReuseBody = Map();
+							fbReuseData = List();
+							fbReuseData.add(fbReuseUpd);
+							fbReuseBody.put("data", fbReuseData);
+							fbReuseBody.put("trigger", List());
+							fbReuseHeaders = Map();
+							fbReuseHeaders.put("Content-Type", "application/json");
+							fbReuseResp = invokeurl
+							[
+								url: "https://www.zohoapis.eu/crm/v6/Quotes/" + fbReuseQid
+								type: PUT
+								parameters: fbReuseBody.toString()
+								connection: "zoho_crm"
+								headers: fbReuseHeaders
+							];
+							fbReuseOk = false;
+							fbReuseArr = null;
+							if(!isNull(fbReuseResp)) { fbReuseArr = fbReuseResp.get("data"); }
+							if(!isNull(fbReuseArr) && fbReuseArr.size() > 0)
+							{
+								fbReuse0 = fbReuseArr.get(0);
+								if(ifnull(fbReuse0.get("code"), "").toString() == "SUCCESS") { fbReuseOk = true; }
+							}
+							if(fbReuseOk == true)
+							{
+								fbCreated = fbCreated + 1;
+								fbCreatedQuoteIds.add(fbReuseQid);
+								automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "fallback_quote_reused", {"deal":dealId.toString(), "quote":fbReuseQid, "product":fbProdId});
+								continue;
+							}
+							fbReasons.add("quote_reuse_key_update_failed:" + fbReuseQid + ":" + ifnull(fbReuseResp, "").toString());
+							continue;
+						}
+						else if(fbReusableQuoteIds.size() > 1)
+						{
+							fbReasons.add("draft_quote_duplicate:" + fbProdId);
+							continue;
+						}
+
+						fbLine = Map();
+						fbLineProd = Map();
+						fbLineProd.put("id", fbProdId);
+						// REST create via Quoted_Items (subform api_name) carries standard AND custom line fields.
+						fbLine.put("Product_Name", fbLineProd);
+						fbLine.put("Quantity", 1);
+						fbLine.put("Quoted_Item_Pricing_Tier", "Base");
+						if(taskBrands != "") { fbLine.put("Quoted_Item_Plan_Brands", taskBrands.toLong()); }
+						if(taskFreq != "") { fbLine.put("Quoted_Item_Frequency", taskFreq); }
+						// Central pricing resolver (no inline/UX-only pricing). The resolver reads family + plan type
+						// from the Product. Unpriced results (Cortex / missing brand count / 360 missing frequency)
+						// leave the line unpriced and raise Manual Review; never invent a price.
+						if(taskBrands != "")
+						{
+							fbPrice = automation.resolveQuoteLinePrice(fbProdId, "", taskBrands, "Base", taskFreq).toMap();
+							if(ifnull(fbPrice.get("valid"), "false").toString() == "true")
+							{
+								fbLine.put("List_Price", ifnull(fbPrice.get("line_acv"), 0));
+							}
+							else
+							{
+								automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "Draft Commercials Task " + taskId + ": Quote line for Product " + fbProdName + " could not be auto-priced (" + ifnull(fbPrice.get("reason"), "pricing_unavailable").toString() + "). Created unpriced; set the price manually.");
+								automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "line_unpriced", {"product":fbProdId, "reason":ifnull(fbPrice.get("reason"), "pricing_unavailable").toString()});
+							}
+						}
+						fbLines = List();
+						fbLines.add(fbLine);
+
+						fbQ = Map();
+						fbQ.put("Subject", automation.buildQuoteSubject(fbAccountName, fbProdName, "", ifnull(fbDeal.get("Deal_Name"), "").toString()));
+						fbQ.put("Quote_Stage", "Draft");
+						fbAccMap = Map(); fbAccMap.put("id", fbAccountId); fbQ.put("Account_Name", fbAccMap);
+						fbDealMap = Map(); fbDealMap.put("id", dealId.toString()); fbQ.put("Deal_Name", fbDealMap);
+						fbProdMap = Map(); fbProdMap.put("id", fbProdId); fbQ.put("Quote_Product", fbProdMap);
+						fbContactMap = Map(); fbContactMap.put("id", contactId.toString()); fbQ.put("Contact_Name", fbContactMap);
+						fbQ.put("Opportunity_Type", fbQuoteOppType);
+						fbQ.put("Quote_Last_Deal_ID", dealId.toString());
+						if(taskStart != "") { fbQ.put("Contract_Date_Start", taskStart); }
+						if(taskEnd != "") { fbQ.put("Contract_Date_End", taskEnd); }
+						fbQ.put("Quoted_Items", fbLines);
+						fbQ.put("Quote_Applied_Activity_Keys", fbActivityKey);
+
+						automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "fallback_quote_create_attempt", {"deal":dealId.toString(), "product":fbProdId, "brands":taskBrands});
+						// Create the Quote via the REST API (zoho_crm connection) in ONE call. Native Deluge createRecord
+						// uses the reserved Product_Details contract which DROPS custom subform fields; the REST API
+						// persists the Quoted_Items custom fields (Quoted_Item_Pricing_Tier/Plan_Brands) directly.
+						// trigger:[] suppresses WF020 -> handleQuoteStageChange -> processDeal recursion.
+						fbCrBody = Map();
+						fbCrData = List();
+						fbCrData.add(fbQ);
+						fbCrBody.put("data", fbCrData);
+						fbCrBody.put("trigger", List());
+						fbCrHeaders = Map();
+						fbCrHeaders.put("Content-Type", "application/json");
+						fbCreateResp = invokeurl
+						[
+							url: "https://www.zohoapis.eu/crm/v6/Quotes"
+							type: POST
+							parameters: fbCrBody.toString()
+							connection: "zoho_crm"
+							headers: fbCrHeaders
+						];
+						automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "fallback_quote_create_response", {"deal":dealId.toString(), "product":fbProdId, "resp":ifnull(fbCreateResp, "").toString()});
+						fbNewQid = "";
+						fbCrArr = null;
+						if(!isNull(fbCreateResp)) { fbCrArr = fbCreateResp.get("data"); }
+						if(!isNull(fbCrArr) && fbCrArr.size() > 0)
+						{
+							fbCr0 = fbCrArr.get(0);
+							if(ifnull(fbCr0.get("code"), "").toString() == "SUCCESS")
+							{
+								fbCrDet = fbCr0.get("details");
+								if(!isNull(fbCrDet) && !isNull(fbCrDet.get("id"))) { fbNewQid = fbCrDet.get("id").toString(); }
+							}
+						}
+						if(fbNewQid == "")
+						{
+							fbReasons.add("quote_create_failed:" + ifnull(fbCreateResp, "").toString());
+						}
+						else
+						{
+							// Strict readback via REST GET (read-after-write consistent): tier + brands must survive.
+							fbMetaOk = false;
+							fbGetResp = invokeurl
+							[
+								url: "https://www.zohoapis.eu/crm/v6/Quotes/" + fbNewQid
+								type: GET
+								connection: "zoho_crm"
+							];
+							fbVArr = null;
+							if(!isNull(fbGetResp)) { fbVArr = fbGetResp.get("data"); }
+							if(!isNull(fbVArr) && fbVArr.size() > 0)
+							{
+								fbVRec = fbVArr.get(0);
+								fbVLines = fbVRec.get("Quoted_Items");
+								if(!isNull(fbVLines) && fbVLines.size() > 0)
+								{
+									fbVL = fbVLines.get(0);
+									fbTierOk = (ifnull(fbVL.get("Quoted_Item_Pricing_Tier"), "").toString() == "Base");
+									fbBrandsOk = true;
+									if(taskBrands != "") { fbBrandsOk = (ifnull(fbVL.get("Quoted_Item_Plan_Brands"), "").toString() == taskBrands); }
+									if(fbTierOk == true && fbBrandsOk == true) { fbMetaOk = true; }
+								}
+							}
+							automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "fallback_quote_meta_verify", {"quote":fbNewQid, "metaOk":fbMetaOk.toString()});
+							if(fbMetaOk == true)
+							{
+								fbCreated = fbCreated + 1;
+								fbCreatedQuoteIds.add(fbNewQid);
+							}
+							else
+							{
+								fbReasons.add("quote_line_meta_persist_failed:" + fbNewQid);
+							}
+						}
+					}
+				}
+
+				if(fbReasons.size() > 0 || fbCreated == 0)
+				{
+					automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "Draft Commercials Task " + taskId + " could not apply Product evidence. processDeal outcome=" + ifnull(pdDraft.get("outcome"), "").toString() + " raw=" + ifnull(pdRawDraft, "").toString() + " fallback=" + fbReasons.toString() + ". Resolve the Quote/Product issue and re-run.");
+					automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "product_evidence_blocked", {"deal":dealId.toString(), "outcome":ifnull(pdDraft.get("outcome"), "").toString(), "fallback":fbReasons.toString()});
+					zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+					return;
+				}
+				automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "fallback_quote_created", {"deal":dealId.toString(), "count":fbCreated.toString()});
+			}
+		}
+		draftEvidenceReasons = List();
+		if(taskBrands == "") { draftEvidenceReasons.add("missing_contract_brands"); }
+		if(taskStart == "") { draftEvidenceReasons.add("missing_contract_start"); }
+		if(taskEnd == "") { draftEvidenceReasons.add("missing_contract_end"); }
+		if(draftEvidenceReasons.size() > 0)
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "[draft_commercials_incomplete_terms] Draft Commercials Task " + taskId + " created/updated Quote evidence but is missing commercial terms: " + draftEvidenceReasons.toString() + ". Complete the Task evidence and re-run before Send Commercials is surfaced.");
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "incomplete_terms_blocked", {"deal":dealId.toString(), "reasons":draftEvidenceReasons.toString()});
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+			return;
+		}
+
+		draftDeal = zoho.crm.getRecordById("Deals", dealId);
+		draftQuoteOppType = "FTP";
+		if(!isNull(draftDeal) && ifnull(draftDeal.get("Stage"), "").toString() == "RTP") { draftQuoteOppType = "RTP"; }
+		draftActivityKey = "Tasks:" + taskId.toString();
+		draftReasons = List();
+		draftProductIds = List();
+
+		for each taskProdName in taskProductList
+		{
+			safeTaskProdName = ifnull(taskProdName, "").toString().trim().replaceAll("  ", " ");
+			if(safeTaskProdName == "Jurni Cortex - Fixed") { safeTaskProdName = "Jurnii Cortex - Fixed"; }
+			if(safeTaskProdName == "Jurni Cortex - Flex") { safeTaskProdName = "Jurnii Cortex - Flex"; }
+			if(safeTaskProdName == "") { continue; }
+			matches = zoho.crm.searchRecords("Products", "(Product_Name:equals:" + safeTaskProdName + ")");
+			matchId = "";
+			matchCount = 0;
+			if(!isNull(matches) && matches.size() > 0 && !matches.toString().startsWith("{\"code\""))
+			{
+				for each mp in matches
+				{
+					if(ifnull(mp.get("Product_Name"), "").toString().trim() == safeTaskProdName)
+					{
+						isActiveMp = ifnull(mp.get("Product_Active"), false);
+						if(isActiveMp == true || isActiveMp == "true")
+						{
+							matchCount = matchCount + 1;
+							matchId = mp.get("id").toString();
+						}
+					}
+				}
+			}
+			if(matchCount == 1 && matchId != "")
+			{
+				draftProductIds.add(matchId);
+			}
+			else if(matchCount > 1)
+			{
+				draftReasons.add("product_ambiguous:" + safeTaskProdName);
+			}
+			else
+			{
+				draftReasons.add("product_unresolved:" + safeTaskProdName);
+			}
+		}
+
+		dealProdIds = List();
+		draftDealProducts = zoho.crm.getRelatedRecords("Products", "Deals", dealId);
+		if(!isNull(draftDealProducts) && draftDealProducts.size() > 0 && !draftDealProducts.toString().startsWith("{\"code\""))
+		{
+			for each dp in draftDealProducts
+			{
+				if(!isNull(dp.get("id"))) { dealProdIds.add(dp.get("id").toString()); }
+			}
+		}
+
+		// ---- contact-product links (Products12 surfaces the Contacts_X_Products junction) ----
+		// Resolve the linked-product id set ROBUSTLY: a junction record can surface the product as
+		// its own id, Product_Details, or Product_Interest, and Products12 can lag / not surface a
+		// freshly created link, so also read the Contacts_X_Products junction directly. Then
+		// SELF-HEAL: idempotently create the contact-product link (Contact.Products_Linked, i.e. the
+		// Contacts_X_Products junction) for any drafted product not yet linked, BEFORE the
+		// prerequisite is evaluated. This stops the commercial flow from staying permanently blocked
+		// when an earlier processDeal run (gated by incomplete pricing / Company Tier) never
+		// established the link: re-running Draft Commercials once the prerequisites are supplied
+		// establishes it here from the existing product association and continues normally.
+		contactProdIds = List();
+		draftContactProducts = zoho.crm.getRelatedRecords("Products12", "Contacts", contactId);
+		if(isNull(draftContactProducts) || draftContactProducts.size() == 0 || draftContactProducts.toString().startsWith("{\"code\""))
+		{
+			draftContactProducts = zoho.crm.getRelatedRecords("Products", "Contacts", contactId);
+		}
+		if(!isNull(draftContactProducts) && draftContactProducts.size() > 0 && !draftContactProducts.toString().startsWith("{\"code\""))
+		{
+			for each cp in draftContactProducts
+			{
+				cpProdId = "";
+				if(!isNull(cp.get("id"))) { cpProdId = cp.get("id").toString(); }
+				cpDet = cp.get("Product_Details");
+				if(!isNull(cpDet) && !isNull(cpDet.get("id"))) { cpProdId = cpDet.get("id").toString(); }
+				cpPI = cp.get("Product_Interest");
+				if(!isNull(cpPI) && !isNull(cpPI.get("id"))) { cpProdId = cpPI.get("id").toString(); }
+				if(cpProdId != "" && !contactProdIds.contains(cpProdId)) { contactProdIds.add(cpProdId); }
+			}
+		}
+		// direct junction fallback (Products12 can lag / not surface a freshly-created link)
+		cxpLinks = zoho.crm.searchRecords("Contacts_X_Products", "(Contacts:equals:" + contactId + ")");
+		if(!isNull(cxpLinks) && cxpLinks.size() > 0 && !cxpLinks.toString().startsWith("{\"code\""))
+		{
+			for each cxp in cxpLinks
+			{
+				cxpProdId = "";
+				cxpPI = cxp.get("Product_Interest");
+				if(!isNull(cxpPI) && !isNull(cxpPI.get("id"))) { cxpProdId = cxpPI.get("id").toString(); }
+				if(cxpProdId != "" && !contactProdIds.contains(cxpProdId)) { contactProdIds.add(cxpProdId); }
+			}
+		}
+		// SELF-HEAL: idempotently establish Products_Linked for any drafted product not yet linked.
+		for each healProdId in draftProductIds
+		{
+			if(!contactProdIds.contains(healProdId))
+			{
+				healLinkMap = Map();
+				healLinkMap.put("Contacts", contactId.toString());
+				healLinkMap.put("Product_Interest", healProdId);
+				healResp = zoho.crm.createRecord("Contacts_X_Products", healLinkMap);
+				automation.logAutomationEvent("handleTaskCompletion", "Contacts", contactId.toString(), "draft_commercials_contact_link_healed", healProdId, {"deal":dealId.toString()});
+				contactProdIds.add(healProdId);
+			}
+		}
+
+		// ---- canonical Draft-Quote verification (SAME resolver as the fallback reuse detection) ----
+		// Pass quote(s) created THIS run so a fresh quote is evaluated directly even if the Deal-
+		// Quotes related list still lags. The resolver owns robust retrieval + applied-key parsing
+		// and logs every candidate with its accept/reject reason. Exactly one match -> proceed;
+		// none -> draft_quote_missing; more than one -> a specific ambiguity (never pick arbitrarily).
+		fbCreatedCsv = "";
+		for each fbCqId in fbCreatedQuoteIds
+		{
+			if(fbCreatedCsv != "") { fbCreatedCsv = fbCreatedCsv + "," + fbCqId.toString(); }
+			else { fbCreatedCsv = fbCqId.toString(); }
+		}
+		for each draftProdId in draftProductIds
+		{
+			if(!dealProdIds.contains(draftProdId)) { draftReasons.add("deal_product_missing:" + draftProdId); }
+			if(!contactProdIds.contains(draftProdId)) { draftReasons.add("contact_product_missing:" + draftProdId); }
+			dqmRaw = automation.matchDraftQuotes(dealId.toString(), draftProdId, draftQuoteOppType, draftActivityKey, fbCreatedCsv);
+			dqm = Map();
+			if(!isNull(dqmRaw) && dqmRaw.toString().trim() != "") { dqm = dqmRaw.toString().toMap(); }
+			dqmMatched = ifnull(dqm.get("matched"), List());
+			if(dqmMatched.size() == 0) { draftReasons.add("draft_quote_missing:" + draftProdId); }
+			else if(dqmMatched.size() > 1) { draftReasons.add("draft_quote_ambiguous:" + draftProdId + ":" + dqmMatched.toString()); }
+		}
+
+		if(draftReasons.size() > 0)
+		{
+			automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "[draft_commercials_package_blocked] Draft Commercials Task " + taskId + " blocked: " + draftReasons.toString() + ". Correct Product/Quote evidence and re-run.");
+			automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "package_blocked", {"deal":dealId.toString(), "reasons":draftReasons.toString()});
+			zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Open", "Task_Status":"Working", "Status":"In Progress"}, noTrigger);
+			return;
+		}
+		newSendId = automation.createAuxTask(contactId.toString(), dealId.toString(), "Send Commercials", "Commercials drafted - send to the customer to advance to Commercial Agreement.");
+		zoho.crm.updateRecord("Tasks", taskId, {"Task_State":"Won", "Task_Status":"Closed", "Status":"Completed"}, noTrigger);
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "draft_commercials", "send_commercials_surfaced", {"contact":contactId.toString(), "send_task":newSendId});
+		return;
+	}
+	if(tType == "Manual Review" || tType == "Suppression Review")
+	{
+		automation.routeContactSequence(contactId.toString(), dealId.toString(), "resume", "{}");
+		automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "review_resolved", "resumed", {"contact":contactId.toString(), "type":tType});
+		return;
+	}
+
+	// Generic sequence-managed stage task: Task_State=Won advances the stage where
+	// task success genuinely is the stage gate (routeContactSequence/processDeal own the writes).
+	automation.routeContactSequence(contactId.toString(), dealId.toString(), "task:positive", taskActivityCtx.toString());
+	automation.logAutomationEvent("handleTaskCompletion", "Tasks", taskId.toString(), "task_positive", "advanced", {"contact":contactId.toString(), "type":tType, "products":taskProductList.size().toString()});
+	return;
+}

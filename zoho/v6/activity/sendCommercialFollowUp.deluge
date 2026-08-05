@@ -1,0 +1,87 @@
+void automation.sendCommercialFollowUp(string dealIdStr)
+{
+	// =========================================================================
+	// sendCommercialFollowUp  (WF010d — date-based on Deal.Next_Comm_Follow_Up_Date)
+	//
+	// Re-engages the Commercial Agreement cadence for the Deal's Primary Contact when
+	// a deferred commercial follow-up date is reached. Guarded so it only fires while
+	// the Deal is genuinely awaiting signature.
+	//
+	//   Guard: Automation_Suppressed != true; Opportunity_Stage = "Commercial Agreement";
+	//          Opportunity_State = "Open"; Primary Contact State = Open + Sequence_State != "Stopped";
+	//          >=1 related Quote still in flight (Delivered / Negotiation / On Hold).
+	//   -> routeContactSequence(primaryId, dealId, "commercial:followup_due", "{}")
+	// =========================================================================
+
+	info "VERSION: v6-contact-centric";
+
+	dealId = 0;
+	if(!isNull(dealIdStr) && dealIdStr != "") { dealId = dealIdStr.toLong(); }
+	if(dealId == 0) { return; }
+
+	deal = zoho.crm.getRecordById("Deals", dealId);
+	if(isNull(deal) || isNull(deal.get("id"))) { return; }
+
+	if(ifnull(deal.get("Automation_Suppressed"), false).toString() == "true")
+	{
+		automation.logAutomationEvent("sendCommercialFollowUp", "Deals", dealId.toString(), "guard", "skip_suppressed", null);
+		return;
+	}
+	if(ifnull(deal.get("Opportunity_Stage"), "").toString() != "Commercial Agreement")
+	{
+		automation.logAutomationEvent("sendCommercialFollowUp", "Deals", dealId.toString(), "guard", "skip_not_commercial_agreement", {"opp_stage":ifnull(deal.get("Opportunity_Stage"), "").toString()});
+		return;
+	}
+	// Commercials_Status retired AND the commercial timestamp fields (Commercials_Sent_At/Signed_At)
+	// do NOT exist live -> gate on the real surviving signal: the Deal is at Commercial Agreement
+	// (checked above; only reached via commercial:sent) and still Open (signing advances to Onboarding;
+	// loss closes it). No phantom-field dependency.
+	if(ifnull(deal.get("Opportunity_State"), "").toString() != "Open")
+	{
+		automation.logAutomationEvent("sendCommercialFollowUp", "Deals", dealId.toString(), "guard", "skip_not_open", {"opp_state":ifnull(deal.get("Opportunity_State"), "").toString()});
+		return;
+	}
+
+	primaryId = "";
+	cnLookup = deal.get("Contact_Name");
+	if(!isNull(cnLookup) && !isNull(cnLookup.get("id"))) { primaryId = cnLookup.get("id").toString(); }
+	if(primaryId == "")
+	{
+		automation.logAutomationEvent("sendCommercialFollowUp", "Deals", dealId.toString(), "guard", "no_primary_contact", null);
+		return;
+	}
+	primary = zoho.crm.getRecordById("Contacts", primaryId.toLong());
+	if(isNull(primary) || ifnull(primary.get("State"), "").toString() != "Open")
+	{
+		automation.logAutomationEvent("sendCommercialFollowUp", "Deals", dealId.toString(), "guard", "primary_not_open", {"contact":primaryId});
+		return;
+	}
+
+	// dispatch switch (Contact-relative): a Stopped Contact sequence suppresses re-engagement
+	if(ifnull(primary.get("Sequence_State"), "").toString() == "Stopped")
+	{
+		automation.logAutomationEvent("sendCommercialFollowUp", "Deals", dealId.toString(), "guard", "primary_sequence_stopped", {"contact":primaryId});
+		return;
+	}
+
+	// Quote-derived gate: only chase while a commercial Quote is still in flight
+	// (Delivered / Negotiation / On Hold). Replaces the retired Commercials_Sent_At/Signed_At signal.
+	hasInFlight = false;
+	dq = zoho.crm.getRelatedRecords("Quotes", "Deals", dealId);
+	if(!isNull(dq) && dq.size() > 0 && !dq.toString().startsWith("{\"code\""))
+	{
+		inFlightSet = {"Delivered", "Negotiation", "On Hold"};
+		for each q in dq
+		{
+			if(inFlightSet.contains(ifnull(q.get("Quote_Stage"), "").toString())) { hasInFlight = true; }
+		}
+	}
+	if(!hasInFlight)
+	{
+		automation.logAutomationEvent("sendCommercialFollowUp", "Deals", dealId.toString(), "guard", "no_in_flight_quote", null);
+		return;
+	}
+
+	automation.routeContactSequence(primaryId, dealId.toString(), "commercial:followup_due", "{}");
+	automation.logAutomationEvent("sendCommercialFollowUp", "Deals", dealId.toString(), "routed", "commercial_followup_due", {"contact":primaryId});
+}

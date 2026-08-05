@@ -1,0 +1,14 @@
+void automation.handleEmailBounced(string relatedDealIdStr, string relatedContactIdStr)
+{
+	// =========================================================================
+	// handleEmailBounced — WF009b wrapper
+	//
+	// Thin entry point invoked by WF009b (Emails / Outgoing email / Bounced).
+	// Delegates to handleEmailEvent with eventType="bounced" hardcoded so the
+	// workflow UI does not bind a static literal that becomes immutable post-
+	// save. emailRecordIdStr is hardcoded to "0" because the Emails module
+	// exposes no Id merge field; the core only uses it for logging.
+	// =========================================================================
+
+	automation.handleEmailEvent("0", "bounced", relatedDealIdStr, relatedContactIdStr);
+}

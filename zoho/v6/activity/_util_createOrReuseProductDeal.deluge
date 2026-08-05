@@ -1,0 +1,196 @@
+string automation.createOrReuseProductDeal(string accountId, string accountKey, string productId, string productName, string productKey, string accountName)
+{
+	// =========================================================================
+	// _util_createOrReuseProductDeal   (VERSION: v6-product-deal)
+	//
+	// The single entry point for the "Deal = Account x Product" invariant. Keys the
+	// Product Deal deterministically as:
+	//     Deal_Key = {accountKey} :: {productKey}
+	// (Phase 1 replaces the legacy "{accountKey}::active" account-level key with
+	// this product-scoped key.) Requires Deals.Deal_Key UNIQUE.
+	//
+	// Reuses the existing Product Deal if one carries that Deal_Key (any state --
+	// a churned/Lost Product Deal that returns is re-used, not duplicated; the
+	// caller/processDeal decides whether to re-open it). Otherwise creates a
+	// minimal Product Deal and returns its id. Reconciliation (Amount, Contact,
+	// Opportunity_* derivation, Contact Roles, Account rollup) is left to
+	// processDeal -- this helper only guarantees the one-Deal-per-product box.
+	//
+	// createRecord runs WITHOUT trigger suppression (matching processAccount /
+	// ensureDealQuote), so WFC-Deal may fire processDeal on the new Deal; that is
+	// idempotent and the caller also calls processDeal explicitly.
+	//
+	// A brand-new Product Deal is Opportunity_State=Open / Opportunity_Status=New
+	// (the codebase convention for a freshly-created Deal at Marketing Consent;
+	// "New" is a live-valid Opportunity_Status value, confirmed in Deal data).
+	// processDeal re-derives Status to "Working" once a Contact is being worked.
+	//
+	// Returns a JSON string (parse with .toMap()):
+	//   valid ("true"/"false"), deal_id, created ("true"/"false"), reason
+	// =========================================================================
+	r = Map();
+	r.put("valid", "false");
+	r.put("deal_id", "");
+	r.put("created", "false");
+	r.put("reason", "init");
+
+	accId = ifnull(accountId, "").toString().replaceAll("zcrm_", "").trim();
+	aKey = ifnull(accountKey, "").toString().trim();
+	pKey = ifnull(productKey, "").toString().trim();
+	pId = ifnull(productId, "").toString().replaceAll("zcrm_", "").trim();
+	pName = ifnull(productName, "").toString().trim();
+	aName = ifnull(accountName, "").toString().trim();
+
+	if(accId == "" || !accId.matches("[0-9]+")) { r.put("reason", "invalid_account_id"); return r.toString(); }
+	if(aKey == "" || pKey == "") { r.put("reason", "missing_key_parts"); return r.toString(); }
+
+	// Product -> Pipeline is authoritative (single source: pipelineForProductKey). An
+	// UNRESOLVED product key must NOT create a Deal: the Pipeline field is mandatory, so a
+	// created Deal would default to B2B = silent misclassification. Return unresolved so the
+	// caller (processLead / processContact / processAccount) logs it + raises a Manual Review
+	// and skips. In practice only the 4 canonical keys reach here (resolveDealProduct filters
+	// upstream), so this is a defensive guard.
+	pipeline = automation.pipelineForProductKey(pKey);
+	if(pipeline == "unresolved")
+	{
+		automation.logAutomationEvent("createOrReuseProductDeal", "Deals", "-", "guard", "pipeline_unresolved_product", {"product_key":pKey, "product":pName});
+		r.put("reason", "pipeline_unresolved_product");
+		return r.toString();
+	}
+
+	dealKey = aKey + "::" + pKey;
+
+	// ---- reuse by Deal_Key (unique) ----
+	existing = zoho.crm.searchRecords("Deals", "(Deal_Key:equals:" + dealKey + ")");
+	if(!isNull(existing) && existing.size() > 0 && !existing.toString().startsWith("{\"code\""))
+	{
+		chosen = "";
+		minId = 999999999999999999;
+		for each d in existing
+		{
+			did = ifnull(d.get("id"), "").toString();
+			if(did != "" && did.matches("[0-9]+") && did.toLong() < minId) { minId = did.toLong(); chosen = did; }
+		}
+		if(chosen != "")
+		{
+			if(existing.size() > 1)
+			{
+				automation.logAutomationEvent("createOrReuseProductDeal", "Deals", chosen, "reuse", "duplicate_deal_key_found", {"deal_key":dealKey, "count":existing.size().toString()});
+			}
+			r.put("valid", "true");
+			r.put("deal_id", chosen);
+			r.put("created", "false");
+			r.put("reason", "reused");
+			return r.toString();
+		}
+	}
+
+	// ---- create the Product Deal ----
+	dealName = "";
+	if(aName != "" && pName != "") { dealName = aName + " - " + pName; }
+	else if(pName != "") { dealName = aKey + " - " + pName; }
+	else { dealName = aKey + " Deal"; }
+
+	dm = Map();
+	dm.put("Deal_Name", dealName);
+	dm.put("Account_Name", accId);
+	dm.put("Deal_Key", dealKey);
+	dm.put("Deal_Product_Key", pKey);
+	if(pId != "" && pId.matches("[0-9]+")) { pm = Map(); pm.put("id", pId); dm.put("Deal_Product", pm); }
+	// Pipeline is a mandatory special field. Native zoho.crm.createRecord DROPS it (the Deal
+	// defaults to B2B) — verified 2026-07-19. The v6 Records INSERT API accepts Pipeline when a
+	// compatible Stage is sent in the SAME create payload (MQL is valid under both pipelines), so
+	// Partnership Deals are created via a direct REST Insert (invokeurl POST). B2B/blank keep the
+	// native createRecord (their B2B default is already correct → B2B creation is unchanged).
+	dm.put("Pipeline", pipeline);
+	// Deal viability = Opportunity_State / Opportunity_Status (Deals have NO bare State/Status).
+	// Deals are never Won (spec decision 2): Opportunity_State in {Open, Lost} only.
+	dm.put("Opportunity_State", "Open");
+	dm.put("Opportunity_Status", "New");
+	closeDate = zoho.currentdate.addDay(30).toString("yyyy-MM-dd");
+	dm.put("Closing_Date", closeDate);
+
+	newId = "";
+	createReason = "created";
+	restRaw = "";
+
+	if(pipeline == "Partnership")
+	{
+		// ---- direct REST Deals Insert with Pipeline + Stage together ----
+		// Native zoho.crm.createRecord DROPS the mandatory Pipeline special field (Deal defaults to B2B),
+		// so a Partnership Deal must be created via the v6 Records INSERT API, which accepts Pipeline when a
+		// compatible Stage rides in the SAME payload (MQL is valid under both pipelines). Uses the zoho_crm
+		// connection (needs ZohoCRM.modules.deals scope + an authorized/connected state — verified live
+		// 2026-07-19). trigger:[] suppresses the workflow cascade (parity with native createRecord; avoids a
+		// second processDeal). The full response is logged; on failure we fall back to native + flag the Deal.
+		acctLk = Map(); acctLk.put("id", accId);
+		restRec = Map();
+		restRec.put("Deal_Name", dealName);
+		restRec.put("Account_Name", acctLk);
+		restRec.put("Deal_Key", dealKey);
+		restRec.put("Deal_Product_Key", pKey);
+		if(pId != "" && pId.matches("[0-9]+")) { prodLk = Map(); prodLk.put("id", pId); restRec.put("Deal_Product", prodLk); }
+		restRec.put("Opportunity_State", "Open");
+		restRec.put("Opportunity_Status", "New");
+		restRec.put("Closing_Date", closeDate);
+		restRec.put("Pipeline", "Partnership");
+		restRec.put("Stage", "MQL");
+		restBody = Map(); restData = List(); restData.add(restRec); restBody.put("data", restData); restBody.put("trigger", List());
+		restHdr = Map(); restHdr.put("Content-Type", "application/json");
+		restResp = invokeurl
+		[
+			url: "https://www.zohoapis.eu/crm/v6/Deals"
+			type: POST
+			parameters: restBody.toString()
+			connection: "zoho_crm"
+			headers: restHdr
+		];
+		restRaw = ifnull(restResp, "").toString();
+		if(!isNull(restResp) && restRaw.startsWith("{") && !isNull(restResp.get("data")) && restResp.get("data").size() > 0)
+		{
+			d0 = restResp.get("data").get(0);
+			if(ifnull(d0.get("code"), "").toString() == "SUCCESS" && !isNull(d0.get("details")) && !isNull(d0.get("details").get("id"))) { newId = d0.get("details").get("id").toString(); }
+		}
+		automation.logAutomationEvent("createOrReuseProductDeal", "Deals", ifnull(newId, "-").toString(), "pipeline_rest_insert", if(newId != "", "created_partnership", "failed"), {"deal_key":dealKey, "resp":restRaw});
+		if(newId != "")
+		{
+			createReason = "created_rest_partnership";
+		}
+		else
+		{
+			// REST insert did not create the Deal (e.g. the zoho_crm connection is disconnected / loses its
+			// Deals scope). Fall back to native createRecord so the import is not broken. The Deal is STILL
+			// held out of B2B automation by its Deal_Product_Key == "partnership" (processDeal C1 gate), so only
+			// the Pipeline *field* is wrong (native drops it -> defaults to B2B). Flag it on the Deal for manual
+			// correction; the full REST response is in the automation log (logAutomationEvent above).
+			res = zoho.crm.createRecord("Deals", dm);
+			if(!isNull(res) && !isNull(res.get("id"))) { newId = res.get("id").toString(); }
+			else if(!isNull(res) && res.get("code") == "DUPLICATE_DATA" && !isNull(res.get("details")) && !isNull(res.get("details").get("id"))) { newId = res.get("details").get("id").toString(); }
+			if(newId != "")
+			{
+				zoho.crm.updateRecord("Deals", newId.toLong(), {"Description": "[partnership_pipeline_rest_failed] Partnership Deal created via native fallback; Pipeline defaulted to B2B and needs manual correction to Partnership. Check the zoho_crm connection (Setup > Connections). Full REST response is in the automation log."}, {"trigger": List()});
+			}
+			createReason = "created_native_rest_failed";
+		}
+	}
+	else
+	{
+		res = zoho.crm.createRecord("Deals", dm);
+		if(!isNull(res) && !isNull(res.get("id"))) { newId = res.get("id").toString(); }
+		else if(!isNull(res) && res.get("code") == "DUPLICATE_DATA" && !isNull(res.get("details")) && !isNull(res.get("details").get("id"))) { newId = res.get("details").get("id").toString(); }
+	}
+
+	if(newId == "")
+	{
+		r.put("reason", "create_failed");
+		automation.logAutomationEvent("createOrReuseProductDeal", "Deals", "-", "create", "failed", {"deal_key":dealKey, "rest_resp":restRaw});
+		return r.toString();
+	}
+
+	r.put("valid", "true");
+	r.put("deal_id", newId);
+	r.put("created", "true");
+	r.put("reason", createReason);
+	automation.logAutomationEvent("createOrReuseProductDeal", "Deals", newId, "create", "product_deal_created", {"deal_key":dealKey, "product":pName, "pipeline":pipeline});
+	return r.toString();
+}

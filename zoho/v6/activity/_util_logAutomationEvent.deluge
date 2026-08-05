@@ -1,0 +1,28 @@
+void automation.logAutomationEvent(string functionName, string moduleName, string recordId, string action, string outcome, map payload)
+{
+	// =========================================================================
+	// _util_logAutomationEvent   (VERSION: v6-shared-utility)
+	// (No `info "VERSION..."` banner here on purpose — this logger runs on a hot
+	//  path and would otherwise spam the log on every parent call.)
+	//
+	// Single emit point for structured automation logs. Every activity-layer
+	// function should call this on entry, exit, and at any decision branch the
+	// user might want to grep for in CRM logs. Keeping the format identical
+	// lets a downstream ingestion / dashboard parse the lines without per-
+	// function knowledge.
+	//
+	// Format:
+	//   automation_event func=<f> module=<m> record=<id> action=<a>
+	//                    outcome=<o> payload=<map_or_empty>
+	//
+	// payload should be small (a Map of the actually-relevant fields, not the
+	// whole record) to keep info lines readable.
+	// =========================================================================
+
+	payloadStr = "";
+	if(!isNull(payload) && payload.size() > 0)
+	{
+		payloadStr = payload.toString();
+	}
+	info "automation_event func=" + ifnull(functionName, "?") + " module=" + ifnull(moduleName, "?") + " record=" + ifnull(recordId, "?") + " action=" + ifnull(action, "?") + " outcome=" + ifnull(outcome, "?") + " payload=" + payloadStr;
+}

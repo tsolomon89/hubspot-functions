@@ -1,0 +1,104 @@
+void automation.handleQuoteStageChange(string quoteIdStr)
+{
+	// =========================================================================
+	// handleQuoteStageChange  (v6 thin Quote-workflow adapter — WF020/WF021)
+	//
+	// Fires on Quote create_or_edit (WF021; WF020 stage-change is superseded).
+	// ALL Quote-lifecycle behaviour (Delivered -> commercial:sent, Confirmed ->
+	// contract ledger + commercial:signed term gate, Closed Lost -> Amount
+	// recompute only / never closes the Deal) now lives inside processDeal. This
+	// adapter only COORDINATES which Deal(s) to reconcile and owns the two-Deal
+	// reassignment handshake via Quote_Last_Deal_ID.
+	//
+	//   oldDealId (= Quote_Last_Deal_ID) vs newDealId (= Quote.Deal_Name):
+	//     moved A->B   -> processDeal(A, role=old) then processDeal(B, role=new);
+	//                     stamp Quote_Last_Deal_ID=B only after BOTH succeed
+	//     unlinked     -> processDeal(A, role=old) then clear Quote_Last_Deal_ID
+	//     no move      -> processDeal(B, role=current); ensure marker = B
+	//
+	// processDeal reconciles ONLY the Deal it is given (no canonical redirect),
+	// owns Automation_Suppressed, and returns {success,outcome,...}. Quote deletion
+	// is prohibited operationally — use Closed Lost.
+	// =========================================================================
+
+	info "VERSION: v6-quote-adapter";
+
+	qId = 0;
+	if(!isNull(quoteIdStr) && quoteIdStr != "") { qId = quoteIdStr.toLong(); }
+	automation.logAutomationEvent("handleQuoteStageChange", "Quotes", ifnull(qId, "").toString(), "entry", "in_progress", null);
+	if(qId == 0) { return; }
+
+	quote = zoho.crm.getRecordById("Quotes", qId);
+	if(isNull(quote) || isNull(quote.get("id"))) { return; }
+
+	newDealId = "";
+	dnLookup = quote.get("Deal_Name");
+	if(!isNull(dnLookup) && !isNull(dnLookup.get("id"))) { newDealId = dnLookup.get("id").toString(); }
+	oldDealId = ifnull(quote.get("Quote_Last_Deal_ID"), "").toString().trim();
+
+	noTrigger = Map();
+	noTrigger.put("trigger", List());
+
+	// ---- build a quote-context Map (reconciliationRole set per call) ----
+	baseCtx = Map();
+	baseCtx.put("source", "quote");
+	baseCtx.put("quoteId", qId.toString());
+	baseCtx.put("oldDealId", oldDealId);
+	baseCtx.put("newDealId", newDealId);
+
+	// ---- reassignment: Quote moved from Deal A to Deal B ----
+	if(oldDealId != "" && newDealId != "" && oldDealId != newDealId)
+	{
+		baseCtx.put("reconciliationRole", "old");
+		rOld = automation.processDeal(oldDealId, baseCtx.toString()).toMap();
+		baseCtx.put("reconciliationRole", "new");
+		rNew = automation.processDeal(newDealId, baseCtx.toString()).toMap();
+
+		oldOk = ifnull(rOld.get("success"), false) == true;
+		newOk = ifnull(rNew.get("success"), false) == true;
+		if(oldOk && newOk)
+		{
+			zoho.crm.updateRecord("Quotes", qId, {"Quote_Last_Deal_ID":newDealId}, noTrigger);
+			// re-read + verify the marker before considering reassignment complete
+			verify = zoho.crm.getRecordById("Quotes", qId);
+			markerOk = (!isNull(verify) && ifnull(verify.get("Quote_Last_Deal_ID"), "").toString().trim() == newDealId);
+			automation.logAutomationEvent("handleQuoteStageChange", "Quotes", qId.toString(), "reassigned", if(markerOk, "marker_verified", "marker_unverified"), {"old":oldDealId, "new":newDealId});
+		}
+		else
+		{
+			// leave marker as-is so the reassignment retries on the next edit
+			automation.logAutomationEvent("handleQuoteStageChange", "Quotes", qId.toString(), "reassign_incomplete", "old=" + oldOk.toString() + " new=" + newOk.toString(), {"old":oldDealId, "new":newDealId});
+		}
+		return;
+	}
+
+	// ---- unlinked: Deal_Name cleared ----
+	if(newDealId == "" && oldDealId != "")
+	{
+		baseCtx.put("reconciliationRole", "old");
+		rOld = automation.processDeal(oldDealId, baseCtx.toString()).toMap();
+		if(ifnull(rOld.get("success"), false) == true)
+		{
+			zoho.crm.updateRecord("Quotes", qId, {"Quote_Last_Deal_ID":""}, noTrigger);
+		}
+		automation.logAutomationEvent("handleQuoteStageChange", "Quotes", qId.toString(), "unlinked", ifnull(rOld.get("outcome"), "").toString(), {"old":oldDealId});
+		return;
+	}
+
+	// ---- no move (normal create/stage edit on a linked Quote) ----
+	if(newDealId != "")
+	{
+		baseCtx.put("reconciliationRole", "current");
+		rCur = automation.processDeal(newDealId, baseCtx.toString()).toMap();
+		// ensure the marker is set so a future reassignment is detectable
+		if(oldDealId != newDealId)
+		{
+			zoho.crm.updateRecord("Quotes", qId, {"Quote_Last_Deal_ID":newDealId}, noTrigger);
+		}
+		automation.logAutomationEvent("handleQuoteStageChange", "Quotes", qId.toString(), "reconciled", ifnull(rCur.get("outcome"), "").toString(), {"deal":newDealId});
+		return;
+	}
+
+	// ---- no Deal at all ----
+	automation.logAutomationEvent("handleQuoteStageChange", "Quotes", qId.toString(), "no_deal", "skip", null);
+}

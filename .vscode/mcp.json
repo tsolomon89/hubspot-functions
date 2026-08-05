@@ -1,0 +1,28 @@
+{
+	"servers": {
+		"crm-workful-crud": {
+			"url": "https://workfulcrud-20115272845.zohomcp.eu/mcp/54a49d16b736b234f1c8559da4e2e821/message",
+			"type": "http"
+		},
+		"crm-module-crud": {
+			"url": "https://modulecrud-20115272845.zohomcp.eu/mcp/805a7c1a377dc10106e7fe536c1001df/message",
+			"type": "http"
+		},
+		"crm-record-crud": {
+			"url": "https://recordcrud-20115272845.zohomcp.eu/mcp/130a7e7f7cd67170d5ff4ed3bf493fd2/message",
+			"type": "http"
+		},
+		"crm-email-crud": {
+			"url": "https://emailcrud-20115272845.zohomcp.eu/mcp/e14a2a9a90818e362106f69aa7712d5a/message",
+			"type": "http"
+		},
+		"crm-event-crud": {
+			"url": "https://eventcrud-20115272845.zohomcp.eu/mcp/8c5028f323a7d03bc0f1b46205774bf3/message",
+			"type": "http"
+		},
+		"crm-function-crud": {
+			"url": "https://functioncrud-20115272845.zohomcp.eu/mcp/9da8546444ae0385d2296cf7fb173ec6/message",
+			"type": "http"
+		}
+	}
+}

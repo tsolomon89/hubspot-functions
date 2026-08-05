@@ -1,0 +1,102 @@
+string automation.resolveDealProduct(string rawNameOrKey)
+{
+	// =========================================================================
+	// _util_resolveDealProduct   (VERSION: v6-product-deal)
+	//
+	// Resolve a product name / interest / family string to the ONE canonical
+	// name-only Product record (Jurnii UX / Jurnii 360 / Jurnii Cortex /
+	// Partnership). Resolution order (NEVER fuzzy-matches plan variants):
+	//   1. exact known-typo alias fix ("Jurnii Cortext" -> "Jurnii Cortex")
+	//   2. canonical (name-only) Product whose normalised name == wanted key
+	//   3. if none exists yet, resolve the FAMILY name (from a canonical name or a
+	//      plan-variant's Product_Plan_Products) but return NO product_id, with
+	//      reason=canonical_product_missing so the caller raises Manual Review
+	//      [product_unresolved] until Product consolidation lands.
+	//
+	// "name-only" = Product_Plan_Products AND Product_Plan_Type both blank. This is
+	// how a canonical product is distinguished from a legacy "Jurnii UX - Fixed"
+	// plan variant during the transition (both may coexist until manual cleanup).
+	//
+	// Returns a JSON string (parse with .toMap()):
+	//   valid ("true"/"false"), product_id, product_name (canonical),
+	//   product_key, reason
+	// =========================================================================
+	r = Map();
+	r.put("valid", "false");
+	r.put("product_id", "");
+	r.put("product_name", "");
+	r.put("product_key", "");
+	r.put("reason", "init");
+
+	raw = ifnull(rawNameOrKey, "").toString().trim();
+	if(raw == "") { r.put("reason", "empty_input"); return r.toString(); }
+
+	// (1) known exact-typo alias (not fuzzy matching -- a single documented typo seen in live data)
+	if(raw == "Jurnii Cortext") { raw = "Jurnii Cortex"; }
+
+	wantKey = automation.computeProductKey(raw);
+	if(wantKey == "") { r.put("reason", "empty_input"); return r.toString(); }
+
+	prods = zoho.crm.getRecords("Products", 1, 200);
+	if(isNull(prods) || prods.toString().startsWith("{\"code\""))
+	{
+		r.put("reason", "product_read_failed");
+		automation.logAutomationEvent("resolveDealProduct", "Products", "-", "read", "failed", {"want":wantKey});
+		return r.toString();
+	}
+
+	// (2) canonical name-only match
+	canonMatches = List();
+	for each p in prods
+	{
+		pid = ifnull(p.get("id"), "").toString();
+		if(pid == "") { continue; }
+		pName = ifnull(p.get("Product_Name"), "").toString().trim();
+		pFamily = ifnull(p.get("Product_Plan_Products"), "").toString().trim();
+		pPlanType = ifnull(p.get("Product_Plan_Type"), "").toString().trim();
+		isNameOnly = (pFamily == "" && pPlanType == "");
+		if(isNameOnly && automation.computeProductKey(pName) == wantKey)
+		{
+			m = Map(); m.put("id", pid); m.put("name", pName);
+			canonMatches.add(m);
+		}
+	}
+	if(canonMatches.size() == 1)
+	{
+		hit = canonMatches.get(0);
+		cName = hit.get("name").toString();
+		r.put("valid", "true");
+		r.put("product_id", hit.get("id").toString());
+		r.put("product_name", cName);
+		r.put("product_key", automation.computeProductKey(cName));
+		r.put("reason", "resolved_canonical");
+		return r.toString();
+	}
+	if(canonMatches.size() > 1)
+	{
+		r.put("reason", "ambiguous_product");
+		automation.logAutomationEvent("resolveDealProduct", "Products", "-", "resolve", "ambiguous", {"want":wantKey, "count":canonMatches.size().toString()});
+		return r.toString();
+	}
+
+	// (3) no canonical record yet -- resolve the family name for reporting only
+	famName = "";
+	for each p in prods
+	{
+		pName = ifnull(p.get("Product_Name"), "").toString().trim();
+		pFamily = ifnull(p.get("Product_Plan_Products"), "").toString().trim();
+		if(famName == "" && pName != "" && automation.computeProductKey(pName) == wantKey) { famName = pName; }
+		if(famName == "" && pFamily != "" && automation.computeProductKey(pFamily) == wantKey) { famName = pFamily; }
+	}
+	if(famName != "")
+	{
+		r.put("product_name", famName);
+		r.put("product_key", automation.computeProductKey(famName));
+		r.put("reason", "canonical_product_missing");
+		automation.logAutomationEvent("resolveDealProduct", "Products", "-", "resolve", "canonical_missing", {"want":wantKey, "family":famName});
+		return r.toString();
+	}
+
+	r.put("reason", "product_unresolved");
+	return r.toString();
+}

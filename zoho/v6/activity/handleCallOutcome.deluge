@@ -1,0 +1,516 @@
+void automation.handleCallOutcome(string callIdStr)
+{
+	// =========================================================================
+	// handleCallOutcome  (Contact-centric; activity-State surface — WF006)
+	//
+	// PRIMARY surface = Call_Task_State (Open/Won/Lost) + Call_Task_Lost_Reasons.
+	//   Won  -> call:positive (advance the stage)
+	//   Lost -> activity-LOCAL by default via resolveActivityLoss(reason): continue
+	//           cadence / Manual Review / Data Repair / Find Decision Maker /
+	//           suppress / (only on No-Response exhaustion) Contact Lost. Never closes
+	//           the Deal from a Lost Reason alone (loss is module-relative).
+	//   Open -> no routing unless an explicit continuation signal exists
+	//           (Next_Follow_Up_Date => reschedule). An Open edit alone must not advance.
+	//
+	// Call_Task_State blank => no actionable signal. The legacy outcome field has been retired;
+	// State/Status/Lost Reasons is the only routing surface.
+	//
+	// Idempotency (WF006 fires on anyaction): act only on an actionable signal, and
+	// mark the processed call Call_Task_Status=Closed so re-edits skip (canonical
+	// non-actionable marker; Calls has no Stale field). Closed + stale-stage +
+	// processed-attempt guards remain.
+	// CANONICAL actionable Call = Call_Task_State == Open AND Call_Task_Status == Working.
+	// A superseded/rescheduled source Call keeps Call_Task_State=Open (it was not Won/Lost) but
+	// is set Call_Task_Status=Closed + native Outgoing_Call_Status=Cancelled so it is not actionable.
+	// =========================================================================
+
+	info "VERSION: v6-activity-state";
+
+	callId = 0;
+	if(!isNull(callIdStr) && callIdStr != "") { callId = callIdStr.toLong(); }
+	automation.logAutomationEvent("handleCallOutcome", "Calls", ifnull(callId, "").toString(), "entry", "in_progress", null);
+	if(callId == 0) { return; }
+
+	call = zoho.crm.getRecordById("Calls", callId);
+	if(isNull(call) || isNull(call.get("id"))) { return; }
+
+	if(ifnull(call.get("Sequence_Managed"), "No").toString() != "Yes")
+	{
+		automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "guard", "skip_not_sequence_managed", null);
+		return;
+	}
+	if(ifnull(call.get("Call_Task_Status"), "").toString() == "Closed")
+	{
+		automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "guard", "skip_closed", null);
+		return;
+	}
+
+	whatLookup = call.get("What_Id");
+	seModule   = ifnull(call.get("$se_module"), "").toString();
+	if(isNull(whatLookup) || isNull(whatLookup.get("id")) || seModule != "Deals")
+	{
+		automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "guard", "skip_no_related_deal", {"se_module":seModule});
+		return;
+	}
+	dealId = whatLookup.get("id").toLong();
+
+	whoLookup = call.get("Who_Id");
+	if(isNull(whoLookup) || isNull(whoLookup.get("id")))
+	{
+		automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "guard", "skip_no_contact", null);
+		return;
+	}
+	contactId = whoLookup.get("id").toLong();
+
+	// ---- actionable-signal guard (idempotency: do not act on bare edits / mirror writes) ----
+	callTaskState = ifnull(call.get("Call_Task_State"), "").toString().trim();
+	if(callTaskState == "-None-") { callTaskState = ""; }
+	callTaskReason = ifnull(call.get("Call_Task_Lost_Reasons"), "").toString().trim();
+	if(callTaskReason == "-None-") { callTaskReason = ""; }
+	if(callTaskState == "")
+	{
+		automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "guard", "skip_no_signal", null);
+		return;
+	}
+
+	callSeqStage   = ifnull(call.get("Sequence_Stage"), "").toString();
+	callSeqAttempt = ifnull(call.get("Sequence_Attempt"), 0).toLong();
+
+	contact = zoho.crm.getRecordById("Contacts", contactId);
+	if(isNull(contact) || isNull(contact.get("id")))
+	{
+		automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "guard", "contact_not_found", {"contact":contactId.toString()});
+		return;
+	}
+	contactStage    = ifnull(contact.get("Stage"), "").toString();
+	contactSeqStage = ifnull(contact.get("Sequence_Stage"), "").toString();
+	contactStepStr  = ifnull(contact.get("Sequence_Step"), "None").toString();
+	contactSeqState = ifnull(contact.get("Sequence_State"), "").toString();
+
+	// ---- superseded: call belongs to a Stage the Contact has left -> neutralise (not actionable) ----
+	if(callSeqStage != "" && callSeqStage != contactStage)
+	{
+		zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Cancelled"}, {"trigger":List()});
+		automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "guard", "marked_superseded_stage", {"call_stage":callSeqStage, "contact_stage":contactStage});
+		return;
+	}
+	// ---- already processed: contact has moved past this attempt ----
+	if(contactSeqStage == "Call" && contactStepStr != "None" && contactStepStr != "")
+	{
+		if(callSeqAttempt != contactStepStr.toLong())
+		{
+			automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "guard", "skip_processed_attempt", {"call_attempt":callSeqAttempt, "contact_step":contactStepStr});
+			return;
+		}
+	}
+
+	noTrigger = Map();
+	noTrigger.put("trigger", List());
+
+	// Real newline for rep-facing Description text. This org's Deluge stores a literal backslash-n
+	// instead of a line break (verified live 2026-07-07), so line breaks must come from an actual
+	// newline character. hextoText("0A") = line feed (a raw newline in a string literal is not valid Deluge here). The rescheduled-Call
+	// Description below is kept byte-identical to routeContactSequence create_call (shared contract).
+	nl = hextoText("0A");
+
+	// Deal context for activity mirror fields (Pipeline / Opportunity Type).
+	dealRec = zoho.crm.getRecordById("Deals", dealId);
+	dealPipeline = "";
+	dealOppType  = "";
+	if(!isNull(dealRec) && !isNull(dealRec.get("id")))
+	{
+		// F3 FIX: Deluge getRecordById omits the special Pipeline field; resolve via the shared
+		// resolver so rescheduled / next Calls preserve Pipeline.
+		dealPipeline = automation.resolveDealPipeline(dealId.toString());
+		dealOppType  = ifnull(dealRec.get("Stage"), "").toString();
+	}
+
+	// =====================================================================
+	// ACTIVITY-STATE SURFACE: Call_Task_State drives routing (Won / Open / Lost).
+	// =====================================================================
+	if(callTaskState != "")
+	{
+		// ---- WON: the call achieved its purpose -> advance + carry commercial evidence ----
+		if(callTaskState == "Won")
+		{
+			// Build the activity contextJson from the Call's commercial-capture fields.
+			// Call_Task_Contract_Products is a MULTI-SELECT PICKLIST of Product NAME strings
+			// (jsonarray); brands/dates apply to the Product Quote line (not the Contact).
+			actx = Map();
+			actx.put("source", "activity");
+			actx.put("sourceModule", "Calls");
+			actx.put("sourceActivityId", callId.toString());
+			actx.put("contactId", contactId.toString());
+			actx.put("activityState", "Won");
+			prodList = List();
+			rawProds = call.get("Call_Task_Contract_Products");
+			if(!isNull(rawProds))
+			{
+				for each pv in rawProds
+				{
+					pvs = ifnull(pv, "").toString().trim();
+					if(pvs != "" && pvs != "-None-") { prodList.add(pvs); }
+				}
+			}
+			actx.put("products", prodList);
+			cBrands = ifnull(call.get("Call_Task_Contract_Brands"), "").toString().trim();
+			if(cBrands != "") { actx.put("numberOfBrands", cBrands.toLong()); }
+			cStart = ifnull(call.get("Call_Task_Contract_Date_Start"), "").toString().trim();
+			if(cStart != "") { actx.put("contractDateStart", cStart); }
+			cEnd = ifnull(call.get("Call_Task_Contract_Date_End"), "").toString().trim();
+			if(cEnd != "") { actx.put("contractDateEnd", cEnd); }
+			cFreq = ifnull(call.get("Call_Task_Contract_Frequency"), "").toString().trim();
+			if(cFreq == "-None-") { cFreq = ""; }
+			if(cFreq != "") { actx.put("frequency", cFreq); }
+			automation.routeContactSequence(contactId.toString(), dealId.toString(), "call:positive", actx.toString());
+			zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Completed"}, noTrigger);
+			automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_won", "call_positive", {"deal":dealId.toString(), "contact":contactId.toString(), "products":prodList.size().toString()});
+			return;
+		}
+
+		// ---- OPEN: only reschedule if an explicit follow-up date exists; else no-op ----
+		if(callTaskState == "Open")
+		{
+			nextFu = call.get("Next_Follow_Up_Date");
+			if(isNull(nextFu))
+			{
+				automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_open", "skip_no_continuation_signal", {"deal":dealId.toString()});
+				return;
+			}
+			// reschedule this attempt to the explicit follow-up date
+			rescheduledCall = Map();
+			rescheduledCall.put("Subject", contactStage + " Call " + callSeqAttempt);
+			rescheduledCall.put("What_Id", dealId);
+			rescheduledCall.put("$se_module", "Deals");
+			rescheduledCall.put("Who_Id", contactId);
+			rescheduledCall.put("Sequence_Managed", "Yes");
+			rescheduledCall.put("Sequence_Stage", contactStage);
+			rescheduledCall.put("Sequence_Attempt", callSeqAttempt);
+			rescheduledCall.put("Call_Type", "Outbound");
+			rescheduledCall.put("Call_Start_Time", nextFu);
+			// activity mirror fields
+			if(dealPipeline != "") { rescheduledCall.put("Call_Task_Pipeline", dealPipeline); }
+			if(dealOppType != "")  { rescheduledCall.put("Call_Task_Opportunity", dealOppType); }
+			if(contactStage != "") { rescheduledCall.put("Call_Task_Stage", contactStage); }
+			// CALL-2: a rescheduled / in-flight Call is a user-facing sales activity -> Working
+			// (native In Progress), not New, per the NEW/WORKING RULE.
+			rescheduledCall.put("Call_Task_Status", "Working");
+			rescheduledCall.put("Outgoing_Call_Status", "Scheduled");
+			rescheduledCall.put("Call_Task_State", "Open");
+			// Same field-update contract as the sequence-created Call (see routeContactSequence create_call).
+			rescheduledCall.put("Description", "Automation-managed call for the " + contactStage + " sequence (attempt " + callSeqAttempt + ")." + nl + "Log the result on this Call:" + nl + "- Reached and progressed -> set Call Task State = Won" + nl + "- Could not progress -> set Call Task State = Lost + choose Call Task Lost Reasons" + nl + "- Try again later -> set Next Follow-Up Date and leave Call Task State = Open" + nl + "If commercial terms were discussed, quoted or agreed, also fill the Call Task Contract fields (Products / Brands / Date Start / Date End / Frequency) before Won." + nl + "Do not edit Call Task Status, Outgoing Call Status, or the Stage / Pipeline / Sequence fields - automation advances the sequence (and creates/updates the Quote from the Contract fields) once you save the result.");
+			// Part E: carry the complete commercial evidence bundle onto the rescheduled Call.
+			rsProds = call.get("Call_Task_Contract_Products");
+			if(!isNull(rsProds)) { rescheduledCall.put("Call_Task_Contract_Products", rsProds); }
+			rsBrands = ifnull(call.get("Call_Task_Contract_Brands"), "").toString().trim();
+			if(rsBrands != "") { rescheduledCall.put("Call_Task_Contract_Brands", rsBrands.toLong()); }
+			rsStart = ifnull(call.get("Call_Task_Contract_Date_Start"), "").toString().trim();
+			if(rsStart != "") { rescheduledCall.put("Call_Task_Contract_Date_Start", rsStart); }
+			rsEnd = ifnull(call.get("Call_Task_Contract_Date_End"), "").toString().trim();
+			if(rsEnd != "") { rescheduledCall.put("Call_Task_Contract_Date_End", rsEnd); }
+			rsFreq = ifnull(call.get("Call_Task_Contract_Frequency"), "").toString().trim();
+			if(rsFreq == "-None-") { rsFreq = ""; }
+			if(rsFreq != "") { rescheduledCall.put("Call_Task_Contract_Frequency", rsFreq); }
+
+			// Idempotency: dedup on Sequence_Stage + Sequence_Attempt + the canonical actionable
+			// predicate (Call_Task_State Open AND Call_Task_Status Working) so repeated edits to the
+			// same source Call do not create duplicate replacements.
+			existingRescheduleIds = List();
+			existingRescheduleKeep = 999999999999999999;
+			existingRescheduleCallId = "";
+			try
+			{
+				relatedCalls = zoho.crm.getRelatedRecords("Calls", "Deals", dealId);
+				if(!isNull(relatedCalls) && relatedCalls.size() > 0 && !relatedCalls.toString().startsWith("{\"code\""))
+				{
+					for each ec in relatedCalls
+					{
+						ecId = ifnull(ec.get("id"), "").toString();
+						if(ecId != "" && ecId != callId.toString())
+						{
+							ecWho = "";
+							ecWhoL = ec.get("Who_Id");
+							if(!isNull(ecWhoL) && !isNull(ecWhoL.get("id"))) { ecWho = ecWhoL.get("id").toString(); }
+							ecFollow = ifnull(ec.get("Next_Follow_Up_Date"), "").toString();
+							// Canonical actionable Call = Call_Task_State Open AND Call_Task_Status Working.
+							if(ecWho == contactId.toString() && ecFollow == "" && ifnull(ec.get("Sequence_Managed"), "No").toString() == "Yes" && ifnull(ec.get("Sequence_Stage"), "").toString() == contactStage && ifnull(ec.get("Sequence_Attempt"), 0).toLong() == callSeqAttempt && ifnull(ec.get("Call_Task_State"), "").toString() == "Open" && ifnull(ec.get("Call_Task_Status"), "").toString() == "Working")
+							{
+								ecLong = ecId.toLong();
+								existingRescheduleIds.add(ecId);
+								if(ecLong < existingRescheduleKeep)
+								{
+									existingRescheduleKeep = ecLong;
+									existingRescheduleCallId = ecId;
+								}
+							}
+						}
+					}
+				}
+			}
+			catch (e)
+			{
+				// CALL-3: a failed dedupe scan must NOT fall through to createRecord (duplicate-Call
+				// risk). Log and RETURN without creating a replacement Call.
+				automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_open", "reschedule_dedupe_scan_failed_abort", {"error":e.toString()});
+				return;
+			}
+			if(existingRescheduleCallId != "")
+			{
+				rescheduledUpdate = Map();
+				rescheduledUpdate.put("Call_Start_Time", nextFu);
+				rescheduledUpdate.put("Sequence_Managed", "Yes");
+				rescheduledUpdate.put("Sequence_Stage", contactStage);
+				rescheduledUpdate.put("Sequence_Attempt", callSeqAttempt);
+				rescheduledUpdate.put("Call_Task_State", "Open");
+				// CALL-2: reused replacement Call is user-facing -> Working (native In Progress).
+				rescheduledUpdate.put("Call_Task_Status", "Working");
+				rescheduledUpdate.put("Outgoing_Call_Status", "Scheduled");
+				if(dealPipeline != "") { rescheduledUpdate.put("Call_Task_Pipeline", dealPipeline); }
+				if(dealOppType != "")  { rescheduledUpdate.put("Call_Task_Opportunity", dealOppType); }
+				if(contactStage != "") { rescheduledUpdate.put("Call_Task_Stage", contactStage); }
+				if(!isNull(rsProds)) { rescheduledUpdate.put("Call_Task_Contract_Products", rsProds); }
+				if(rsBrands != "") { rescheduledUpdate.put("Call_Task_Contract_Brands", rsBrands.toLong()); }
+				if(rsStart != "") { rescheduledUpdate.put("Call_Task_Contract_Date_Start", rsStart); }
+				if(rsEnd != "") { rescheduledUpdate.put("Call_Task_Contract_Date_End", rsEnd); }
+				if(rsFreq != "") { rescheduledUpdate.put("Call_Task_Contract_Frequency", rsFreq); }
+				zoho.crm.updateRecord("Calls", existingRescheduleCallId.toLong(), rescheduledUpdate, noTrigger);
+				if(existingRescheduleIds.size() > 1)
+				{
+					for each extraRescheduleId in existingRescheduleIds
+					{
+						if(extraRescheduleId != existingRescheduleCallId)
+						{
+							zoho.crm.updateRecord("Calls", extraRescheduleId.toLong(), {"Outgoing_Call_Status":"Cancelled", "Call_Task_Status":"Closed"}, noTrigger);
+						}
+					}
+				}
+				// CALL-1: cancel the processed source Call (match the surplus-replacement cleanup) so it
+				// is not left as an open sales activity. Call_Task_State is left unchanged (no Won/Lost).
+				// CALL-4-clear: clear Next_Follow_Up_Date so WF006 Condition 2 cannot perpetually re-fire.
+				zoho.crm.updateRecord("Calls", callId, {"Outgoing_Call_Status":"Cancelled", "Call_Task_Status":"Closed", "Next_Follow_Up_Date":null}, noTrigger);
+				automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_open", "rescheduled_existing", {"deal":dealId.toString(), "rescheduled_call":existingRescheduleCallId, "until":nextFu.toString()});
+				return;
+			}
+			zoho.crm.createRecord("Calls", rescheduledCall);
+			// CALL-1: cancel the processed source Call (match the surplus-replacement cleanup). State unchanged.
+			// CALL-4-clear: clear Next_Follow_Up_Date so WF006 Condition 2 cannot perpetually re-fire.
+			zoho.crm.updateRecord("Calls", callId, {"Outgoing_Call_Status":"Cancelled", "Call_Task_Status":"Closed", "Next_Follow_Up_Date":null}, noTrigger);
+			automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_open", "rescheduled", {"deal":dealId.toString(), "until":nextFu.toString()});
+			return;
+		}
+
+		// ---- LOST: activity-local by default; resolveActivityLoss branches on reason ----
+		if(callTaskState == "Lost")
+		{
+			if(callTaskReason == "")
+			{
+				zoho.crm.updateRecord("Calls", callId, {"Call_Task_State":"Open", "Call_Task_Status":"Working"}, noTrigger);
+				automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "Call " + callId + " was marked Lost without Call Lost Reasons. Add a canonical Lost Reason, then set Call_Task_State=Lost again.");
+				automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_lost", "missing_reason_reopened", {"deal":dealId.toString(), "contact":contactId.toString()});
+				return;
+			}
+			// hasNextStep = the Contact sequence is still active (NOT exhausted). Do NOT equate
+			// "call attempt 5" with exhaustion — the existing call:neutral cadence escalates attempt 5
+			// into the post-call email; only a Complete sequence escalates No Response to Contact Lost.
+			hasNext = "true";
+			if(contactSeqState == "Complete") { hasNext = "false"; }
+			lossRaw = automation.resolveActivityLoss(callTaskReason, "activity", hasNext, "false", "false");
+			loss = Map();
+			if(!isNull(lossRaw) && lossRaw.toString().trim() != "") { loss = lossRaw.toString().toMap(); }
+			act = ifnull(loss.get("action"), "manual_review").toString();
+
+			if(act == "continue_cadence")
+			{
+				automation.routeContactSequence(contactId.toString(), dealId.toString(), "call:neutral", "{}");
+				zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Completed"}, noTrigger);
+			}
+			else if(act == "contact_lost")
+			{
+				clr = ifnull(loss.get("contactLostReason"), "No Response").toString();
+				// SEQ-6: a No-Response Lost may only escalate to Contact Lost on GENUINE recovery
+				// exhaustion. resolveActivityLoss returned contact_lost off Sequence_State=='Complete';
+				// but a failed postcall send can leave the Contact Running yet not actually exhausted,
+				// so verify exhaustion EXPLICITLY before closing the Contact. If any precondition cannot
+				// be checked reliably, default to continue_cadence (safe) rather than risk a false close.
+				//   at recovery exhaustion = Sequence_Stage=='Call' Step>=5 (postcall is step 5) OR
+				//   the Contact has already left the Call recovery (Step exhausted upstream).
+				atRecoveryExhaustion = false;
+				if(contactSeqStage == "Call")
+				{
+					stepNum = 0;
+					if(contactStepStr != "None" && contactStepStr != "") { stepNum = contactStepStr.toLong(); }
+					if(stepNum >= 5) { atRecoveryExhaustion = true; }
+				}
+				else
+				{
+					// Contact is no longer in the Call recovery sub-cadence; with Sequence_State=='Complete'
+					// the cadence has nothing further to run for this Stage.
+					atRecoveryExhaustion = true;
+				}
+
+				// (e) Sequence_State must not be Stopped (a Stopped sequence is owner-held, not a loss).
+				notStopped = (contactSeqState != "Stopped");
+				// (d) Stage must be unchanged (the actionable Call belongs to the Contact's current Stage;
+				// the stale-stage guard above already returned if callSeqStage != contactStage, so this
+				// holds whenever a Stage was stamped on the Call).
+				stageUnchanged = (callSeqStage == "" || callSeqStage == contactStage);
+
+				// (a) no OPEN Sequence_Managed Call for this Contact+Deal (other than this one), and
+				// (b) no actionable ScheduledSend Task, and (c) no open/valid FUTURE Meeting.
+				// Scan failures => cannot prove exhaustion => treat as NOT exhausted (safe).
+				preconditionsChecked = true;
+				openCallExists = false;
+				scheduledSendActionable = false;
+				futureMeetingExists = false;
+
+				try
+				{
+					seqCalls = zoho.crm.getRelatedRecords("Calls", "Deals", dealId);
+					if(isNull(seqCalls) || seqCalls.size() == 0 || seqCalls.toString().startsWith("{\"code\""))
+					{
+						seqCalls = zoho.crm.searchRecords("Calls", "(What_Id:equals:" + dealId + ")");
+					}
+					if(!isNull(seqCalls) && seqCalls.size() > 0 && !seqCalls.toString().startsWith("{\"code\""))
+					{
+						for each sc in seqCalls
+						{
+							scId = ifnull(sc.get("id"), "").toString();
+							if(scId != "" && scId != callId.toString())
+							{
+								scWho = "";
+								scWhoL = sc.get("Who_Id");
+								if(!isNull(scWhoL) && !isNull(scWhoL.get("id"))) { scWho = scWhoL.get("id").toString(); }
+								// Canonical actionable Call = Call_Task_State Open AND Call_Task_Status Working.
+								if(scWho == contactId.toString() && ifnull(sc.get("Sequence_Managed"), "No").toString() == "Yes" && ifnull(sc.get("Call_Task_State"), "").toString() == "Open" && ifnull(sc.get("Call_Task_Status"), "").toString() == "Working")
+								{
+									openCallExists = true;
+								}
+							}
+						}
+					}
+				}
+				catch (eCalls)
+				{
+					preconditionsChecked = false;
+					automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_lost", "seq6_call_scan_failed", {"error":eCalls.toString()});
+				}
+
+				try
+				{
+					seqTasks = zoho.crm.getRelatedRecords("Tasks", "Deals", dealId);
+					if(isNull(seqTasks) || seqTasks.size() == 0 || seqTasks.toString().startsWith("{\"code\""))
+					{
+						seqTasks = zoho.crm.searchRecords("Tasks", "(What_Id:equals:" + dealId + ")");
+					}
+					if(!isNull(seqTasks) && seqTasks.size() > 0 && !seqTasks.toString().startsWith("{\"code\""))
+					{
+						for each st in seqTasks
+						{
+							stWho = "";
+							stWhoL = st.get("Who_Id");
+							if(!isNull(stWhoL) && !isNull(stWhoL.get("id"))) { stWho = stWhoL.get("id").toString(); }
+							stStatus = ifnull(st.get("Status"), "").toString();
+							stDesc = ifnull(st.get("Description"), "").toString();
+							if(stWho == contactId.toString() && ifnull(st.get("Task_Sequence_Managed"), false).toString() == "true" && stStatus != "Completed" && stStatus != "Cancelled" && stStatus != "Deferred" && stDesc.contains("ScheduledSend|"))
+							{
+								scheduledSendActionable = true;
+							}
+						}
+					}
+				}
+				catch (eTasks)
+				{
+					preconditionsChecked = false;
+					automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_lost", "seq6_task_scan_failed", {"error":eTasks.toString()});
+				}
+
+				try
+				{
+					// zoho.currenttime is the runtime "now" used elsewhere for datetime work. Deluge
+					// compares DateTime objects with '>' directly. The org's currenttime TZ behaviour is
+					// known-fragile (see import audit), so this comparison is BEST-EFFORT NARROWING only:
+					// any non-Lost Meeting with a Start_DateTime is treated as blocking unless we can
+					// positively prove it is in the past. That keeps a false Contact Lost off the table.
+					nowDt = zoho.currenttime;
+					seqEvents = zoho.crm.getRelatedRecords("Events", "Contacts", contactId);
+					if(!isNull(seqEvents) && seqEvents.size() > 0 && !seqEvents.toString().startsWith("{\"code\""))
+					{
+						for each ev in seqEvents
+						{
+							evState = ifnull(ev.get("Meeting_Task_State"), "").toString();
+							evStart = ev.get("Start_DateTime");
+							if(evState != "Lost" && !isNull(evStart))
+							{
+								isPast = false;
+								try
+								{
+									evStartDt = evStart.toString().toDateTime();
+									if(evStartDt < nowDt) { isPast = true; }
+								}
+								catch (eCmp)
+								{
+									// could not parse/compare -> do NOT assume past; treat as blocking
+									isPast = false;
+								}
+								if(!isPast) { futureMeetingExists = true; }
+							}
+						}
+					}
+					else if(!isNull(seqEvents) && seqEvents.toString().startsWith("{\"code\""))
+					{
+						// an error payload (not an empty related list) => cannot prove "no meeting"
+						preconditionsChecked = false;
+						automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_lost", "seq6_event_scan_error", {"payload":seqEvents.toString()});
+					}
+				}
+				catch (eEvents)
+				{
+					preconditionsChecked = false;
+					automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_lost", "seq6_event_scan_failed", {"error":eEvents.toString()});
+				}
+
+				genuinelyExhausted = (atRecoveryExhaustion && notStopped && stageUnchanged && preconditionsChecked && !openCallExists && !scheduledSendActionable && !futureMeetingExists);
+				if(genuinelyExhausted)
+				{
+					automation.routeContactSequence(contactId.toString(), dealId.toString(), "contactlost:" + clr, "{}");
+					zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Completed"}, noTrigger);
+					automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_lost", "contact_lost_verified", {"deal":dealId.toString(), "contact":contactId.toString(), "reason":clr});
+				}
+				else
+				{
+					// Not provably exhausted -> keep the Contact alive on the recovery cadence rather
+					// than strand or falsely close it. This also rescues a Running Contact whose postcall
+					// send failed: call:neutral re-asserts the next recovery step.
+					automation.routeContactSequence(contactId.toString(), dealId.toString(), "call:neutral", "{}");
+					zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Completed"}, noTrigger);
+					automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_lost", "contact_lost_deferred_continue_cadence", {"deal":dealId.toString(), "contact":contactId.toString(), "at_exhaustion":atRecoveryExhaustion.toString(), "open_call":openCallExists.toString(), "sched_send":scheduledSendActionable.toString(), "future_meeting":futureMeetingExists.toString(), "preconditions_checked":preconditionsChecked.toString(), "not_stopped":notStopped.toString()});
+				}
+			}
+			else if(act == "find_decision_maker")
+			{
+				automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "Find Decision Maker (No Authority on Call " + callId + ") - reassign the buyer/decision maker for this Deal. Deal stays Open.");
+				zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Completed"}, noTrigger);
+			}
+			else if(act == "data_repair")
+			{
+				automation.createAuxTask(contactId.toString(), dealId.toString(), "Data Repair", "Bad data on Call " + callId + " - repair before the sequence continues.");
+				zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Completed"}, noTrigger);
+			}
+			else if(act == "suppress")
+			{
+				zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Completed"}, noTrigger);
+			}
+			else
+			{
+				// manual_review / none / deal_lost-unexpected -> surface for a human, stay local
+				automation.createAuxTask(contactId.toString(), dealId.toString(), "Manual Review", "Call " + callId + " marked Lost (" + callTaskReason + ") - review next step (continue, find another contact, or close the Contact). Deal stays Open.");
+				zoho.crm.updateRecord("Calls", callId, {"Call_Task_Status":"Closed", "Outgoing_Call_Status":"Completed"}, noTrigger);
+			}
+			automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "state_lost", act, {"deal":dealId.toString(), "contact":contactId.toString(), "reason":callTaskReason});
+			return;
+		}
+
+		automation.logAutomationEvent("handleCallOutcome", "Calls", callId.toString(), "unknown_state", callTaskState, {"deal":dealId.toString()});
+		return;
+	}
+}

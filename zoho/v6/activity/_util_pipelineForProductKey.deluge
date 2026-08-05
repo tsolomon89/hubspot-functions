@@ -1,0 +1,29 @@
+string automation.pipelineForProductKey(string productKey)
+{
+	// =========================================================================
+	// _util_pipelineForProductKey   (VERSION: v6-product-pipeline)
+	//
+	// THE single source of truth for the Product -> Deal Pipeline rule. Product
+	// Interest is authoritative for the pipeline; this maps the canonical product
+	// KEY (from _util_computeProductKey / Deal_Product_Key) to a pipeline value.
+	//
+	//   "jurnii_ux" | "jurnii_360" | "jurnii_cortex" -> "B2B"
+	//   "partnership"                                 -> "Partnership"
+	//   ""  (blank)                                   -> "B2B"          (agreed default)
+	//   any other non-blank key                       -> "unresolved"   (NEVER silent B2B)
+	//
+	// Callers MUST handle "unresolved" explicitly (do not create a Deal / leave the
+	// activity mirror blank / hold out of B2B automation + Manual Review). A malformed
+	// or unexpected key must never be silently classified as B2B. There are exactly two
+	// live pipelines: B2B and Partnership.
+	//
+	// No CRM reads, no writes — pure. (No `info` VERSION banner: hot pure helper called
+	// in loops; a banner would spam the function log — same rationale as
+	// _util_computeProductKey.)
+	// =========================================================================
+	k = ifnull(productKey, "").toString().trim().toLowerCase();
+	if(k == "") { return "B2B"; }
+	if(k == "partnership") { return "Partnership"; }
+	if(k == "jurnii_ux" || k == "jurnii_360" || k == "jurnii_cortex") { return "B2B"; }
+	return "unresolved";
+}

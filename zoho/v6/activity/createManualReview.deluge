@@ -1,0 +1,95 @@
+string automation.createManualReview(string contactIdStr, string dealIdStr, string codeKey, string detail)
+{
+	// =========================================================================
+	// createManualReview   (VERSION: v6-product-deal)
+	//
+	// Thin convenience wrapper that realises the plan's "createAuxTask gains a
+	// reviewCode contract" WITHOUT changing createAuxTask's signature (which would
+	// break its ~existing callers before Phases 1-4 rewire them). It resolves a
+	// canonical review code via resolveManualReviewCode and prepends it to the
+	// note, then delegates to createAuxTask("Manual Review", ...).
+	//
+	// Because the note LEADS with the canonical "[code]" token, createAuxTask's
+	// existing append-issue dedup makes repeated fires idempotent per Contact/Deal
+	// and accumulates DISTINCT codes on one reusable Manual Review task.
+	//
+	// Returns the Manual Review Task id (new or reused), or "".
+	// =========================================================================
+	code = automation.resolveManualReviewCode(codeKey);
+	note = code;
+	det = ifnull(detail, "").toString().trim();
+	if(det != "") { note = code + " " + det; }
+
+	// Real newline for rep-facing Description text (this org's Deluge stores a literal backslash-n
+	// instead of a line break). hextoText("0A") = line feed (a raw newline in a string literal is not valid Deluge here).
+	nl = hextoText("0A");
+
+	cId = ifnull(contactIdStr, "").toString().replaceAll("zcrm_", "").trim();
+	dId = ifnull(dealIdStr, "").toString().replaceAll("zcrm_", "").trim();
+
+	// createAuxTask requires BOTH a contact and a deal (it returns "" otherwise).
+	// Several review codes legitimately have no contact (e.g. quote_missing_contact,
+	// product_unresolved). Fall back to the Deal's primary contact so the review is
+	// never silently dropped.
+	if(cId == "" && dId != "" && dId.matches("[0-9]+"))
+	{
+		dealRec = zoho.crm.getRecordById("Deals", dId.toLong());
+		if(!isNull(dealRec) && !isNull(dealRec.get("id")))
+		{
+			pc = dealRec.get("Deal_Primary_Contact");
+			if(!isNull(pc) && !isNull(pc.get("id"))) { cId = pc.get("id").toString(); }
+			if(cId == "")
+			{
+				cn = dealRec.get("Contact_Name");
+				if(!isNull(cn) && !isNull(cn.get("id"))) { cId = cn.get("id").toString(); }
+			}
+		}
+	}
+
+	// Contact-only Manual Review (no Deal should be selected -- e.g. multi_product_sequence_ambiguous,
+	// or product_unresolved during import before any Deal exists). createAuxTask requires a Deal, so
+	// create a Contact-scoped review Task directly (Who_Id=Contact, no What_Id), deduped on the leading
+	// [code] token across this Contact's open Manual Review tasks. Do NOT invent a Deal to host it.
+	if(dId == "" && cId != "" && cId.matches("[0-9]+"))
+	{
+		existingC = zoho.crm.getRelatedRecords("Tasks", "Contacts", cId.toLong());
+		if(!isNull(existingC) && existingC.size() > 0 && !existingC.toString().startsWith("{\"code\""))
+		{
+			for each tk in existingC
+			{
+				tType = ifnull(tk.get("Task_Type"), "").toString();
+				tStatus = ifnull(tk.get("Status"), "").toString();
+				tDesc = ifnull(tk.get("Description"), "").toString();
+				if(tType == "Manual Review" && (tStatus == "Not Started" || tStatus == "In Progress") && tDesc.contains(code))
+				{
+					return tk.get("id").toString();
+				}
+			}
+		}
+		coMap = Map();
+		coMap.put("Subject", "Manual Review: " + note);
+		coMap.put("Status", "In Progress");
+		coMap.put("Who_Id", cId);
+		coMap.put("$se_module", "Contacts");
+		coMap.put("Task_Type", "Manual Review");
+		coMap.put("Blocks_Sequence", "Yes");
+		// Contact-only review (no What_Id/Deal): handleTaskCompletion returns at its no-related-deal
+		// guard, so completing THIS task does not itself drive automation. Say so plainly rather than
+		// promising a Task State trigger that will not fire.
+		coMap.put("Description", note + nl + nl + "--- Automation-raised review. No Deal is linked, so completing this task does not advance a sequence by itself. Resolve the data issue described above; automation resumes the correct Deal flow when the record is re-processed.");
+		coMap.put("Task_Status", "Working");
+		coMap.put("Task_State", "Open");
+		coResp = zoho.crm.createRecord("Tasks", coMap);
+		if(!isNull(coResp) && !isNull(coResp.get("id"))) { return coResp.get("id").toString(); }
+		automation.logAutomationEvent("createManualReview", "Contacts", cId, "review_not_created", "contact_only_create_failed", {"code":code});
+		return "";
+	}
+
+	taskId = automation.createAuxTask(cId, dId, "Manual Review", note);
+	if(taskId == "")
+	{
+		// never let a review vanish silently -- surface the unresolvable case in the log
+		automation.logAutomationEvent("createManualReview", "Deals", dId, "review_not_created", "no_contact_or_deal", {"code":code, "detail":det});
+	}
+	return taskId;
+}

@@ -1,0 +1,12 @@
+.mcp.json
+
+.zoho-self-client.env
+
+.claude/
+
+# Ignore CSV files in import_tests
+.agents/context/import_tests/*.csv
+
+# Python caches (tests/)
+__pycache__/
+*.pyc

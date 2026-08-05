@@ -1,0 +1,43 @@
+{
+  "uid": "reconcile_record_action",
+  "type": "workflow-action",
+  "config": {
+    "actionUrl": "https://example.com/workflow-actions/reconcile",
+    "isPublished": false,
+    "supportedClients": [
+      {
+        "client": "WORKFLOWS"
+      }
+    ],
+    "inputFields": [
+      {
+        "typeDefinition": {
+          "name": "recordId",
+          "type": "string",
+          "fieldType": "text"
+        },
+        "supportedValueTypes": [
+          "OBJECT_PROPERTY"
+        ],
+        "isRequired": true
+      }
+    ],
+    "labels": {
+      "en": {
+        "actionName": "Reconcile Commercial Record",
+        "actionDescription": "Submits record to the external Commercial Operations state machine reconciler.",
+        "inputFieldLabels": {
+          "recordId": "Record ID"
+        },
+        "inputFieldDescriptions": {
+          "recordId": "The ID of the record being reconciled"
+        }
+      }
+    },
+    "objectTypes": [
+      "CONTACT",
+      "COMPANY",
+      "DEAL"
+    ]
+  }
+}

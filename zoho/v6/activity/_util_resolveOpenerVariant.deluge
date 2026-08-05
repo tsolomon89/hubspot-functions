@@ -1,0 +1,34 @@
+string automation.resolveOpenerVariant(string latestNoteContent)
+{
+	// =========================================================================
+	// _util_resolveOpenerVariant   (VERSION: v6-opener-variant)
+	//
+	// Single owner of the opening-email variant decision. Driven by the LATEST
+	// native Note on the Activation Task — the caller (handleTaskCompletion) reads
+	// that one note's content and passes it here; older notes are never consulted.
+	//
+	// Deterministic + case-insensitive:
+	//   exact "warm"                          -> "warm"      (send Warm opener)
+	//   exact "cold"                          -> "cold"      (send Cold opener)
+	//   explicit both-value entry             -> "conflict"  (do NOT activate; Manual Review)
+	//     ("warm cold", "warm/cold", "warm and cold", ...)
+	//   empty / prose / anything else         -> "default"   (existing default opener)
+	//
+	// Selection is EXACT, so incidental prose ("warm introduction", "previously
+	// cold, now warm") falls through to "default" — it never selects a variant and
+	// never trips the conflict. Extend by adding an exact token here + a registry
+	// key in sendSequencedEmail + a template; the automation structure is unchanged.
+	// =========================================================================
+	t = ifnull(latestNoteContent, "").toString().trim().toLowerCase();
+	if(t == "") { return "default"; }
+	if(t == "warm") { return "warm"; }
+	if(t == "cold") { return "cold"; }
+
+	// The ONLY path to a conflict: a note whose entire content explicitly names BOTH
+	// controls. Common separators are enumerated so prose that merely mentions both
+	// words is not caught (it is not an exact member of this set).
+	bothValues = {"warm cold", "cold warm", "warm/cold", "cold/warm", "warm,cold", "cold,warm", "warm, cold", "cold, warm", "warm and cold", "cold and warm", "warm & cold", "cold & warm"};
+	if(bothValues.contains(t)) { return "conflict"; }
+
+	return "default";
+}

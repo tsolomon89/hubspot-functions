@@ -1,0 +1,19 @@
+﻿{
+    "jsonrpc":  "2.0",
+    "id":  2,
+    "result":  {
+                   "content":  [
+                                   {
+                                       "type":  "text",
+                                       "text":  "You cannot perform this operation. Connection not authorised"
+                                   }
+                               ],
+                   "isError":  false,
+                   "structuredContent":  {
+                                             "data":  {
+                                                          "message":  "You cannot perform this operation. Connection not authorised"
+                                                      },
+                                             "status":  "failure"
+                                         }
+               }
+}

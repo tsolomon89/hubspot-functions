@@ -1,0 +1,172 @@
+string automation.resolveQuoteLinePrice(string productId, string planType, string brandsStr, string tier, string frequency)
+{
+	// =========================================================================
+	// _util_resolveQuoteLinePrice  (v6 quote-line pricing)
+	//
+	// Resolves a single Quoted Item line price from the banded, market-sensitive
+	// pricing matrix encoded below (transcribed verbatim from
+	// .agents/context/pricing/price_model.csv). Pure: one Product read, no writes.
+	//
+	// Inputs:
+	//   productId   Quoted Item -> Product lookup id (carries Product_Plan_Products family)
+	//   planType    Fixed / Flex (Jurnii UX). Read from Product if blank.
+	//   brandsStr   actual contracted brand-MARKET count (Quoted_Item_Plan_Brands)
+	//   tier        Base / Markup / Agency (Quoted_Item_Pricing_Tier; default Base)
+	//   frequency   4x per day / 2x per day / 1x per day (Jurnii 360 only)
+	//
+	// Returns a JSON string (parse with .toMap()):
+	//   line_acv, pricing_band_used, pricing_tier_used, pricing_basis,
+	//   sub, ppb, valid ("true"/"false"), reason
+	//
+	// Family pricing dimensions (from the CSV):
+	//   Jurnii UX     -> plan type Fixed/Flex; bands 5,7,10,15,20,50,100
+	//   Jurnii 360    -> frequency 4x/2x/1x per day; bands 5,10,20,50
+	//   Jurnii Cortex -> NOT in the matrix -> cannot auto-price (A3 -> Manual Review)
+	//
+	// Pricing gates A2 (price basis) + A9 (rounding) are RESOLVED:
+	//   A2 -> a line is priced as PPB x brand-markets (the band picks the
+	//         volume-discounted per-brand rate; the actual market count is the
+	//         multiplier). NOT the band Sub total.
+	//   A9 -> line_acv is rounded to 2 decimal places (currency).
+	// Band/tier/sku resolution + matrix lookup are implemented (A1 default).
+	// This util therefore returns valid=true with line_acv computed (see below);
+	// it only returns valid=false on missing/unresolvable inputs (missing brand
+	// count, family not in matrix, Cortex A3, etc.), where syncConfirmedQuoteToDeal
+	// refuses to auto-price and raises Manual Review.
+	// =========================================================================
+
+	info "VERSION: v6-quote-pricing";
+
+	r = Map();
+	r.put("line_acv", 0);
+	r.put("pricing_band_used", "");
+	r.put("pricing_tier_used", "");
+	r.put("pricing_basis", "");
+	r.put("sub", 0);
+	r.put("ppb", 0);
+	r.put("valid", "false");
+	r.put("reason", "init");
+
+	// ---- normalise inputs ----
+	pType = ifnull(planType, "").toString().trim();
+	if(pType == "Flexible") { pType = "Flex"; }
+	tierKey = ifnull(tier, "Base").toString().trim();
+	if(tierKey == "") { tierKey = "Base"; }
+	freq = ifnull(frequency, "").toString().trim();
+	brands = 0;
+	if(!isNull(brandsStr) && brandsStr.toString().trim() != "") { brands = brandsStr.toString().trim().toLong(); }
+	if(brands <= 0) { r.put("reason", "missing_brand_count"); return r.toString(); }
+
+	// ---- resolve family (and fallback plan type) from the Product ----
+	family = "";
+	if(!isNull(productId) && productId.toString().trim() != "")
+	{
+		prod = zoho.crm.getRecordById("Products", productId.toString().trim().toLong());
+		if(!isNull(prod) && !isNull(prod.get("id")))
+		{
+			family = ifnull(prod.get("Product_Plan_Products"), "").toString().trim();
+			// CANONICAL model: name-only Products carry a BLANK Product_Plan_Products.
+			// Fall back to the Product_Name as the family (e.g. "Jurnii UX" -> "Jurnii UX").
+			if(family == "") { family = ifnull(prod.get("Product_Name"), "").toString().trim(); }
+			if(family == "Jurnii Cortext") { family = "Jurnii Cortex"; }
+			if(pType == "")
+			{
+				pType = ifnull(prod.get("Product_Plan_Type"), "").toString().trim();
+				if(pType == "Flexible") { pType = "Flex"; }
+			}
+		}
+	}
+	if(family == "") { r.put("reason", "missing_product_family"); return r.toString(); }
+
+	// ---- resolve skuKey + the family's own band set ----
+	skuKey = "";
+	bandSet = List();
+	if(family == "Jurnii UX")
+	{
+		if(pType != "Fixed" && pType != "Flex") { r.put("reason", "ux_missing_plan_type"); return r.toString(); }
+		skuKey = "UX_" + pType;
+		bandSet = {5, 7, 10, 15, 20, 50, 100};
+	}
+	else if(family == "Jurnii 360")
+	{
+		freqKey = "";
+		if(freq == "4x per day") { freqKey = "360_4x"; }
+		else if(freq == "2x per day") { freqKey = "360_2x"; }
+		else if(freq == "1x per day") { freqKey = "360_1x"; }
+		if(freqKey == "") { r.put("reason", "360_missing_frequency"); return r.toString(); }
+		skuKey = freqKey;
+		bandSet = {5, 10, 20, 50};
+	}
+	else if(family == "Jurnii Cortex")
+	{
+		r.put("reason", "no_pricing_for_product");   // A3
+		return r.toString();
+	}
+	else
+	{
+		r.put("reason", "unknown_product_family");
+		return r.toString();
+	}
+
+	// ---- band selection (A1 default: exact, else next-highest, else > max -> Manual Review) ----
+	chosenBand = 0;
+	for each b in bandSet
+	{
+		if(chosenBand == 0 && brands <= b) { chosenBand = b; }
+	}
+	if(chosenBand == 0) { r.put("reason", "above_max_band"); return r.toString(); }
+
+	// ---- pricing matrix (verbatim from price_model.csv): skuKey -> tier -> band -> {sub, ppb} ----
+	PRICE = {
+		"UX_Fixed": {
+			"Base":   {"5":{"sub":10500,"ppb":2100}, "7":{"sub":14700,"ppb":2100}, "10":{"sub":18480,"ppb":1848}, "15":{"sub":24507,"ppb":1633.8}, "20":{"sub":29400,"ppb":1470}, "50":{"sub":63000,"ppb":1260}, "100":{"sub":119000,"ppb":1190}},
+			"Markup": {"5":{"sub":13650,"ppb":2730}, "7":{"sub":19110,"ppb":2730}, "10":{"sub":24024,"ppb":2402.4}, "15":{"sub":31859.1,"ppb":2123.94}, "20":{"sub":38220,"ppb":1911}, "50":{"sub":81900,"ppb":1638}, "100":{"sub":154700,"ppb":1547}},
+			"Agency": {"5":{"sub":17745,"ppb":3549}, "7":{"sub":24843,"ppb":3549}, "10":{"sub":31231.2,"ppb":3123.12}, "15":{"sub":41416.83,"ppb":2761.12}, "20":{"sub":49686,"ppb":2484.3}, "50":{"sub":106470,"ppb":2129.4}, "100":{"sub":201110,"ppb":2011.1}}
+		},
+		"UX_Flex": {
+			"Base":   {"5":{"sub":8400,"ppb":1680}, "7":{"sub":11760,"ppb":1680}, "10":{"sub":14784,"ppb":1478.4}, "15":{"sub":19605.6,"ppb":1307.04}, "20":{"sub":23520,"ppb":1176}, "50":{"sub":50400,"ppb":1008}, "100":{"sub":95200,"ppb":952}},
+			"Markup": {"5":{"sub":10920,"ppb":2184}, "7":{"sub":15288,"ppb":2184}, "10":{"sub":19219.2,"ppb":1921.92}, "15":{"sub":25487.28,"ppb":1699.15}, "20":{"sub":30576,"ppb":1528.8}, "50":{"sub":65520,"ppb":1310.4}, "100":{"sub":123760,"ppb":1237.6}},
+			"Agency": {"5":{"sub":14196,"ppb":2839.2}, "7":{"sub":19874.4,"ppb":2839.2}, "10":{"sub":24984.96,"ppb":2498.5}, "15":{"sub":33133.46,"ppb":2208.9}, "20":{"sub":39748.8,"ppb":1987.44}, "50":{"sub":85176,"ppb":1703.52}, "100":{"sub":160888,"ppb":1608.88}}
+		},
+		"360_4x": {
+			"Base":   {"5":{"sub":76800,"ppb":15360}, "10":{"sub":138240,"ppb":13824}, "20":{"sub":248832,"ppb":12441.6}, "50":{"sub":466598,"ppb":9331.96}},
+			"Markup": {"5":{"sub":99840,"ppb":19968}, "10":{"sub":179712,"ppb":17971.2}, "20":{"sub":323481.6,"ppb":16174.08}, "50":{"sub":606577.4,"ppb":12131.55}},
+			"Agency": {"5":{"sub":129792,"ppb":25958.4}, "10":{"sub":233625.6,"ppb":23362.56}, "20":{"sub":420526.08,"ppb":21026.3}, "50":{"sub":788550.62,"ppb":15771.01}}
+		},
+		"360_2x": {
+			"Base":   {"5":{"sub":65280,"ppb":13056}, "10":{"sub":117504,"ppb":11750.4}, "20":{"sub":211507,"ppb":10575.35}, "50":{"sub":396056,"ppb":7921.12}},
+			"Markup": {"5":{"sub":65280,"ppb":13056}, "10":{"sub":117504,"ppb":11750.4}, "20":{"sub":211507,"ppb":10575.35}, "50":{"sub":396056,"ppb":7921.12}},
+			"Agency": {"5":{"sub":65280,"ppb":13056}, "10":{"sub":117504,"ppb":11750.4}, "20":{"sub":211507,"ppb":10575.35}, "50":{"sub":396056,"ppb":7921.12}}
+		},
+		"360_1x": {
+			"Base":   {"5":{"sub":53760,"ppb":10752}, "10":{"sub":96768,"ppb":9676.8}, "20":{"sub":174182,"ppb":8709.1}, "50":{"sub":326303,"ppb":6526.06}},
+			"Markup": {"5":{"sub":53760,"ppb":10752}, "10":{"sub":96768,"ppb":9676.8}, "20":{"sub":174182,"ppb":8709.1}, "50":{"sub":326303,"ppb":6526.06}},
+			"Agency": {"5":{"sub":53760,"ppb":10752}, "10":{"sub":96768,"ppb":9676.8}, "20":{"sub":174182,"ppb":8709.1}, "50":{"sub":326303,"ppb":6526.06}}
+		}
+	};
+
+	skuMap = PRICE.get(skuKey);
+	if(isNull(skuMap)) { r.put("reason", "sku_not_in_matrix"); return r.toString(); }
+	tierMap = skuMap.get(tierKey);
+	if(isNull(tierMap)) { r.put("reason", "tier_not_in_matrix"); return r.toString(); }
+	cell = tierMap.get(chosenBand.toString());
+	if(isNull(cell)) { r.put("reason", "cell_not_in_matrix"); return r.toString(); }
+
+	subVal = ifnull(cell.get("sub"), 0);
+	ppbVal = ifnull(cell.get("ppb"), 0);
+	r.put("pricing_band_used", chosenBand.toString());
+	r.put("pricing_tier_used", tierKey);
+	r.put("sub", subVal);
+	r.put("ppb", ppbVal);
+
+	// ---- line ACV (A2 basis = PPB x brand-markets; A9 rounding = 2 decimal places) ----
+	// The band selects the volume-discounted per-brand rate; the actual brand-market
+	// count drives the line value. e.g. 8 markets -> band 10 -> 1848 * 8 = 14784.00.
+	lineAcv = ppbVal.toDecimal() * brands;
+	lineAcv = lineAcv.round(2);
+	r.put("line_acv", lineAcv);
+	r.put("pricing_basis", "ppb_x_brands");
+	r.put("valid", "true");
+	r.put("reason", "ok");
+	return r.toString();
+}

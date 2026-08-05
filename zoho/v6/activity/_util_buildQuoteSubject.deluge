@@ -1,0 +1,112 @@
+string automation.buildQuoteSubject(string accountName, string productNames, string quoteLabel, string dealName)
+{
+	// =========================================================================
+	// _util_buildQuoteSubject   (VERSION: v6-quote-naming)
+	//
+	// The SINGLE owner of Quote.Subject construction. Every path that creates or
+	// updates a Quote (acquisition, acquisition scaffold, expansion, renewal,
+	// import bootstrap, Task fallback) MUST build its Subject here.
+	//
+	// NAMING CONTRACT
+	//   Subject = <base> [ - <product>[ + <product>...] ] [ (<label>) ]
+	//   where base = Account name, else the Deal name (legacy/no-Account), else "Quote".
+	//
+	// The Subject is COMPOSED FROM CANONICAL PARTS — it is never derived by
+	// patching a previously-built Subject or by concatenating Deal_Name with a
+	// product. Deal_Name is itself "<Account> - <Product>" (createOrReuseProductDeal),
+	// so "Deal_Name + ' - ' + product" duplicated the product; that is the defect
+	// this helper replaces. Because the output is recomputed from parts, calling
+	// this on an already-correct Quote is idempotent.
+	//
+	// EXACTLY-ONCE RULE
+	//   A product is appended only when the base does not already carry it as a
+	//   " - "-delimited SEGMENT (case-insensitive whole-segment match, never a
+	//   substring/replace). So an Account "SuperBet" + product "Jurnii UX" yields
+	//   "SuperBet - Jurnii UX", while a legacy base "SuperBet - Jurnii UX" (Deal
+	//   name, no Account) appends nothing. Segment matching — not substring —
+	//   keeps an Account legitimately named "SuperBet - Napoleon Games" intact and
+	//   stops a product "Jurnii UX" from being swallowed by a "Jurnii UX Pro" base.
+	//
+	// Args
+	//   accountName  Account_Name of the Account (authoritative base; may be "")
+	//   productNames COMMA-separated product display names. "" = no product segment.
+	//                Multiple names are deduped, order-preserved, joined with " + ".
+	//   quoteLabel   parenthesised suffix: "Acquisition" | "Expansion" | "Renewal" |
+	//                "Acquisition scaffold" | "" (no suffix)
+	//   dealName     Deal_Name, used as the base ONLY when accountName is blank
+	//
+	// Mirrored for test by tests/quote_subject_contract.py — change both together.
+	//
+	// No CRM reads, no writes — pure. (No `info` VERSION banner: pure helper called
+	// in loops; a banner would spam the function log — same rationale as
+	// _util_computeProductKey.)
+	// =========================================================================
+	aName = ifnull(accountName, "").toString().trim();
+	dName = ifnull(dealName, "").toString().trim();
+	label = ifnull(quoteLabel, "").toString().trim();
+	rawProds = ifnull(productNames, "").toString().trim();
+
+	// ---- base: Account name is authoritative; Deal name is the legacy fallback ----
+	base = "Quote";
+	if(aName != "") { base = aName; }
+	else if(dName != "") { base = dName; }
+
+	// ---- products: split, trim, drop blanks, dedupe (order-preserving) ----
+	prodList = List();
+	if(rawProds != "")
+	{
+		for each rawP in rawProds.toList(",")
+		{
+			pTrim = ifnull(rawP, "").toString().trim();
+			if(pTrim != "" && !prodList.contains(pTrim)) { prodList.add(pTrim); }
+		}
+	}
+
+	// ---- matching base ----
+	// A trailing parenthesised group is stripped FOR MATCHING ONLY (never from the
+	// output), so re-feeding a built Subject back in as the base stays idempotent
+	// instead of re-appending the product. An Account legitimately named "Acme (EU)"
+	// keeps its suffix in the output and simply matches on "Acme".
+	//
+	// Regex written WITHOUT backslash escapes on purpose: this org's Deluge is
+	// unreliable about backslashes in string literals (cf. the hextoText("0A")
+	// newline workaround). " *" covers the separating space (input is already
+	// trimmed) and "[(]"/"[)]" are literal parens inside character classes.
+	matchLc = base.replaceAll(" *[(][^()]*[)]$", "").toLowerCase();
+
+	// ---- append only products the base does not already carry as a segment ----
+	// Segment membership is tested with explicit boundary comparisons rather than by
+	// splitting on " - ": every toList() call in this codebase splits on a SINGLE
+	// character, so a multi-character delimiter is not a proven idiom here.
+	appendList = List();
+	for each p in prodList
+	{
+		pLc = p.toLowerCase();
+		hasSeg = false;
+		if(matchLc == pLc)                            { hasSeg = true; }   // base IS the product
+		else if(matchLc.startsWith(pLc + " - "))      { hasSeg = true; }   // leading segment
+		else if(matchLc.endsWith(" - " + pLc))        { hasSeg = true; }   // trailing segment
+		else if(matchLc.contains(" - " + pLc + " - ")){ hasSeg = true; }   // middle segment
+		if(!hasSeg) { appendList.add(p); }
+	}
+
+	subj = base;
+	if(appendList.size() > 0)
+	{
+		joined = "";
+		for each ap in appendList
+		{
+			if(joined == "") { joined = ap; }
+			else { joined = joined + " + " + ap; }
+		}
+		subj = subj + " - " + joined;
+	}
+
+	// ---- parenthesised label, exactly once ----
+	if(label != "")
+	{
+		suffix = "(" + label + ")";
+		if(!subj.endsWith(suffix)) { subj = subj + " " + suffix; }
+	}
+	return subj;
+}

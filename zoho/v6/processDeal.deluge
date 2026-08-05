@@ -1,0 +1,2805 @@
+string automation.processDeal(string deal_id, string contextJson)
+{
+	// =========================================================================
+	// processDeal  (v6 commercial-propagation engine — Engine B)
+	//
+	// Signature CHANGED: void(deal_id) -> string(deal_id, contextJson). Returns a
+	// JSON string built from a Map:
+	//   {"success":<bool>, "outcome":<str>, "transitionRouted":<bool>,
+	//    "routedTrigger":<str>, "reviewRequired":<bool>, "reviewReasons":<list>}
+	// success / transitionRouted / reviewRequired are REAL Booleans (Map put
+	// true/false), serialized via result.toString(). Non-activity callers pass "{}".
+	//
+	// Engine B owns the Deal + Quote + Account side of the propagation chain:
+	//   Account resolution + Account_Key guard
+	//   Contact gather + Product-Interest aggregation + Contact_Role stamping
+	//   Contact_Roles related-list maintenance
+	//   primary-Contact selection (role tiebreak)
+	//   RTP floor (durable; everRTP via Contact completion history)
+	//   activity Product NAME resolution -> Products_Linked + Deal Products + per-Product Quote upsert
+	//   Deal.Amount recompute = SUM of OPEN quote totals (non-Closed-Lost AND non-Closed-Won)
+	//   contractual-term ledger (Initial / Current; Confirmed/Closed-Won only)
+	//   Confirmed prerequisites + Contract_ACV / Contract_Signed_Date establishment
+	//   term-completion transition gates (Delivered->commercial:sent, Signed->commercial:signed)
+	//   stage-completion-date stamping; Account State/Status rollup
+	//
+	// REMOVED (vs prior void version):
+	//   - duplicate-active-Deal silencing + canonical-deal reselection. processDeal
+	//     ALWAYS reconciles the EXACT supplied deal_id. Duplicate remediation now
+	//     lives in processAccount (which selects/creates the canonical Deal then
+	//     calls processDeal). For source=="quote" we reconcile the supplied Deal
+	//     regardless of canonical/Lost status.
+	//   - ensureDealQuote auto-seed at Proposal Preparation (folded; no auto-seed).
+	//   - Product Unit_Price sum as Amount authority (now provisional ONLY when
+	//     zero Quotes exist).
+	//
+	// Folds the proven logic of ensureDealQuote (create pattern + Quoted_Items
+	// seeding + resolveQuoteLinePrice pricing), syncConfirmedQuoteToDeal
+	// (Contract_Initial_*/Current_* ledger), and _util_resolveQuotePlanSummary
+	// (line aggregation). Those 3 files stay on disk; processDeal no longer calls them.
+	//
+	// REQUIRED ZOHO CRM SETTING: Accounts.Account_Key UNIQUE; Deals.Deal_Key UNIQUE.
+	// =========================================================================
+	info "VERSION: v6-commercial-propagation";
+
+	// ---- result object (real Booleans) ----
+	result = Map();
+	result.put("success", false);
+	result.put("outcome", "init");
+	result.put("transitionRouted", false);
+	result.put("routedTrigger", "");
+	result.put("reviewRequired", false);
+	reviewReasons = List();
+	result.put("reviewReasons", reviewReasons);
+
+	noTrigger = Map();
+	noTrigger.put("trigger", List());
+
+	if(deal_id == null || deal_id == "")
+	{
+		result.put("outcome", "missing_deal_id");
+		return result.toString();
+	}
+	cleanId = deal_id.replaceAll("zcrm_", "").trim();
+
+	// ---- parse contextJson ----
+	ctx = Map();
+	raw = ifnull(contextJson, "").toString().trim();
+	if(raw != "" && raw != "{}")
+	{
+		ctx = raw.toMap();
+	}
+	ctxSource = ifnull(ctx.get("source"), "").toString();
+	isActivity = (ctxSource == "activity");
+	isQuoteSrc = (ctxSource == "quote");
+	isImport = (ctxSource == "import_bootstrap");
+
+	dealRecord = zoho.crm.getRecordById("Deals", cleanId.toLong());
+	if(isNull(dealRecord) || isNull(dealRecord.get("id")))
+	{
+		result.put("outcome", "deal_not_found");
+		return result.toString();
+	}
+
+	// ---- structural kill-switch ----
+	if(ifnull(dealRecord.get("Automation_Suppressed"), false).toString() == "true")
+	{
+		automation.logAutomationEvent("processDeal", "Deals", cleanId, "guard", "automation_suppressed", null);
+		result.put("outcome", "automation_suppressed");
+		return result.toString();
+	}
+
+	// ---- PIPELINE GATE (Product Interest is authoritative for the pipeline) ----
+	// Hold non-B2B Deals out of the B2B automation BEFORE any Quote / Amount / ledger /
+	// commercial-transition / sequence work below. Keyed on Deal_Product_Key (readable in
+	// the Deluge runtime; the Pipeline field is not) via pipelineForProductKey.
+	//   Partnership -> held pending its own automation (NOT permanently barred).
+	//   unresolved  -> data anomaly: hold + Manual Review; never run B2B on a bad key.
+	//   B2B / blank -> unchanged B2B path continues below.
+	// Distinct from Automation_Suppressed (manual kill-switch, left untouched).
+	dealPipeline = automation.pipelineForProductKey(ifnull(dealRecord.get("Deal_Product_Key"), "").toString().trim());
+	if(dealPipeline == "Partnership")
+	{
+		automation.logAutomationEvent("processDeal", "Deals", cleanId, "guard", "partnership_pipeline_held", {"product_key":ifnull(dealRecord.get("Deal_Product_Key"), "").toString()});
+		result.put("success", true);
+		result.put("outcome", "partnership_held");
+		return result.toString();
+	}
+	if(dealPipeline == "unresolved")
+	{
+		heldContactId = "";
+		hcl = dealRecord.get("Contact_Name");
+		if(!isNull(hcl) && !isNull(hcl.get("id"))) { heldContactId = hcl.get("id").toString(); }
+		automation.createManualReview(heldContactId, cleanId, "product_key_unresolved", "Deal " + cleanId + " has an unrecognised Deal_Product_Key '" + ifnull(dealRecord.get("Deal_Product_Key"), "").toString() + "' that maps to no pipeline; held out of B2B automation. Fix the Product / Deal_Product_Key.");
+		automation.logAutomationEvent("processDeal", "Deals", cleanId, "guard", "product_key_unresolved", {"product_key":ifnull(dealRecord.get("Deal_Product_Key"), "").toString()});
+		result.put("outcome", "product_key_unresolved");
+		return result.toString();
+	}
+
+	stageRanks = {"Marketing Consent":1, "Demo Booking":2, "Demo Confirmation":3, "Demo Hosted":4, "Proposal Preparation":5, "Commercial Agreement":6, "Onboarding":7, "Renewal":8};
+	onboardingRank = 7;
+
+	// Title -> Contact_Role mapping (precedence on duplicate titles: End User > Influencer > Decision Maker).
+	dmTitles = {"automation & ai transformation director","casino director","chief architect","chief commercial officer","chief customer officer","chief data officer","chief executive officer","chief financial officer","chief marketing officer","chief online gaming","chief operating officer","chief product officer","chief revenue officer","chief strategy officer","chief systems officer","chief technology officer","chief trading officer","chief transformation officer","co-founder","commercial director","commerical director","company director","customer experience director","data director","design director","digital director","digital experience director","director of digital product","director of gaming","director of information technology","director of operations","director of product","director of product & operations management","director of product analysis","director of product operations","director of strategy & customer experience","director of technology","director of ux & growth","director product & tech","director product & technology","experimentation lead","founder","fp&a director","gaming director","general manager","global cmo","global cxo","global director of product support & services","global head of product","global product director","global product manager","group cfo","group chief operating officer","group gaming director emea","group head of commercial gaming operations","group product manager","group strategy director","group trading director","growth director","head of acquisition","head of analytics","head of bi","head of brand","head of brand & creative","head of brand marketing","head of casino","head of casino business development","head of commercial","head of crm","head of cro","head of customer experience","head of customer marketing","head of customer value management","head of cx","head of data platform","head of design","head of digital","head of digital product","head of engineering","head of finance","head of gaming","head of gaming commercial","head of gaming operations","head of gaming product","head of group marketing","head of growth","head of igaming","head of infrastructure","head of internal audit","head of international horse racing","head of marketing","head of online","head of online & customer acquisition","head of online casino operations","head of product","head of product design","head of product marketing","head of program product + chief of staff","head of promotions","head of proposition","head of research","head of retention","head of special product development","head of sports","head of sportsbook","head of strategy & performance","head of technology","head of ux","lifecycle director","manager of global product management","managing director","market manager","marketing director","operational product supplier manager","owner","performance marketing director","president","product design director","product director","product management lead","product operations director","promotions director","proposition director","regional director","revenue director","senior global brand manager","senior ia & ai business transformation architect","senior product manager","senior vice president product development","sportsbook director","svp product","ux director","vice managing director","vice president","vice president & general manager","vice president marketing","vice president of commercials","vice president of finance","vice president of global operations & media","vice president of operations","vice president of pricing strategy","vice president of product","vice president of product development","vice president of sales & marketing","vice president product management","vice president risk","vp customer experience","vp growth","vp product"};
+	euTitles = {"advanced analytics lead","ai & automation lead","ai lead","analytics engineer","attribution manager","behavioural analyst","betting operations manager","bi analyst","bi developer","bonus manager","brand & marketing director","brand & product marketing lead","business operations manager","campaign manager","casino manager","casino product manager","commercial analyst","competitor intelligence analyst","country manager","crm director","crm manager","cro director","cro manager","cro product manager","customer excellence department head","customer experience insights manager","customer experience manager","customer insights product owner","customer journey manager","cx manager","data layer specialist","data visualisation analyst","design lead","design manager","design systems engineer","design systems lead","digital analyst","digital product manager","director customer experience & strategy","director of applied intelligence","director of cx & optimisation","director of digital marketing","director of marketing","director of marketing & affiliation","director of marketing communications","director of poker & bingo","director of poker operations","director of sportsbook","director of strategy & business delivery","director of user experience","experience researcher","experimentation manager","frontend developer","gaming product manager","generosity analytics & segmentation senior manager","go-to-market manager","head of experience","head of generosity transformation","head of performance","head of pricing strategy & insights","head of product analytics","head of product growth","head of sales","head of seo","head of trade marketing","head of ux & design","head trader","igaming product manager","information & product analysis specialist manager","interaction designer","lead product designer","lifecycle manager","live casino manager","manager egaming","manager product management","manager ux/ui & da gaming","market analyst","marketing analyst","marketing operations manager","offer manager","optimisation manager","paid search executive","planning & execution director","player engagement manager","pricing analyst","pricing strategy director","product & design operations specialist","product & experience operations manager","product analyst","product analytics","product designer","product experience director","product insights manager","product manager","product manager & qa lead","product marketing manager","product operations manager","product owner","promotions manager","proposition manager","regional head of digital","research manager","retention manager","senior crm marketing specialist","senior cvm manager","senior director sportsbook product","senior generosity transformation manager","senior product designer","senior product development manager","senior project leader","senior research manager","senior ux researcher","sports director","sportsbook operations manager","sportsbook product manager","sportsbook trading manager","tagging specialist","tracking specialist","trading manager","ui designer","user experience research manager","user research lead","user research manager","user researcher","ux analyst","ux architect","ux designer","ux researcher","voice of customer manager","web analyst","web developer","website manager","website product manager"};
+	infTitles = {"account executive","acquisition manager","administrative assistant","art director","associate director of product","bi manager","brand manager","business development director","business development executive","campaign strategy manager","chief assurance officer","chief of staff","client director","client partner","commercial finance manager","commercial manager","commercial planning manager","compliance manager","compliance product manager","consultant","creative director","creative lead","customer operations manager","data analyst","delivery director","deputy director","designer","director","director & general manager","director of corporate compliance","director of corporate security","director of engineering","director of generosity transformation","director of hospitality & general services","director of hotel sales","director of payments","director of people & culture","director of product compliance","director of product design","director of product development","director of product management","director of project management","director of trading strategy","engineering manager","experience director (product, cx, data, research & pmo)","finance business partner","fp&a manager","freelance writer","frontend lead","head cashier","head of affiliates","head of aml","head of aml, fraud & risk","head of b2b","head of backend engineering","head of business development","head of compliance","head of corporate communications","head of creative","head of creative research & insights","head of customer care","head of customer excellence","head of customer service","head of customer support","head of customer support & vip accounts management","head of facility & workplace strategy","head of greyhound racing operations","head of human resources","head of investor relations & capital deployment","head of legal","head of liquidity","head of live casino","head of operations","head of operations & support","head of partnerships","head of people & culture","head of propositions","head of social","head of streaming operations","head of support department","head of trading","head of trading & risk","head of vip","head of vip services","human resources business partner","human resources director","insight manager","legal counsel","lifecycle marketing manager","live ops product manager","live ops product manager, head of content","m&a principal","marketing manager","obg strategy","paid search manager","paid social manager","payment product manager","performance marketing manager","player experience lead","player operations manager","player protection lead","player value manager","poker product manager","principal product manager","product & customer support manager","product & insight director","product lead","product release manager","program manager","regulatory affairs manager","responsible gambling manager","safer gambling analyst","safer gambling lead","sales manager","senior business development manager","senior commercial manager","senior ecommerce consultant","senior graphic designer","senior legal & regulatory counsel","senior manager","senior manager new business & sales executive","senior product owner","senior sales manager","sportsbook property director kentucky","strategy consultant","supplier manager","team lead hr business partner","technical director","trading graduate","uk news editor","ux/ui designer","vice president of human resources","vip manager"};
+
+	// ---- duplicate-record short-circuit (still honour an explicitly-flagged duplicate) ----
+	// NOTE: duplicate-ACTIVE-Deal SILENCING + canonical reselection have been REMOVED
+	// (moved to processAccount). We still avoid reviving a record explicitly flagged as a
+	// duplicate / test record EXCEPT for a quote-source reconciliation, which must reconcile
+	// the supplied Deal regardless of its canonical/Lost/duplicate status.
+	dealName = ifnull(dealRecord.get("Deal_Name"), "").toString();
+	reasonForLoss = ifnull(dealRecord.get("Reason_For_Loss__s"), "").toString();
+	if(!isQuoteSrc && (dealName.endsWith("(Duplicate)") || reasonForLoss == "Duplicate / Test Record"))
+	{
+		automation.logAutomationEvent("processDeal", "Deals", cleanId, "guard", "ignore_duplicate", null);
+		result.put("success", true);
+		result.put("outcome", "ignored_duplicate");
+		return result.toString();
+	}
+
+	// ---- Resolve Account + Account_Key ----
+	accountId = "";
+	accNameMap = dealRecord.get("Account_Name");
+	if(accNameMap != null && accNameMap.get("id") != null)
+	{
+		accountId = accNameMap.get("id").toString();
+	}
+	if(accountId == "" || accountId == "null")
+	{
+		automation.logAutomationEvent("processDeal", "Deals", cleanId, "guard", "missing_account", null);
+		result.put("outcome", "missing_account");
+		return result.toString();
+	}
+
+	accRec = zoho.crm.getRecordById("Accounts", accountId.toLong());
+	accountKey = ifnull(accRec.get("Account_Key"), "").toString();
+	if(accountKey == "")
+	{
+		automation.logAutomationEvent("processDeal", "Deals", cleanId, "guard", "missing_account_key", {"account":accountId});
+		result.put("outcome", "missing_account_key");
+		return result.toString();
+	}
+	// Authoritative base for every Quote Subject built below (see _util_buildQuoteSubject).
+	// NEVER compose a Subject from Deal_Name + product: Deal_Name is already
+	// "<Account> - <Product>", which is what duplicated the product name.
+	accountName = ifnull(accRec.get("Account_Name"), "").toString();
+	// Deal_Key is PRODUCT-SCOPED: accountKey + "::" + productKey. The productKey is resolved from
+	// the Deal's own Deal_Product / else EXACTLY ONE unique non-lost child Quote product (§6b below),
+	// so Deal_Key is composed there — never here, and NEVER the legacy "::active" account-level key.
+	dealKey = "";
+
+	// EXACT supplied deal only — never reselect a canonical/min-id Deal.
+	targetDealId = cleanId;
+
+	// ===================================================================
+	// 1. Gather Contacts + aggregate Product Interest + furthest viable open
+	//    + everRTP completion history (durable RTP floor)
+	// ===================================================================
+	relContacts = zoho.crm.getRelatedRecords("Contacts", "Accounts", accountId.toLong());
+
+	aggregatedPIList = List();
+	lowercasePIList = List();
+
+	maxRank = 0;
+	bestStage = "Marketing Consent";
+	anyContactOpen = false;
+	anyContactWorking = false;
+	openContactIdsAtMax = List();
+	processedContactIds = List();
+	contactJobTitleMap = Map();
+	contactRoleMap = Map();
+	contactStageMap = Map();
+	contactDatesMap = Map();
+	contactProductKeysMap = Map();   // cId -> List of CANONICAL product_key (for product-scoped Contact_Role stamping)
+	productKeyResolveCache = Map();  // rawLower -> canonical product_key ("" if unresolved); avoids repeat resolveDealProduct calls
+	everRTPviaContact = false;   // ANY Deal-linked Contact completed Onboarding or Renewal
+
+	for each c in relContacts
+	{
+		cId = "";
+		if(c.get("id") != null) { cId = c.get("id").toString(); }
+		if(cId != "" && cId != "null")
+		{
+			processedContactIds.add(cId);
+			fullC = zoho.crm.getRecordById("Contacts", cId.toLong());
+			if(fullC != null && fullC.get("id") != null)
+			{
+				cState = ifnull(fullC.get("State"), "Open").toString();
+				cStatusLoop = ifnull(fullC.get("Status"), "").toString();
+				cStage = ifnull(fullC.get("Stage"), "Marketing Consent").toString();
+				cJobTitleLoop = ifnull(fullC.get("Job_Title"), "").toString().trim();
+				contactJobTitleMap.put(cId, cJobTitleLoop);
+				contactRoleMap.put(cId, ifnull(fullC.get("Contact_Role1"), "Decision Maker").toString());
+				contactStageMap.put(cId, cStage);
+
+				// everRTP via LIVE Contact completion timestamps (across ALL Deal-linked Contacts,
+				// not just the Primary — changing the Primary must not erase the historical floor).
+				if(ifnull(fullC.get("Contact_Completed_Onboarding_At"), "").toString() != "") { everRTPviaContact = true; }
+				if(ifnull(fullC.get("Contact_Completed_Renewal_At"), "").toString() != "") { everRTPviaContact = true; }
+
+				cDates = Map();
+				cDates.put("Marketing Consent", ifnull(fullC.get("Contact_Completed_Marketing_Qualification_At"), ""));
+				cDates.put("Demo Booking", ifnull(fullC.get("Contact_Completed_Demo_Booking_At"), ""));
+				cDates.put("Demo Confirmation", ifnull(fullC.get("Contact_Completed_Demo_Confirmation_At"), ""));
+				cDates.put("Demo Hosted", ifnull(fullC.get("Contact_Completed_Demo_Hosted_At"), ""));
+				cDates.put("Proposal Preparation", ifnull(fullC.get("Contact_Completed_Proposal_Preparation_At"), ""));
+				cDates.put("Commercial Agreement", ifnull(fullC.get("Contact_Completed_Commercial_Agreement_At"), ""));
+				cDates.put("Onboarding", ifnull(fullC.get("Contact_Completed_Onboarding_At"), ""));
+				cDates.put("Renewal", ifnull(fullC.get("Contact_Completed_Renewal_At"), ""));
+				contactDatesMap.put(cId, cDates);
+
+				// Stamp Contact_Role on the Contact if blank and Job_Title resolves to a role
+				cContactRoleLoop = ifnull(fullC.get("Contact_Role1"), "").toString().trim();
+				if(cContactRoleLoop == "" && cJobTitleLoop != "")
+				{
+					resolvedRoleLoop = "Decision Maker";
+					tKeyLoop = cJobTitleLoop.toLowerCase();
+					if(euTitles.contains(tKeyLoop)) { resolvedRoleLoop = "End User"; }
+					else if(infTitles.contains(tKeyLoop)) { resolvedRoleLoop = "Influencer"; }
+					stampResp = zoho.crm.updateRecord("Contacts", cId.toLong(), {"Contact_Role1": resolvedRoleLoop}, noTrigger);
+					info "processDeal: stamped Contact_Role1 on " + cId + " title='" + cJobTitleLoop + "' -> '" + resolvedRoleLoop + "' resp=" + stampResp;
+				}
+
+				// Per-contact raw product-name evidence (for product-scoped Contact_Role stamping in Section 3).
+				cRawProdNames = List();
+
+				cPIStaging = ifnull(fullC.get("Product_Interest_Staging"), "").toString().trim();
+				if(cPIStaging != "")
+				{
+					for each part in cPIStaging.toList(",")
+					{
+						pTrim = part.trim();
+						if(pTrim != "" && !cRawProdNames.contains(pTrim)) { cRawProdNames.add(pTrim); }
+						if(pTrim != "" && !lowercasePIList.contains(pTrim.toLowerCase()))
+						{
+							aggregatedPIList.add(pTrim);
+							lowercasePIList.add(pTrim.toLowerCase());
+						}
+					}
+				}
+				cPI = fullC.get("Products_Linked");
+				if(cPI != null)
+				{
+					cPIStr = cPI.toString();
+					if(cPIStr.startsWith("[") && cPIStr.endsWith("]") && cPIStr.contains("{"))
+					{
+						for each item in cPI
+						{
+							if(item != null && item.get("name") != null)
+							{
+								pn = item.get("name").toString().trim();
+								if(pn != "" && !cRawProdNames.contains(pn)) { cRawProdNames.add(pn); }
+								if(pn != "" && !lowercasePIList.contains(pn.toLowerCase()))
+								{
+									aggregatedPIList.add(pn);
+									lowercasePIList.add(pn.toLowerCase());
+								}
+							}
+						}
+					}
+					else if(cPIStr != "" && cPIStr != "null")
+					{
+						cleaned = cPIStr.removeFirstOccurence("[").removeLastOccurence("]").replaceAll(";", ",").replaceAll("\"", "").replaceAll("'", "");
+						for each part in cleaned.toList(",")
+						{
+							pTrim = part.trim();
+							if(pTrim != "" && !cRawProdNames.contains(pTrim)) { cRawProdNames.add(pTrim); }
+							if(pTrim != "" && !lowercasePIList.contains(pTrim.toLowerCase()))
+							{
+								aggregatedPIList.add(pTrim);
+								lowercasePIList.add(pTrim.toLowerCase());
+							}
+						}
+					}
+				}
+
+				// Resolve this contact's raw product names -> CANONICAL product_key list (cached).
+				cProdKeys = List();
+				for each rawNm in cRawProdNames
+				{
+					rawLower = rawNm.toLowerCase();
+					ckey = "";
+					if(productKeyResolveCache.get(rawLower) != null)
+					{
+						ckey = productKeyResolveCache.get(rawLower).toString();
+					}
+					else
+					{
+						rRes = automation.resolveDealProduct(rawNm).toMap();
+						if(ifnull(rRes.get("valid"), "false").toString() == "true")
+						{
+							ckey = ifnull(rRes.get("product_key"), "").toString();
+						}
+						productKeyResolveCache.put(rawLower, ckey);
+					}
+					if(ckey != "" && !cProdKeys.contains(ckey)) { cProdKeys.add(ckey); }
+				}
+				contactProductKeysMap.put(cId, cProdKeys);
+
+				if(cState == "Open")
+				{
+					anyContactOpen = true;
+					if(cStatusLoop == "Working") { anyContactWorking = true; }
+					rank = ifnull(stageRanks.get(cStage), 1);
+					info "Contact " + cId + " Stage=" + cStage + " rank=" + rank;
+					if(rank > maxRank)
+					{
+						maxRank = rank;
+						bestStage = cStage;
+						openContactIdsAtMax = List();
+						openContactIdsAtMax.add(cId);
+					}
+					else if(rank == maxRank)
+					{
+						openContactIdsAtMax.add(cId);
+					}
+				}
+			}
+		}
+	}
+
+	primaryContactRank = maxRank;
+	info "Rollup: bestStage=" + bestStage + " maxRank=" + maxRank + " anyContactOpen=" + anyContactOpen + " everRTPviaContact=" + everRTPviaContact;
+
+	// Existing Deal Products -> contribute to interest aggregation
+	existingProds = zoho.crm.getRelatedRecords("Products", "Deals", targetDealId.toLong());
+	existingProdIds = List();
+	if(existingProds != null && existingProds.size() > 0 && !existingProds.toString().startsWith("{\"code\""))
+	{
+		for each ep in existingProds
+		{
+			epName = ifnull(ep.get("Product_Name"), "").toString().trim();
+			if(epName != "" && !lowercasePIList.contains(epName.toLowerCase()))
+			{
+				aggregatedPIList.add(epName);
+				lowercasePIList.add(epName.toLowerCase());
+			}
+			if(ep.get("id") != null) { existingProdIds.add(ep.get("id").toString()); }
+		}
+	}
+
+	// ===================================================================
+	// 2. RTP floor (durable) + effective Opportunity Type
+	// ===================================================================
+	storedStage = ifnull(dealRecord.get("Stage"), "").toString();
+	storedOppStage = ifnull(dealRecord.get("Opportunity_Stage"), "").toString();
+	storedOppStageRank = ifnull(stageRanks.get(storedOppStage), 0).toLong();
+	// Deal-level Onboarding_Completed_At / Renewal_Completed_At are PHANTOM (do not exist) —
+	// never read them. everRTP relies on stored RTP, stored Opportunity_Stage rank, and the
+	// Contact completion history gathered above.
+	everRTP = (storedStage == "RTP") || (storedOppStageRank >= onboardingRank) || everRTPviaContact;
+
+	targetRank = primaryContactRank;
+	if(everRTP)
+	{
+		if(onboardingRank > primaryContactRank) { targetRank = onboardingRank; }
+		else { targetRank = primaryContactRank; }
+	}
+
+	// Derive Opportunity Type (Deal.Stage) from the target rank — never the raw stored value.
+	effectiveOppType = "MQL";
+	if(targetRank >= onboardingRank) { effectiveOppType = "RTP"; }
+	else if(targetRank >= 5) { effectiveOppType = "FTP"; }
+	else if(targetRank >= 2) { effectiveOppType = "SQL"; }
+	else { effectiveOppType = "MQL"; }
+
+	// Quote Opportunity_Type is binary FTP/RTP (RTP once the Deal has reached the RTP floor).
+	quoteOppType = "FTP";
+	if(effectiveOppType == "RTP") { quoteOppType = "RTP"; }
+
+	// targetStage = the 8-stage stage matching targetRank (post-RTP floor may raise it).
+	rankToStage = Map();
+	for each sName in stageRanks.keys()
+	{
+		rankToStage.put(stageRanks.get(sName).toString(), sName);
+	}
+	targetStage = ifnull(rankToStage.get(targetRank.toString()), bestStage).toString();
+	if(targetRank == 0) { targetStage = "Marketing Consent"; }
+
+	info "RTP floor: everRTP=" + everRTP + " primaryRank=" + primaryContactRank + " targetRank=" + targetRank + " targetStage=" + targetStage + " effectiveOppType=" + effectiveOppType + " quoteOppType=" + quoteOppType;
+
+	// ===================================================================
+	// 3. Maintain Contact_Roles (each entry's id == Contact id)
+	// ===================================================================
+	roleIdMap = Map();
+	rolesResp = invokeurl
+	[
+		url: "https://www.zohoapis.com/crm/v2/Contacts/roles"
+		type: GET
+	];
+	if(rolesResp != null && rolesResp.get("contact_roles") != null)
+	{
+		for each role in rolesResp.get("contact_roles")
+		{
+			if(role.get("name") != null && role.get("id") != null)
+			{
+				roleIdMap.put(role.get("name").toString(), role.get("id").toString());
+			}
+		}
+	}
+	info "Contact Role IDs loaded: " + roleIdMap.size() + " roles";
+
+	existingRoles = zoho.crm.getRelatedRecords("Contact_Roles", "Deals", targetDealId.toLong());
+	existingRoleMap = Map();
+	if(existingRoles != null && existingRoles.size() > 0 && !existingRoles.toString().startsWith("{\"code\""))
+	{
+		for each er in existingRoles
+		{
+			if(er.get("id") != null)
+			{
+				erRoleRaw = er.get("Contact_Role");
+				erRoleStr = "";
+				if(erRoleRaw != null)
+				{
+					erRoleStr = erRoleRaw.toString();
+					if(erRoleStr.startsWith("{") && erRoleRaw.get("name") != null)
+					{
+						erRoleStr = erRoleRaw.get("name").toString();
+					}
+				}
+				existingRoleMap.put(er.get("id").toString(), erRoleStr);
+			}
+		}
+	}
+	info "Existing Contact_Roles on Deal " + targetDealId + ": " + existingRoleMap.size();
+
+	// Product-scope guard: a Contact is stamped onto this Deal ONLY if its product evidence
+	// matches the Deal's product, OR it is the controlling Deal/Quote Contact (Contact_Name).
+	dealProdKey = ifnull(dealRecord.get("Deal_Product_Key"), "").toString().trim();
+	if(dealProdKey == "")
+	{
+		dealProdLookup = dealRecord.get("Deal_Product");
+		if(!isNull(dealProdLookup) && !isNull(dealProdLookup.get("name")))
+		{
+			dealProdKey = ifnull(automation.computeProductKey(dealProdLookup.get("name").toString()), "").toString().trim();
+		}
+	}
+	dealPrimaryContactId = "";
+	dealCnLookup = dealRecord.get("Contact_Name");
+	if(!isNull(dealCnLookup) && !isNull(dealCnLookup.get("id"))) { dealPrimaryContactId = dealCnLookup.get("id").toString(); }
+	info "Contact_Role product scope: dealProdKey='" + dealProdKey + "' dealPrimaryContactId=" + dealPrimaryContactId;
+
+	for each cId in processedContactIds
+	{
+		if(cId != "")
+		{
+			// Product-scope: skip stamping a Contact whose product evidence does not match this
+			// Product Deal, unless it is the controlling Deal/Quote Contact. dealProdKey=="" is a
+			// defensive fallback (should not occur on fresh data) -> retain prior stamp-all behavior.
+			stampAllowed = true;
+			if(dealProdKey != "")
+			{
+				stampAllowed = false;
+				if(cId == dealPrimaryContactId) { stampAllowed = true; }
+				else
+				{
+					cKeysForStamp = contactProductKeysMap.get(cId);
+					if(!isNull(cKeysForStamp) && cKeysForStamp.contains(dealProdKey)) { stampAllowed = true; }
+				}
+			}
+			if(!stampAllowed)
+			{
+				info "Contact_Roles skip contact=" + cId + " (product evidence does not match Deal product '" + dealProdKey + "')";
+				continue;
+			}
+			existingRoleVal = existingRoleMap.get(cId);
+			if(existingRoleVal == null || existingRoleVal.toString().trim() == "")
+			{
+				cJobTitle = ifnull(contactJobTitleMap.get(cId), "").toString().trim();
+				resolvedRoleName = "Decision Maker";
+				if(cJobTitle != "")
+				{
+					titleKey = cJobTitle.toLowerCase();
+					if(euTitles.contains(titleKey)) { resolvedRoleName = "End User"; }
+					else if(infTitles.contains(titleKey)) { resolvedRoleName = "Influencer"; }
+				}
+				resolvedRoleId = ifnull(roleIdMap.get(resolvedRoleName), "").toString();
+				if(resolvedRoleId == "")
+				{
+					resolvedRoleId = ifnull(roleIdMap.get("Decision Maker"), "").toString();
+				}
+				roleValueToPass = resolvedRoleId;
+				if(roleValueToPass == "") { roleValueToPass = resolvedRoleName; }
+
+				roleMap = Map();
+				roleMap.put("Contact_Role", roleValueToPass);
+				roleResp = zoho.crm.updateRelatedRecord("Contact_Roles", cId.toLong(), "Deals", targetDealId.toLong(), roleMap);
+				info "Contact_Roles upsert deal=" + targetDealId + " contact=" + cId + " role=" + resolvedRoleName + " (passed=" + roleValueToPass + ", title=" + cJobTitle + ") resp=" + roleResp;
+			}
+			else
+			{
+				info "Contact_Roles skip contact=" + cId + " (existing role=" + existingRoleVal + ")";
+			}
+		}
+	}
+
+	// ===================================================================
+	// 4. Pick primary Contact (role tiebreak), refresh Deal record
+	// ===================================================================
+	targetDeal = zoho.crm.getRecordById("Deals", targetDealId.toLong());
+
+	currentPrimaryId = "";
+	cnLookup0 = targetDeal.get("Contact_Name");
+	if(cnLookup0 != null && cnLookup0.get("id") != null) { currentPrimaryId = cnLookup0.get("id").toString(); }
+
+	furthestContactId = "";
+	if(openContactIdsAtMax.size() > 0)
+	{
+		if(openContactIdsAtMax.size() == 1)
+		{
+			furthestContactId = openContactIdsAtMax.get(0);
+		}
+		else
+		{
+			roleRanks = {"Decision Maker": 3, "End User": 2, "Influencer": 1};
+			bestRoleRank = -1;
+			bestContactId = "";
+			for each cId_tie in openContactIdsAtMax
+			{
+				cRole_tie = ifnull(contactRoleMap.get(cId_tie), "Decision Maker").toString();
+				cRoleRank = ifnull(roleRanks.get(cRole_tie), 3).toLong();
+				isCurrentPrimary = cId_tie == currentPrimaryId;
+				if(cRoleRank > bestRoleRank)
+				{
+					bestRoleRank = cRoleRank;
+					bestContactId = cId_tie;
+				}
+				else if(cRoleRank == bestRoleRank && isCurrentPrimary)
+				{
+					bestContactId = cId_tie;
+				}
+			}
+			furthestContactId = bestContactId;
+		}
+	}
+
+	// the controlling Primary Contact for gates/transitions (existing primary if still open, else furthest)
+	primaryContactId = currentPrimaryId;
+	if(furthestContactId != "") { primaryContactId = furthestContactId; }
+
+	// ===================================================================
+	// 5. Activity Product NAME resolution + linking + per-Product Quote upsert
+	//    (only for source=="activity"; generic/quote contexts reconcile EXISTING only)
+	// ===================================================================
+	productCatalog = Map();      // lowercase Product_Name -> product map
+	productCatalogByCode = Map(); // lowercase Product_Code -> product map
+	duplicateProductNameKeys = List();
+	duplicateProductCodeKeys = List();
+	catalogLoaded = false;
+
+	sourceContactId = ifnull(ctx.get("contactId"), "").toString();
+	if(sourceContactId == "") { sourceContactId = primaryContactId; }
+
+	sourceModule = ifnull(ctx.get("sourceModule"), "").toString();
+	sourceActivityId = ifnull(ctx.get("sourceActivityId"), "").toString();
+	activityKey = "";
+	if(sourceModule != "" && sourceActivityId != "") { activityKey = sourceModule + ":" + sourceActivityId; }
+
+	ctxBrands = ifnull(ctx.get("numberOfBrands"), "").toString();
+	ctxDateStart = ifnull(ctx.get("contractDateStart"), "").toString();
+	ctxDateEnd = ifnull(ctx.get("contractDateEnd"), "").toString();
+	ctxFreq = ifnull(ctx.get("frequency"), "").toString().trim();
+	if(ctxFreq == "-None-") { ctxFreq = ""; }
+
+	anyBlocked = false;            // any Product hit a BLOCKING anomaly
+	resolvedProductIds = List();   // Products linked this pass (for staging append)
+
+	if(isActivity)
+	{
+		ctxProducts = ctx.get("products");
+		productNames = List();
+		if(!isNull(ctxProducts))
+		{
+			// D2 FIX (2026-06-22): parse products robustly whether ctx.get("products")
+			// round-trips from handleTaskCompletion/handleCallOutcome/handleMeetingEvent as a
+			// real List OR as a bracketed String. Deluge Map.toString()->toMap() can deliver
+			// the JSON array as a String; "for each ... in <String>" then iterates CHARACTERS,
+			// not Product names, so productNames stayed empty and NO Quote was created
+			// (E2E: Draft Commercials activity produced no Quote). Strip brackets/quotes and
+			// split on comma — correct for both the List form ("[a, b]") and the String form.
+			cpStr = ctxProducts.toString().removeFirstOccurence("[").removeLastOccurence("]").replaceAll("\"", "").replaceAll("'", "").trim();
+			if(cpStr != "")
+			{
+				for each pnTok in cpStr.toList(",")
+				{
+					pnNm = pnTok.trim();
+					if(pnNm != "" && pnNm != "-None-") { productNames.add(pnNm); }
+				}
+			}
+		}
+
+		if(productNames.size() > 0)
+		{
+			// ---- load Product catalogue once (active only), index by Name + Code ----
+			allProds = zoho.crm.getRecords("Products", 1, 200);
+			if(allProds != null && allProds.size() > 0 && !allProds.toString().startsWith("{\"code\""))
+			{
+				for each p in allProds
+				{
+					if(p != null && p.get("Product_Name") != null)
+					{
+						isActiveP = ifnull(p.get("Product_Active"), false);
+						if(isActiveP == true || isActiveP == "true")
+						{
+							pNameRaw = p.get("Product_Name").toString().trim().replaceAll("  ", " ");
+							if(pNameRaw != "")
+							{
+								pNameKey = pNameRaw.toLowerCase();
+								if(productCatalog.get(pNameKey) != null)
+								{
+									if(!duplicateProductNameKeys.contains(pNameKey)) { duplicateProductNameKeys.add(pNameKey); }
+								}
+								else
+								{
+									productCatalog.put(pNameKey, p);
+								}
+							}
+							pCodeRaw = ifnull(p.get("Product_Code"), "").toString().trim();
+							if(pCodeRaw != "")
+							{
+								pCodeKey = pCodeRaw.toLowerCase();
+								if(productCatalogByCode.get(pCodeKey) != null)
+								{
+									if(!duplicateProductCodeKeys.contains(pCodeKey)) { duplicateProductCodeKeys.add(pCodeKey); }
+								}
+								else
+								{
+									productCatalogByCode.put(pCodeKey, p);
+								}
+							}
+						}
+					}
+				}
+			}
+			catalogLoaded = true;
+			info "Product catalog loaded: " + productCatalog.size() + " active products";
+
+			// ---- resolve each name -> Product, dedup ----
+			resolvedProducts = List();   // list of {id, product map}
+			seenResolvedIds = List();
+			for each pName in productNames
+			{
+				safeName = pName.trim().replaceAll("  ", " ");
+				if(safeName != "")
+				{
+					// Temporary alias for live picklist options whose display labels were fixed
+					// but whose actual values still read back with one "i" via Zoho metadata.
+					if(safeName == "Jurni Cortex - Fixed") { safeName = "Jurnii Cortex - Fixed"; }
+					if(safeName == "Jurni Cortex - Flex") { safeName = "Jurnii Cortex - Flex"; }
+					nameKey = safeName.toLowerCase();
+					prod = null;
+					ambiguousProduct = false;
+					if(duplicateProductNameKeys.contains(nameKey))
+					{
+						ambiguousProduct = true;
+					}
+					else
+					{
+						prod = productCatalog.get(nameKey);
+						if(prod == null)
+						{
+							if(duplicateProductCodeKeys.contains(nameKey))
+							{
+								ambiguousProduct = true;
+							}
+							else
+							{
+								prod = productCatalogByCode.get(nameKey);
+							}
+						}
+					}
+					if(prod != null && prod.get("id") != null)
+					{
+						pid = prod.get("id").toString();
+						if(!seenResolvedIds.contains(pid))
+						{
+							seenResolvedIds.add(pid);
+							resolvedProducts.add(prod);
+						}
+					}
+					else if(ambiguousProduct)
+					{
+						if(!reviewReasons.contains("product_name_ambiguous")) { reviewReasons.add("product_name_ambiguous"); }
+						automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Activity Product value matched multiple active Products: '" + safeName + "'. Make Product_Name/Product_Code unique and re-run.");
+						automation.logAutomationEvent("processDeal", "Deals", targetDealId, "product_ambiguous", safeName, {"activityKey":activityKey});
+					}
+					else
+					{
+						// no unambiguous match -> Manual Review, skip this Product (no Quote)
+						if(!reviewReasons.contains("product_name_unresolved")) { reviewReasons.add("product_name_unresolved"); }
+						automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Activity Product name could not be resolved to a Product: '" + safeName + "'. Correct the picklist value or Product_Name and re-run.");
+						automation.logAutomationEvent("processDeal", "Deals", targetDealId, "product_unresolved", safeName, {"activityKey":activityKey});
+					}
+				}
+			}
+
+			// ---- per-Product: link + per-Product Quote upsert ----
+			for each prod in resolvedProducts
+			{
+				prodId = prod.get("id").toString();
+				prodName = ifnull(prod.get("Product_Name"), "").toString().trim();
+				prodFamily = ifnull(prod.get("Product_Plan_Products"), "").toString().trim();
+				if(prodFamily == "Jurnii Cortext") { prodFamily = "Jurnii Cortex"; }
+				prodPlanType = ifnull(prod.get("Product_Plan_Type"), "").toString().trim();
+				if(prodPlanType == "Flexible") { prodPlanType = "Flex"; }
+
+				// (a) link Product -> source Contact Products_Linked via the Contacts_X_Products junction
+				if(sourceContactId != "")
+				{
+					contactProductLinked = false;
+					sourceConLinks = zoho.crm.getRelatedRecords("Products12", "Contacts", sourceContactId.toLong());
+					if(!isNull(sourceConLinks) && sourceConLinks.size() > 0 && !sourceConLinks.toString().startsWith("{\"code\""))
+					{
+						for each scl in sourceConLinks
+						{
+							sclProdId = "";
+							if(!isNull(scl.get("id"))) { sclProdId = scl.get("id").toString(); }
+							sclProd = scl.get("Product_Details");
+							if(!isNull(sclProd) && !isNull(sclProd.get("id"))) { sclProdId = sclProd.get("id").toString(); }
+							sclPI = scl.get("Product_Interest");
+							if(!isNull(sclPI) && !isNull(sclPI.get("id"))) { sclProdId = sclPI.get("id").toString(); }
+							if(sclProdId == prodId) { contactProductLinked = true; break; }
+						}
+					}
+					if(!contactProductLinked)
+					{
+						sourceJunctionLinks = zoho.crm.searchRecords("Contacts_X_Products", "(Contacts:equals:" + sourceContactId + ")");
+						if(!isNull(sourceJunctionLinks) && sourceJunctionLinks.size() > 0 && !sourceJunctionLinks.toString().startsWith("{\"code\""))
+						{
+							for each sjl in sourceJunctionLinks
+							{
+								sjlProdId = "";
+								sjlPI = sjl.get("Product_Interest");
+								if(!isNull(sjlPI) && !isNull(sjlPI.get("id"))) { sjlProdId = sjlPI.get("id").toString(); }
+								if(sjlProdId == prodId) { contactProductLinked = true; break; }
+							}
+						}
+					}
+					if(!contactProductLinked)
+					{
+						linkCMap = Map();
+						linkCMap.put("Contacts", sourceContactId);
+						linkCMap.put("Product_Interest", prodId);
+						linkCResp = zoho.crm.createRecord("Contacts_X_Products", linkCMap);
+						info "Linked Product to Contact Products_Linked via Contacts_X_Products: prod=" + prodId + " contact=" + sourceContactId + " resp=" + linkCResp;
+					}
+				}
+				// (b) link Product -> Deal Products related list (idempotent: skip if already present)
+				if(!existingProdIds.contains(prodId))
+				{
+					linkDResp = zoho.crm.updateRelatedRecord("Products", prodId.toLong(), "Deals", targetDealId.toLong(), Map());
+					existingProdIds.add(prodId);
+					info "Linked Product to Deal Products: prod=" + prodId + " deal=" + targetDealId + " resp=" + linkDResp;
+				}
+				// (c) record canonical name for staging append + interest aggregation
+				if(prodName != "")
+				{
+					resolvedProductIds.add(prodId);
+					if(!lowercasePIList.contains(prodName.toLowerCase()))
+					{
+						aggregatedPIList.add(prodName);
+						lowercasePIList.add(prodName.toLowerCase());
+					}
+				}
+
+				// ---- per-Product Quote upsert ----
+				// match set = Deal + Quote_Product + Opportunity_Type; activity-updatable = Draft/Negotiation/Delivered/On Hold
+				keyAlreadyApplied = false;
+				updatableMatches = List();   // ids of activity-updatable matching Quotes
+				anomalyMultipleOpen = false;
+
+				dealQuotesForProd = zoho.crm.getRelatedRecords("Quotes", "Deals", targetDealId.toLong());
+				if(dealQuotesForProd != null && dealQuotesForProd.size() > 0 && !dealQuotesForProd.toString().startsWith("{\"code\""))
+				{
+					for each dqp in dealQuotesForProd
+					{
+						qProdId = "";
+						qpLookup = dqp.get("Quote_Product");
+						if(!isNull(qpLookup) && !isNull(qpLookup.get("id"))) { qProdId = qpLookup.get("id").toString(); }
+						qOppT = ifnull(dqp.get("Opportunity_Type"), "").toString();
+						if(qProdId == prodId && qOppT == quoteOppType)
+						{
+							qStg = ifnull(dqp.get("Quote_Stage"), "").toString();
+							// parse Quote_Applied_Activity_Keys: EXACT trimmed newline-delimited keys (NO substring)
+							rawKeys = ifnull(dqp.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+							for each kLine in rawKeys.toList("\n")
+							{
+								if(activityKey != "" && kLine.trim() == activityKey) { keyAlreadyApplied = true; }
+							}
+							if(qStg == "Draft" || qStg == "Negotiation" || qStg == "Delivered" || qStg == "On Hold")
+							{
+								updatableMatches.add(dqp.get("id").toString());
+							}
+						}
+					}
+				}
+
+				if(keyAlreadyApplied)
+				{
+					// (A) key already present -> ALREADY_APPLIED; do not create/alter.
+					// If a duplicate-open anomaly ALSO exists -> still complete, but review.
+					if(updatableMatches.size() > 1)
+					{
+						result.put("reviewRequired", true);
+						if(!reviewReasons.contains("anomaly_multiple_open_match")) { reviewReasons.add("anomaly_multiple_open_match"); }
+						automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Multiple open Quotes for Product " + prodName + " / " + quoteOppType + " while the Activity key " + activityKey + " is already applied. Consolidate the duplicate open Quotes.");
+					}
+					automation.logAutomationEvent("processDeal", "Deals", targetDealId, "quote_already_applied", prodName, {"activityKey":activityKey, "oppType":quoteOppType});
+				}
+				else
+				{
+					// (B) key NOT present
+					if(updatableMatches.size() > 1)
+					{
+						// >1 activity-updatable match -> BLOCKING anomaly: update none.
+						anyBlocked = true;
+						result.put("reviewRequired", true);
+						if(!reviewReasons.contains("anomaly_multiple_open_match")) { reviewReasons.add("anomaly_multiple_open_match"); }
+						automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "BLOCKING: multiple activity-updatable Quotes for Product " + prodName + " / " + quoteOppType + ". Cannot apply Activity " + activityKey + " unambiguously. Consolidate the open Quotes.");
+						automation.logAutomationEvent("processDeal", "Deals", targetDealId, "quote_multiple_open_blocked", prodName, {"activityKey":activityKey, "matches":updatableMatches.size().toString()});
+					}
+					else if(updatableMatches.size() == 1)
+					{
+						// 1 match -> update nonblank values; never overwrite Quote Contact; append key in SAME request.
+						upQid = updatableMatches.get(0);
+						existingQ = zoho.crm.getRecordById("Quotes", upQid.toLong());
+						qUpd = Map();
+						// Re-assert the canonical Subject so a Quote written by an earlier
+						// (product-duplicating) build self-repairs as soon as activity evidence
+						// touches it. Recomputed from parts -> no-op once already canonical. The
+						// Quote's own Quote_Type is the label, so a scaffold that has since taken
+						// real evidence settles on its true type.
+						qUpd.put("Subject", automation.buildQuoteSubject(accountName, prodName, ifnull(existingQ.get("Quote_Type"), "").toString(), ifnull(targetDeal.get("Deal_Name"), "").toString()));
+						qHeaderProd = Map();
+						qHeaderProd.put("id", prodId);
+						qUpd.put("Quote_Product", qHeaderProd);
+						qUpd.put("Opportunity_Type", quoteOppType);
+						qUpd.put("Quote_Last_Deal_ID", targetDealId);
+
+						// dates (nonblank-overwrite; blanks never erase)
+						if(ctxDateStart != "") { qUpd.put("Contract_Date_Start", ctxDateStart); }
+						if(ctxDateEnd != "") { qUpd.put("Contract_Date_End", ctxDateEnd); }
+
+						// brands -> the single Quoted_Items line; reprice when brands change.
+						// Read the existing lines via REST GET, NOT getRecordById: native Deluge
+						// getRecordById omits the subform LINE IDs and the custom subform fields
+						// (Quoted_Item_Pricing_Tier/Frequency/Plan_Brands). Without the line id the
+						// PUT below APPENDS a new line instead of updating in place, inflating the
+						// Quote total / Deal Amount / contract ACV on every activity re-fire.
+						lineEdited = false;
+						newLines = List();
+						existingLines = List();
+						exActGet = invokeurl
+						[
+							url: "https://www.zohoapis.eu/crm/v6/Quotes/" + upQid
+							type: GET
+							connection: "zoho_crm"
+						];
+						if(!isNull(exActGet) && !isNull(exActGet.get("data")) && exActGet.get("data").size() > 0)
+						{
+							exActLines = exActGet.get("data").get(0).get("Quoted_Items");
+							if(!isNull(exActLines)) { existingLines = exActLines; }
+						}
+						if(existingLines.size() > 0)
+						{
+							for each xl in existingLines
+							{
+								lm = Map();
+								xlId = "";
+								if(!isNull(xl.get("id"))) { xlId = xl.get("id").toString(); }
+								if(xlId != "") { lm.put("id", xlId); }
+								// keep the existing product on the line
+								xlProdId = "";
+								xlpL = xl.get("Product_Name");
+								if(!isNull(xlpL) && !isNull(xlpL.get("id"))) { xlProdId = xlpL.get("id").toString(); }
+								if(xlProdId != "") { pm = Map(); pm.put("id", xlProdId); lm.put("Product_Name", pm); }
+								lm.put("Quantity", ifnull(xl.get("Quantity"), 1));
+								xlTier = ifnull(xl.get("Quoted_Item_Pricing_Tier"), "Base").toString();
+								if(xlTier == "") { xlTier = "Base"; }
+								lm.put("Quoted_Item_Pricing_Tier", xlTier);
+								// frequency: a nonblank ctx value overrides the existing line value (blanks never erase)
+								xlFreq = ifnull(xl.get("Quoted_Item_Frequency"), "").toString();
+								effFreq = xlFreq;
+								if(ctxFreq != "" && ctxFreq != xlFreq)
+								{
+									effFreq = ctxFreq;
+									lineEdited = true;
+								}
+								if(effFreq != "") { lm.put("Quoted_Item_Frequency", effFreq); }
+
+								xlBrands = ifnull(xl.get("Quoted_Item_Plan_Brands"), "").toString();
+								effBrands = xlBrands;
+								if(ctxBrands != "" && ctxBrands != "null" && ctxBrands != xlBrands)
+								{
+									effBrands = ctxBrands;
+									lineEdited = true;
+								}
+								if(effBrands != "" && effBrands != "null") { lm.put("Quoted_Item_Plan_Brands", effBrands.toLong()); }
+
+								// (re)price best-effort when we have a brand count (NONFATAL).
+								// Unpriced results route to the unpriced-quote/Manual Review flow below.
+								if(effBrands != "" && effBrands != "null" && xlProdId != "")
+								{
+									priceResp = automation.resolveQuoteLinePrice(xlProdId, prodPlanType, effBrands, xlTier, effFreq).toMap();
+									if(ifnull(priceResp.get("valid"), "false").toString() == "true")
+									{
+										lm.put("List_Price", ifnull(priceResp.get("line_acv"), 0));
+									}
+									else
+									{
+										result.put("reviewRequired", true);
+										if(!reviewReasons.contains("pricing_unavailable")) { reviewReasons.add("pricing_unavailable"); }
+										automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Quote line for Product " + prodName + " could not be auto-priced (" + ifnull(priceResp.get("reason"), "pricing_unavailable").toString() + "). Left unpriced; set the price manually.");
+									}
+								}
+								newLines.add(lm);
+							}
+						}
+						else
+						{
+							lm = Map();
+							pm = Map();
+							pm.put("id", prodId);
+							lm.put("Product_Name", pm);
+							lm.put("Quantity", 1);
+							lm.put("Quoted_Item_Pricing_Tier", "Base");
+							if(ctxBrands != "" && ctxBrands != "null") { lm.put("Quoted_Item_Plan_Brands", ctxBrands.toLong()); }
+							if(ctxFreq != "") { lm.put("Quoted_Item_Frequency", ctxFreq); }
+							if(ctxBrands != "" && ctxBrands != "null")
+							{
+								priceRespN = automation.resolveQuoteLinePrice(prodId, prodPlanType, ctxBrands, "Base", ctxFreq).toMap();
+								if(ifnull(priceRespN.get("valid"), "false").toString() == "true")
+								{
+									lm.put("List_Price", ifnull(priceRespN.get("line_acv"), 0));
+								}
+								else
+								{
+									result.put("reviewRequired", true);
+									if(!reviewReasons.contains("pricing_unavailable")) { reviewReasons.add("pricing_unavailable"); }
+									automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Quote line for Product " + prodName + " could not be auto-priced (" + ifnull(priceRespN.get("reason"), "pricing_unavailable").toString() + "). Left unpriced; set the price manually.");
+								}
+							}
+							newLines.add(lm);
+						}
+						if(newLines.size() > 0) { qUpd.put("Quoted_Items", newLines); }
+
+						// append activityKey (preserve all prior keys) in the SAME update request
+						priorKeysStr = ifnull(existingQ.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+						if(activityKey != "")
+						{
+							keyPresent = false;
+							for each kL in priorKeysStr.toList("\n") { if(kL.trim() == activityKey) { keyPresent = true; } }
+							if(!keyPresent)
+							{
+								newKeysStr = priorKeysStr;
+								if(newKeysStr.trim() != "") { newKeysStr = newKeysStr + "\n" + activityKey; }
+								else { newKeysStr = activityKey; }
+								qUpd.put("Quote_Applied_Activity_Keys", newKeysStr);
+							}
+						}
+
+						if(qUpd.size() > 0)
+						{
+							// Update via the REST API (zoho_crm connection) in ONE PUT. Native Deluge updateRecord
+							// uses the reserved Product_Details contract which DROPS custom subform fields; the REST
+							// API persists the Quoted_Items custom fields (Pricing_Tier/Plan_Brands/Frequency) directly.
+							// trigger:[] suppresses WF020 -> handleQuoteStageChange -> processDeal recursion.
+							upBody = Map();
+							upData = List();
+							upData.add(qUpd);
+							upBody.put("data", upData);
+							upBody.put("trigger", List());
+							upHeaders = Map();
+							upHeaders.put("Content-Type", "application/json");
+							updateResp = invokeurl
+							[
+								url: "https://www.zohoapis.eu/crm/v6/Quotes/" + upQid
+								type: PUT
+								parameters: upBody.toString()
+								connection: "zoho_crm"
+								headers: upHeaders
+							];
+							// Strict readback via REST GET (read-after-write consistent): key + product + line must survive.
+							verifyQ = Map();
+							vUpGetResp = invokeurl
+							[
+								url: "https://www.zohoapis.eu/crm/v6/Quotes/" + upQid
+								type: GET
+								connection: "zoho_crm"
+							];
+							if(!isNull(vUpGetResp) && !isNull(vUpGetResp.get("data")) && vUpGetResp.get("data").size() > 0) { verifyQ = vUpGetResp.get("data").get(0); }
+							verifyKeyOk = false;
+							verifyProductOk = false;
+							verifyLineOk = false;
+							if(!isNull(verifyQ) && !isNull(verifyQ.get("id")))
+							{
+								verifyKeyOk = true;
+								if(activityKey != "")
+								{
+									verifyKeyOk = false;
+									verifyKeysRaw = ifnull(verifyQ.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+									for each vk in verifyKeysRaw.toList("\n")
+									{
+										if(vk.trim() == activityKey) { verifyKeyOk = true; }
+									}
+								}
+								verifyQp = verifyQ.get("Quote_Product");
+								if(!isNull(verifyQp) && !isNull(verifyQp.get("id")) && verifyQp.get("id").toString() == prodId) { verifyProductOk = true; }
+								verifyLines = verifyQ.get("Quoted_Items");
+								if(!isNull(verifyLines) && verifyLines.size() > 0)
+								{
+									verifyLineProductIds = List();
+									for each vl in verifyLines
+									{
+										vlProdId = "";
+										vlProd = vl.get("Product_Name");
+										if(!isNull(vlProd) && !isNull(vlProd.get("id"))) { vlProdId = vlProd.get("id").toString(); }
+										if(vlProdId != "" && !verifyLineProductIds.contains(vlProdId)) { verifyLineProductIds.add(vlProdId); }
+									}
+									if(verifyLineProductIds.size() == 1 && verifyLineProductIds.contains(prodId)) { verifyLineOk = true; }
+								}
+							}
+							if(verifyKeyOk != true || verifyProductOk != true || verifyLineOk != true)
+							{
+								anyBlocked = true;
+								result.put("reviewRequired", true);
+								if(!reviewReasons.contains("quote_post_write_verification_failed")) { reviewReasons.add("quote_post_write_verification_failed"); }
+								automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Quote " + upQid + " was updated for Product " + prodName + " but post-write verification failed. Check Quote_Applied_Activity_Keys, Quote_Product, and Quoted_Items.");
+								automation.logAutomationEvent("processDeal", "Deals", targetDealId, "quote_update_verify_failed", prodName, {"quote":upQid, "activityKey":activityKey, "resp":updateResp});
+							}
+							else
+							{
+								automation.logAutomationEvent("processDeal", "Deals", targetDealId, "quote_updated", prodName, {"quote":upQid, "activityKey":activityKey});
+							}
+						}
+					}
+					else
+					{
+						// 0 matches -> CREATE one Draft Quote via the REST API in ONE call. Native Deluge createRecord
+						// (Product_Details) drops custom subform fields; the REST API persists the Quoted_Items custom
+						// fields directly. trigger:[] suppresses WF020 -> handleQuoteStageChange -> processDeal recursion.
+						line = Map();
+						linePm = Map(); linePm.put("id", prodId); line.put("Product_Name", linePm);
+						line.put("Quantity", 1);
+						line.put("Quoted_Item_Pricing_Tier", "Base");
+						if(ctxBrands != "" && ctxBrands != "null") { line.put("Quoted_Item_Plan_Brands", ctxBrands.toLong()); }
+						if(ctxFreq != "") { line.put("Quoted_Item_Frequency", ctxFreq); }
+						if(ctxBrands != "" && ctxBrands != "null")
+						{
+							priceResp = automation.resolveQuoteLinePrice(prodId, prodPlanType, ctxBrands, "Base", ctxFreq).toMap();
+							if(ifnull(priceResp.get("valid"), "false").toString() == "true")
+							{
+								line.put("List_Price", ifnull(priceResp.get("line_acv"), 0));
+							}
+							else
+							{
+								result.put("reviewRequired", true);
+								if(!reviewReasons.contains("pricing_unavailable")) { reviewReasons.add("pricing_unavailable"); }
+								automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Quote line for Product " + prodName + " could not be auto-priced (" + ifnull(priceResp.get("reason"), "pricing_unavailable").toString() + "). Created unpriced; set the price manually.");
+							}
+						}
+						else
+						{
+							result.put("reviewRequired", true);
+							if(!reviewReasons.contains("pricing_unavailable")) { reviewReasons.add("pricing_unavailable"); }
+						}
+						lineList = List(); lineList.add(line);
+						qMap = Map();
+						qMap.put("Subject", automation.buildQuoteSubject(accountName, prodName, "", ifnull(targetDeal.get("Deal_Name"), "").toString()));
+						qMap.put("Quote_Stage", "Draft");
+						accMap = Map(); accMap.put("id", accountId); qMap.put("Account_Name", accMap);
+						dMap = Map(); dMap.put("id", targetDealId); qMap.put("Deal_Name", dMap);
+						qpMap = Map(); qpMap.put("id", prodId); qMap.put("Quote_Product", qpMap);
+						qMap.put("Opportunity_Type", quoteOppType);
+						qMap.put("Quote_Last_Deal_ID", targetDealId);
+						if(sourceContactId != "") { srcCMap = Map(); srcCMap.put("id", sourceContactId); qMap.put("Contact_Name", srcCMap); }
+						if(ctxDateStart != "") { qMap.put("Contract_Date_Start", ctxDateStart); }
+						if(ctxDateEnd != "") { qMap.put("Contract_Date_End", ctxDateEnd); }
+						qMap.put("Quoted_Items", lineList);
+						if(activityKey != "") { qMap.put("Quote_Applied_Activity_Keys", activityKey); }
+						crBody = Map();
+						crData = List(); crData.add(qMap);
+						crBody.put("data", crData);
+						crBody.put("trigger", List());
+						crHeaders = Map(); crHeaders.put("Content-Type", "application/json");
+						createResp = invokeurl
+						[
+							url: "https://www.zohoapis.eu/crm/v6/Quotes"
+							type: POST
+							parameters: crBody.toString()
+							connection: "zoho_crm"
+							headers: crHeaders
+						];
+						newQid = "";
+						crArr = null;
+						if(!isNull(createResp)) { crArr = createResp.get("data"); }
+						if(!isNull(crArr) && crArr.size() > 0)
+						{
+							cr0 = crArr.get(0);
+							if(ifnull(cr0.get("code"), "").toString() == "SUCCESS")
+							{
+								crDet = cr0.get("details");
+								if(!isNull(crDet) && !isNull(crDet.get("id"))) { newQid = crDet.get("id").toString(); }
+							}
+						}
+						if(newQid == "")
+						{
+							anyBlocked = true;
+							result.put("reviewRequired", true);
+							if(!reviewReasons.contains("quote_write_failed")) { reviewReasons.add("quote_write_failed"); }
+							automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Quote could not be created for Product " + prodName + ". CRM create response: " + ifnull(createResp, "").toString() + ". Check function failure logs and re-run the Activity after correction.");
+							automation.logAutomationEvent("processDeal", "Deals", targetDealId, "quote_create_failed", prodName, {"oppType":quoteOppType, "activityKey":activityKey, "resp":createResp});
+						}
+						else
+						{
+							// Strict readback via REST GET (read-after-write consistent): key + product + line + tier + brands.
+							vGetResp = invokeurl
+							[
+								url: "https://www.zohoapis.eu/crm/v6/Quotes/" + newQid
+								type: GET
+								connection: "zoho_crm"
+							];
+							vRec = Map();
+							if(!isNull(vGetResp) && !isNull(vGetResp.get("data")) && vGetResp.get("data").size() > 0) { vRec = vGetResp.get("data").get(0); }
+							vKeyOk = true;
+							if(activityKey != "")
+							{
+								vKeyOk = false;
+								vKeysRaw = ifnull(vRec.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+								for each vk in vKeysRaw.toList("\n") { if(vk.trim() == activityKey) { vKeyOk = true; } }
+							}
+							vProdOk = false;
+							vqp = vRec.get("Quote_Product");
+							if(!isNull(vqp) && !isNull(vqp.get("id")) && vqp.get("id").toString() == prodId) { vProdOk = true; }
+							vLineOk = false;
+							vTierOk = false;
+							vBrandsOk = true;
+							vLines = vRec.get("Quoted_Items");
+							if(!isNull(vLines) && vLines.size() > 0)
+							{
+								vL = vLines.get(0);
+								vlp = vL.get("Product_Name");
+								if(!isNull(vlp) && !isNull(vlp.get("id")) && vlp.get("id").toString() == prodId) { vLineOk = true; }
+								vTierOk = (ifnull(vL.get("Quoted_Item_Pricing_Tier"), "").toString() == "Base");
+								if(ctxBrands != "" && ctxBrands != "null") { vBrandsOk = (ifnull(vL.get("Quoted_Item_Plan_Brands"), "").toString() == ctxBrands); }
+							}
+							if(vKeyOk != true || vProdOk != true || vLineOk != true || vTierOk != true || vBrandsOk != true)
+							{
+								anyBlocked = true;
+								result.put("reviewRequired", true);
+								if(!reviewReasons.contains("quote_post_write_verification_failed")) { reviewReasons.add("quote_post_write_verification_failed"); }
+								automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "Quote " + newQid + " created for Product " + prodName + " but post-write verification failed (key/product/line/tier/brands).");
+								automation.logAutomationEvent("processDeal", "Deals", targetDealId, "quote_create_verify_failed", prodName, {"quote":newQid, "oppType":quoteOppType, "activityKey":activityKey});
+							}
+							else
+							{
+								automation.logAutomationEvent("processDeal", "Deals", targetDealId, "quote_created", prodName, {"quote":newQid, "oppType":quoteOppType, "activityKey":activityKey});
+							}
+						}
+					}
+				}
+			}
+		}
+		// Won with NO Product -> productNames empty: no Quote created, structural reconciliation continues.
+	}
+
+	// ===================================================================
+	// 5b. IMPORTED-CONTRACT bootstrap  (source=="import_bootstrap")  -- CANONICAL Quote engine
+	//     One idempotent Quote package per asserted contract term (A/E/R) from imported
+	//     Lead split-contract evidence, decoded from the 11-field TERM ENCODING CONTRACT:
+	//       0 quoteType  1 family  2 planType  3 brands  4 dateStart  5 dateEnd
+	//       6 acv        7 freq    8 tier      9 dateRenewal          10 stage
+	//     Product is resolved to the ONE CANONICAL name-only Product via
+	//     automation.resolveDealProduct(family) -> Quote_Product == Deal_Product (no variants,
+	//     no [quote_product_mismatch]). If the family cannot resolve -> [product_unresolved]
+	//     Manual Review and the term is skipped.
+	//     Plan attributes live on the Quote (Quote_Plan_Type/Brands/Frequency + Quote_Type).
+	//     Imported ACV wins over pricing where present (Contract_ACV = acv); when acv is blank
+	//     the central resolver prices the line, and an unpriceable line stays Draft + Manual
+	//     Review (List_Price 0 so Zoho does not fabricate a total from Product Unit_Price).
+	//     Quote_Stage = encoded stage (default Draft). Quote_Target_ACV derives from the Account
+	//     Company Tier (1->26000, 2->16500, 3->10500, else 0); Quote_ACV_Gap is a FORMULA field
+	//     (Target - Contract_ACV) and is NOT written here. Quote_Contract_Date_Renewal = encoded
+	//     renewal, else End-45d when End is present.
+	//     IMPORT IDEMPOTENCY (this chunk only; NOT lifecycle transitions): create/update ONLY the
+	//     supplied A/E/R Quotes. Dedup key (stored in Quote_Applied_Activity_Keys) =
+	//     ImportBootstrap:Lead:<leadId>:<quoteType>:<prodId>:<start>:<end>; key already applied
+	//     -> skip. Never create a duplicate OPEN Quote for the same Deal + Quote_Type + product +
+	//     term (existing Deal Quotes are searched by Quote_Type + Quote_Product + dates first).
+	//     Opportunity_Type (FTP/RTP) is still written so downstream §9/§6/§7 term ledger derive.
+	//     Downstream §9 (Confirmed stamp), §6 (Amount = sum of OPEN quotes), §7 (ledger) derive
+	//     Deal.Amount and the Contract_Initial_*/Current_* ledger from the resulting Quotes.
+	// ===================================================================
+	if(isImport)
+	{
+		impLeadId = ifnull(ctx.get("sourceRecordId"), "").toString();
+		termsEncoded = ifnull(ctx.get("termsEncoded"), "").toString();
+		if(termsEncoded != "")
+		{
+			// Company-Tier target ACV benchmark (Account is authoritative for tier).
+			impTierNum = ifnull(accRec.get("Company_Tier"), "").toString().trim();
+			impTargetAcv = 0;
+			if(impTierNum == "1") { impTargetAcv = 26000; }
+			else if(impTierNum == "2") { impTargetAcv = 16500; }
+			else if(impTierNum == "3") { impTargetAcv = 10500; }
+
+			for each termStr in termsEncoded.toList(";")
+			{
+				termParts = termStr.toList("~");
+				if(termParts.size() >= 11)
+				{
+					// decode: "_" sentinel -> empty string. 11-field canonical format.
+					impQuoteType = termParts.get(0).trim(); if(impQuoteType == "_") { impQuoteType = ""; }
+					impFam = termParts.get(1).trim(); if(impFam == "_") { impFam = ""; }
+					if(impFam == "Jurnii Cortext") { impFam = "Jurnii Cortex"; }
+					impType = termParts.get(2).trim(); if(impType == "_") { impType = ""; }
+					if(impType == "Flexible") { impType = "Flex"; }
+					impBrands = termParts.get(3).trim(); if(impBrands == "_" || impBrands == "null") { impBrands = ""; }
+					impStart = termParts.get(4).trim(); if(impStart == "_") { impStart = ""; }
+					impEnd = termParts.get(5).trim(); if(impEnd == "_") { impEnd = ""; }
+					impAcvStr = termParts.get(6).trim(); if(impAcvStr == "_") { impAcvStr = ""; }
+					impFreq = termParts.get(7).trim(); if(impFreq == "_" || impFreq == "-None-") { impFreq = ""; }
+					impTier = termParts.get(8).trim();
+					if(impTier == "" || impTier == "_") { impTier = "Base"; }
+					impRenewal = termParts.get(9).trim(); if(impRenewal == "_") { impRenewal = ""; }
+					impStageIn = termParts.get(10).trim(); if(impStageIn == "_") { impStageIn = ""; }
+
+					// impTerm is used only for human-readable Subject / task text / logs.
+					impTerm = impQuoteType; if(impTerm == "") { impTerm = "Imported"; }
+
+					// family is required to assert a contract
+					if(impFam != "")
+					{
+						termResolved = true;
+						impProd = null;
+
+						// CANONICAL product resolution (no variant catalogue lookup).
+						impRes = automation.resolveDealProduct(impFam).toMap();
+						impResValid = (ifnull(impRes.get("valid"), "false").toString() == "true");
+						if(impResValid && !isNull(impRes.get("product_id")) && impRes.get("product_id").toString() != "")
+						{
+							impProd = Map();
+							impProd.put("id", impRes.get("product_id").toString());
+							impProd.put("Product_Name", ifnull(impRes.get("product_name"), impFam).toString());
+						}
+						else
+						{
+							termResolved = false;
+							result.put("reviewRequired", true);
+							if(!reviewReasons.contains("product_unresolved")) { reviewReasons.add("product_unresolved"); }
+							automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "[product_unresolved] Imported " + impTerm + " contract family '" + impFam + "' did not resolve to a canonical Product (reason: " + ifnull(impRes.get("reason"), "") + "). Lead " + impLeadId + ".");
+							automation.logAutomationEvent("processDeal", "Deals", targetDealId, "import_product_unresolved", impFam, {"term":impTerm});
+						}
+
+						if(termResolved && !isNull(impProd) && !isNull(impProd.get("id")))
+						{
+							impProdId = impProd.get("id").toString();
+							impProdName = ifnull(impProd.get("Product_Name"), "").toString().trim();
+							// planType now comes from the encoded term (not the Product).
+							impProdPlanType = impType;
+
+							// (a) link Product -> source Contact junction (idempotent)
+							if(sourceContactId != "")
+							{
+								impConLinked = false;
+								impConLinks = zoho.crm.getRelatedRecords("Products12", "Contacts", sourceContactId.toLong());
+								if(!isNull(impConLinks) && impConLinks.size() > 0 && !impConLinks.toString().startsWith("{\"code\""))
+								{
+									for each scl in impConLinks
+									{
+										sclProdId = "";
+										if(!isNull(scl.get("id"))) { sclProdId = scl.get("id").toString(); }
+										sclProd = scl.get("Product_Details");
+										if(!isNull(sclProd) && !isNull(sclProd.get("id"))) { sclProdId = sclProd.get("id").toString(); }
+										sclPI = scl.get("Product_Interest");
+										if(!isNull(sclPI) && !isNull(sclPI.get("id"))) { sclProdId = sclPI.get("id").toString(); }
+										if(sclProdId == impProdId) { impConLinked = true; }
+									}
+								}
+								if(!impConLinked)
+								{
+									impJunc = zoho.crm.searchRecords("Contacts_X_Products", "(Contacts:equals:" + sourceContactId + ")");
+									if(!isNull(impJunc) && impJunc.size() > 0 && !impJunc.toString().startsWith("{\"code\""))
+									{
+										for each sjl in impJunc
+										{
+											sjlProdId = "";
+											sjlPI = sjl.get("Product_Interest");
+											if(!isNull(sjlPI) && !isNull(sjlPI.get("id"))) { sjlProdId = sjlPI.get("id").toString(); }
+											if(sjlProdId == impProdId) { impConLinked = true; }
+										}
+									}
+								}
+								if(!impConLinked)
+								{
+									linkIMap = Map();
+									linkIMap.put("Contacts", sourceContactId);
+									linkIMap.put("Product_Interest", impProdId);
+									linkIResp = zoho.crm.createRecord("Contacts_X_Products", linkIMap);
+									info "5b: linked Product to Contact junction prod=" + impProdId + " contact=" + sourceContactId + " resp=" + linkIResp;
+								}
+							}
+							// (b) link Product -> Deal Products (idempotent)
+							if(!existingProdIds.contains(impProdId))
+							{
+								linkIDResp = zoho.crm.updateRelatedRecord("Products", impProdId.toLong(), "Deals", targetDealId.toLong(), Map());
+								existingProdIds.add(impProdId);
+								info "5b: linked Product to Deal prod=" + impProdId + " deal=" + targetDealId + " resp=" + linkIDResp;
+							}
+							// (c) interest aggregation (canonical SKU name)
+							if(impProdName != "" && !lowercasePIList.contains(impProdName.toLowerCase()))
+							{
+								aggregatedPIList.add(impProdName);
+								lowercasePIList.add(impProdName.toLowerCase());
+							}
+
+							// ---- contract value: IMPORTED ACV WINS where present (the real negotiated money);
+							//      otherwise the central resolver prices the canonical line. Unpriced only
+							//      when neither an imported ACV nor a resolvable price exists.
+							//      (Import docs carry the actual negotiated ACV but not always the pricing
+							//      inputs — e.g. Jurnii 360 has no frequency — so imported ACV is authoritative.) ----
+							calcAcv = "";
+							calcValid = false;
+							calcReason = "";
+							if(impBrands != "")
+							{
+								impPR = automation.resolveQuoteLinePrice(impProdId, impProdPlanType, impBrands, "Base", impFreq).toMap();
+								if(ifnull(impPR.get("valid"), "false").toString() == "true")
+								{
+									calcAcv = ifnull(impPR.get("line_acv"), 0).toString();
+									calcValid = true;
+								}
+								else { calcReason = ifnull(impPR.get("reason"), "pricing_unavailable").toString(); }
+							}
+							else { calcReason = "missing_brand_count"; }
+
+							importedAcvOk = (impAcvStr != "" && impAcvStr != "0" && impAcvStr.toDecimal() > 0);
+							importedAcvVal = "";
+							if(importedAcvOk) { importedAcvVal = impAcvStr.toDecimal().round(2).toString(); }
+
+							impLineAcv = "";
+							impPriced = false;
+							impValueSource = "none";
+							if(importedAcvOk) { impLineAcv = importedAcvVal; impPriced = true; impValueSource = "imported_acv"; }
+							else if(calcValid) { impLineAcv = calcAcv; impPriced = true; impValueSource = "calculated"; }
+
+							// reviews around the chosen value (exact 2dp comparison; no invented tolerance)
+							if(impValueSource == "imported_acv" && calcValid)
+							{
+								if(importedAcvVal.toDecimal() != calcAcv.toDecimal())
+								{
+									result.put("reviewRequired", true);
+									if(!reviewReasons.contains("imported_acv_variance")) { reviewReasons.add("imported_acv_variance"); }
+									automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "[imported_acv_variance] Imported " + impTerm + " ACV " + importedAcvVal + " used as the contract value for " + impProdName + " but differs from the catalogue calculation " + calcAcv + " (" + impBrands + " brands). Confirm the contract figure. Lead " + impLeadId + ".");
+									automation.logAutomationEvent("processDeal", "Deals", targetDealId, "import_acv_variance", impProdName, {"imported":importedAcvVal,"calculated":calcAcv,"term":impTerm});
+								}
+							}
+							else if(impValueSource == "imported_acv" && !calcValid)
+							{
+								result.put("reviewRequired", true);
+								if(!reviewReasons.contains("pricing_from_imported_acv")) { reviewReasons.add("pricing_from_imported_acv"); }
+								automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "[pricing_from_imported_acv] Imported " + impTerm + " ACV " + importedAcvVal + " used as the contract value for " + impProdName + "; the catalogue could not auto-price it (reason: " + calcReason + "). Confirm cadence/brands. Lead " + impLeadId + ".");
+								automation.logAutomationEvent("processDeal", "Deals", targetDealId, "import_priced_from_acv", impProdName, {"imported":importedAcvVal,"reason":calcReason,"term":impTerm});
+							}
+
+							// Contract ACV (imported wins) + Company-Tier Target ACV benchmark.
+							// Quote_ACV_Gap is a FORMULA field (Target - Contract_ACV) -> NOT written.
+							impContractAcv = 0;
+							if(impPriced) { impContractAcv = impLineAcv.toDecimal(); }
+
+							// ---- renewal date: encoded value wins; else derive End - 45 days when End present ----
+							impRenewalOut = impRenewal;
+							if(impRenewalOut == "" && impEnd != "")
+							{
+								impRenewalOut = impEnd.toDate().addDay(-45).toString("yyyy-MM-dd");
+							}
+
+							// ---- stage: encoded stage wins (default Draft). A blank/unpriceable line
+							//      stays Draft + Manual Review (existing pricing review pattern). ----
+							impStage = impStageIn;
+							if(impStage == "") { impStage = "Draft"; }
+							if(!impPriced)
+							{
+								result.put("reviewRequired", true);
+								// unpriceable -> keep Draft regardless of the encoded stage
+								if(impStage != "Closed Lost" && impStage != "Closed Won") { impStage = "Draft"; }
+								if(calcReason == "360_missing_frequency") { if(!reviewReasons.contains("pricing_frequency_missing")) { reviewReasons.add("pricing_frequency_missing"); } }
+								else if(impBrands == "") { if(!reviewReasons.contains("contract_tuple_incomplete")) { reviewReasons.add("contract_tuple_incomplete"); } }
+								else { if(!reviewReasons.contains("pricing_unavailable")) { reviewReasons.add("pricing_unavailable"); } }
+								automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "[import_contract_draft] Imported " + impTerm + " contract for " + impProdName + " left as Draft (unpriceable: source=" + impValueSource + " reason=" + ifnull(calcReason, "") + "; brands=" + impBrands + " start=" + impStart + " end=" + impEnd + "). Complete the evidence then Confirm. Lead " + impLeadId + ".");
+							}
+
+							// ---- deterministic idempotency key (quoteType + canonical prod + term dates) ----
+							impKey = "ImportBootstrap:Lead:" + impLeadId + ":" + impQuoteType + ":" + impProdId + ":" + impStart + ":" + impEnd;
+
+							// ---- locate existing Quote: key already applied -> skip; else dedup by
+							//      Quote_Type + Quote_Product + term dates (open Quote) -> update in place. ----
+							impKeyApplied = false;
+							impUpdId = "";
+							impDQ = zoho.crm.getRelatedRecords("Quotes", "Deals", targetDealId.toLong());
+							if(impDQ != null && impDQ.size() > 0 && !impDQ.toString().startsWith("{\"code\""))
+							{
+								for each dqp in impDQ
+								{
+									dqpId = "";
+									if(!isNull(dqp.get("id"))) { dqpId = dqp.get("id").toString(); }
+									if(dqpId == "" || !dqpId.matches("[0-9]+")) { continue; }
+									// Idempotency depends on custom fields (Quote_Type, Contract_Date_*,
+									// Quote_Applied_Activity_Keys) that the related-list projection can omit;
+									// read the full Quote so the ledger/dedup check is reliable (mirrors section 9).
+									dqFull = zoho.crm.getRecordById("Quotes", dqpId.toLong());
+									if(isNull(dqFull) || isNull(dqFull.get("id"))) { continue; }
+									rawKeysI = ifnull(dqFull.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+									for each kLine in rawKeysI.toList("\n") { if(kLine.trim() == impKey) { impKeyApplied = true; } }
+									qProdIdI = "";
+									qpLookupI = dqFull.get("Quote_Product");
+									if(!isNull(qpLookupI) && !isNull(qpLookupI.get("id"))) { qProdIdI = qpLookupI.get("id").toString(); }
+									qTypeI = ifnull(dqFull.get("Quote_Type"), "").toString();
+									qSI = ifnull(dqFull.get("Contract_Date_Start"), "").toString();
+									qEI = ifnull(dqFull.get("Contract_Date_End"), "").toString();
+									qStgI = ifnull(dqFull.get("Quote_Stage"), "").toString();
+									if(impUpdId == "" && qProdIdI == impProdId && qTypeI == impQuoteType && qSI == impStart && qEI == impEnd && qStgI != "Closed Lost" && qStgI != "Closed Won")
+									{
+										impUpdId = dqpId;
+									}
+								}
+							}
+
+							if(impKeyApplied)
+							{
+								automation.logAutomationEvent("processDeal", "Deals", targetDealId, "import_quote_already_applied", impProdName, {"key":impKey, "term":impTerm});
+							}
+							else
+							{
+								// single Quoted_Items line
+								impLine = Map();
+								impLinePm = Map(); impLinePm.put("id", impProdId); impLine.put("Product_Name", impLinePm);
+								impLine.put("Quantity", 1);
+								impLine.put("Quoted_Item_Pricing_Tier", impTier);
+								if(impBrands != "" && impBrands.matches("[0-9]+")) { impLine.put("Quoted_Item_Plan_Brands", impBrands.toLong()); }
+								if(impFreq != "") { impLine.put("Quoted_Item_Frequency", impFreq); }
+								// Set List_Price explicitly. For an UNPRICED line set 0 — otherwise Zoho
+								// auto-inherits the Product Unit_Price onto the line, fabricating a Quote total
+								// (and Deal Amount) from Unit_Price, which the pricing invariant forbids.
+								if(impPriced) { impLine.put("List_Price", impLineAcv.toDecimal()); }
+								else { impLine.put("List_Price", 0); }
+								impLinesList = List(); impLinesList.add(impLine);
+
+								impWroteId = "";
+								if(impUpdId != "")
+								{
+									existingQI = zoho.crm.getRecordById("Quotes", impUpdId.toLong());
+									// IDEMPOTENCY: reuse the existing Quoted_Items line id so the REST PUT
+									// UPDATES the line in place. Without the id, Zoho APPENDS a second subform
+									// row on every replay, doubling the Quote total (Amount inflation). The line
+									// id must come from a REST GET — Deluge getRecordById does NOT return subform
+									// line ids reliably (same limitation that hides the custom subform fields).
+									exLineIdI = "";
+									exGetI = invokeurl
+									[
+										url: "https://www.zohoapis.eu/crm/v6/Quotes/" + impUpdId
+										type: GET
+										connection: "zoho_crm"
+									];
+									if(!isNull(exGetI) && !isNull(exGetI.get("data")) && exGetI.get("data").size() > 0)
+									{
+										exLinesI = exGetI.get("data").get(0).get("Quoted_Items");
+										if(!isNull(exLinesI) && exLinesI.size() > 0 && !isNull(exLinesI.get(0)) && !isNull(exLinesI.get(0).get("id")))
+										{
+											exLineIdI = exLinesI.get(0).get("id").toString();
+										}
+									}
+									if(exLineIdI != "") { impLine.put("id", exLineIdI); }
+									qUpdI = Map();
+									// Re-assert the canonical Subject on update so a Quote written by an
+									// earlier (product-duplicating) build self-repairs. Recomputed from
+									// parts, so this is a no-op once the Subject is already canonical.
+									qUpdI.put("Subject", automation.buildQuoteSubject(accountName, impProdName, impTerm, ifnull(targetDeal.get("Deal_Name"), "").toString()));
+									qpHI = Map(); qpHI.put("id", impProdId); qUpdI.put("Quote_Product", qpHI);
+									qUpdI.put("Opportunity_Type", quoteOppType);
+									if(impQuoteType != "") { qUpdI.put("Quote_Type", impQuoteType); }
+									if(impType != "") { qUpdI.put("Quote_Plan_Type", impType); }
+									if(impBrands != "" && impBrands.matches("[0-9]+")) { qUpdI.put("Quote_Plan_Brands", impBrands.toLong()); }
+									if(impFreq != "") { qUpdI.put("Quote_Plan_Frequency", impFreq); }
+									qUpdI.put("Quote_Target_ACV", impTargetAcv);
+									if(impRenewalOut != "") { qUpdI.put("Quote_Contract_Date_Renewal", impRenewalOut); }
+									qUpdI.put("Quote_Last_Deal_ID", targetDealId);
+									qUpdI.put("Quote_Stage", impStage);
+									if(impStart != "") { qUpdI.put("Contract_Date_Start", impStart); }
+									if(impEnd != "") { qUpdI.put("Contract_Date_End", impEnd); }
+									if(impPriced) { qUpdI.put("Contract_ACV", impContractAcv); }
+									qUpdI.put("Quoted_Items", impLinesList);
+									priorKI = ifnull(existingQI.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+									newKI = priorKI;
+									if(newKI.trim() != "") { newKI = newKI + "\n" + impKey; } else { newKI = impKey; }
+									qUpdI.put("Quote_Applied_Activity_Keys", newKI);
+									upBodyI = Map(); upDataI = List(); upDataI.add(qUpdI); upBodyI.put("data", upDataI); upBodyI.put("trigger", List());
+									upHdrI = Map(); upHdrI.put("Content-Type", "application/json");
+									updRespI = invokeurl
+									[
+										url: "https://www.zohoapis.eu/crm/v6/Quotes/" + impUpdId
+										type: PUT
+										parameters: upBodyI.toString()
+										connection: "zoho_crm"
+										headers: upHdrI
+									];
+									impWroteId = impUpdId;
+									automation.logAutomationEvent("processDeal", "Deals", targetDealId, "import_quote_updated", impProdName, {"quote":impUpdId, "term":impTerm, "stage":impStage});
+								}
+								else
+								{
+									qMapI = Map();
+									qMapI.put("Subject", automation.buildQuoteSubject(accountName, impProdName, impTerm, ifnull(targetDeal.get("Deal_Name"), "").toString()));
+									qMapI.put("Quote_Stage", impStage);
+									accMapI = Map(); accMapI.put("id", accountId); qMapI.put("Account_Name", accMapI);
+									dMapI = Map(); dMapI.put("id", targetDealId); qMapI.put("Deal_Name", dMapI);
+									qpMapI = Map(); qpMapI.put("id", impProdId); qMapI.put("Quote_Product", qpMapI);
+									qMapI.put("Opportunity_Type", quoteOppType);
+									if(impQuoteType != "") { qMapI.put("Quote_Type", impQuoteType); }
+									if(impType != "") { qMapI.put("Quote_Plan_Type", impType); }
+									if(impBrands != "" && impBrands.matches("[0-9]+")) { qMapI.put("Quote_Plan_Brands", impBrands.toLong()); }
+									if(impFreq != "") { qMapI.put("Quote_Plan_Frequency", impFreq); }
+									qMapI.put("Quote_Target_ACV", impTargetAcv);
+									if(impRenewalOut != "") { qMapI.put("Quote_Contract_Date_Renewal", impRenewalOut); }
+									qMapI.put("Quote_Last_Deal_ID", targetDealId);
+									if(sourceContactId != "") { scMapI = Map(); scMapI.put("id", sourceContactId); qMapI.put("Contact_Name", scMapI); }
+									if(impStart != "") { qMapI.put("Contract_Date_Start", impStart); }
+									if(impEnd != "") { qMapI.put("Contract_Date_End", impEnd); }
+									if(impPriced) { qMapI.put("Contract_ACV", impContractAcv); }
+									qMapI.put("Quoted_Items", impLinesList);
+									qMapI.put("Quote_Applied_Activity_Keys", impKey);
+									crBodyI = Map(); crDataI = List(); crDataI.add(qMapI); crBodyI.put("data", crDataI); crBodyI.put("trigger", List());
+									crHdrI = Map(); crHdrI.put("Content-Type", "application/json");
+									crRespI = invokeurl
+									[
+										url: "https://www.zohoapis.eu/crm/v6/Quotes"
+										type: POST
+										parameters: crBodyI.toString()
+										connection: "zoho_crm"
+										headers: crHdrI
+									];
+									crArrI = null;
+									if(!isNull(crRespI)) { crArrI = crRespI.get("data"); }
+									if(!isNull(crArrI) && crArrI.size() > 0)
+									{
+										cr0I = crArrI.get(0);
+										if(ifnull(cr0I.get("code"), "").toString() == "SUCCESS")
+										{
+											crDetI = cr0I.get("details");
+											if(!isNull(crDetI) && !isNull(crDetI.get("id"))) { impWroteId = crDetI.get("id").toString(); }
+										}
+									}
+									if(impWroteId == "")
+									{
+										anyBlocked = true;
+										result.put("reviewRequired", true);
+										if(!reviewReasons.contains("quote_write_failed")) { reviewReasons.add("quote_write_failed"); }
+										automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "[quote_write_failed] Import Quote could not be created for " + impProdName + " (" + impTerm + "). CRM response: " + ifnull(crRespI, "").toString() + ". Lead " + impLeadId + ".");
+										automation.logAutomationEvent("processDeal", "Deals", targetDealId, "import_quote_create_failed", impProdName, {"term":impTerm, "resp":crRespI});
+									}
+									else
+									{
+										automation.logAutomationEvent("processDeal", "Deals", targetDealId, "import_quote_created", impProdName, {"quote":impWroteId, "term":impTerm, "stage":impStage});
+									}
+								}
+
+								// ---- strict post-write verification (readback) ----
+								if(impWroteId != "")
+								{
+									vGetI = invokeurl
+									[
+										url: "https://www.zohoapis.eu/crm/v6/Quotes/" + impWroteId
+										type: GET
+										connection: "zoho_crm"
+									];
+									vRecI = Map();
+									if(!isNull(vGetI) && !isNull(vGetI.get("data")) && vGetI.get("data").size() > 0) { vRecI = vGetI.get("data").get(0); }
+									vKeyI = false;
+									vKeysRawI = ifnull(vRecI.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+									for each vk in vKeysRawI.toList("\n") { if(vk.trim() == impKey) { vKeyI = true; } }
+									vProdI = false;
+									vqpI = vRecI.get("Quote_Product");
+									if(!isNull(vqpI) && !isNull(vqpI.get("id")) && vqpI.get("id").toString() == impProdId) { vProdI = true; }
+									vLineI = false;
+									vBrandsI = true;
+									vLinesI = vRecI.get("Quoted_Items");
+									if(!isNull(vLinesI) && vLinesI.size() > 0)
+									{
+										vL0 = vLinesI.get(0);
+										vlpI = vL0.get("Product_Name");
+										if(!isNull(vlpI) && !isNull(vlpI.get("id")) && vlpI.get("id").toString() == impProdId) { vLineI = true; }
+										if(impBrands != "") { vBrandsI = (ifnull(vL0.get("Quoted_Item_Plan_Brands"), "").toString() == impBrands); }
+									}
+									if(vKeyI != true || vProdI != true || vLineI != true || vBrandsI != true)
+									{
+										anyBlocked = true;
+										result.put("reviewRequired", true);
+										if(!reviewReasons.contains("quote_post_write_verification_failed")) { reviewReasons.add("quote_post_write_verification_failed"); }
+										automation.createAuxTask(sourceContactId, targetDealId, "Manual Review", "[quote_post_write_verification_failed] Import Quote " + impWroteId + " for " + impProdName + " (" + impTerm + ") failed readback (key/product/line/brands). Lead " + impLeadId + ".");
+										automation.logAutomationEvent("processDeal", "Deals", targetDealId, "import_quote_verify_failed", impProdName, {"quote":impWroteId, "term":impTerm});
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// If any Product/Quote write BLOCKED -> stop before downstream writes; success=false, no dispatch.
+	if(anyBlocked)
+	{
+		result.put("success", false);
+		result.put("outcome", "blocked_activity_product_or_quote");
+		return result.toString();
+	}
+
+	// ===================================================================
+	// 8z. SCAFFOLD QUOTE -- invariant: no (Open) Product Deal without at least one Quote.
+	//     A Product Deal created from product evidence alone (Product_Interest, no A/E/R contract
+	//     term) has no Quote after 5b. Preserve the invariant by creating ONE Draft Acquisition
+	//     scaffold Quote for it. NON-IMPORT calls only (an isImport run owns Quote creation via 5b);
+	//     the async WF001d plain run that fires on the un-suppressed Deal create still covers an
+	//     import Deal whose terms produced no Quote. Idempotent + concurrency-safe self-guard: fires
+	//     only when the Deal is Open, has a resolved Deal_Product, and -- per a FULL-record read of
+	//     each existing Deal Quote (getRelatedRecords omits Quote_Stage / Quote_Applied_Activity_Keys)
+	//     -- the Deal has NO non-Closed-Lost Quote AND no Quote already carrying this scaffold key
+	//     (mirrors 5b's impKey check). Unpriced (Contract_ACV 0, List_Price 0) so it never fabricates
+	//     an Amount; the Deal.Amount hierarchy (8b) still derives the pipeline value from the Account
+	//     Company Tier. Quote_Product = the canonical Deal_Product (no [quote_product_mismatch]).
+	// ===================================================================
+	scafDealState = ifnull(targetDeal.get("Opportunity_State"), "Open").toString().trim();
+	scafProdId = "";
+	scafProdName = "";
+	dpScaf = targetDeal.get("Deal_Product");
+	if(!isNull(dpScaf) && !isNull(dpScaf.get("id")))
+	{
+		scafProdId = dpScaf.get("id").toString();
+		scafProdName = ifnull(dpScaf.get("name"), "").toString();
+	}
+	if(!isImport && scafDealState == "Open" && scafProdId != "" && accountId != "")
+	{
+		// Idempotency key for THIS Deal+product scaffold (searched below, stamped on create).
+		scafKey = "Scaffold:Deal:" + targetDealId + ":Acquisition:" + scafProdId;
+		scafSkip = false;
+		scafQuotes = zoho.crm.getRelatedRecords("Quotes", "Deals", targetDealId.toLong());
+		if(!isNull(scafQuotes) && scafQuotes.size() > 0 && !scafQuotes.toString().startsWith("{\"code\""))
+		{
+			for each sq in scafQuotes
+			{
+				sqId = "";
+				if(!isNull(sq.get("id"))) { sqId = sq.get("id").toString(); }
+				if(sqId == "" || !sqId.matches("[0-9]+")) { continue; }
+				// getRelatedRecords omits custom fields (Quote_Stage, Quote_Applied_Activity_Keys) ->
+				// fetch the full Quote. Skip the scaffold if the Deal already has ANY non-Closed-Lost
+				// Quote (invariant already satisfied -- an import Quote just written by 5b, or a prior
+				// scaffold) OR any Quote already carrying this exact scaffold key (idempotent re-run /
+				// concurrent-fire guard, mirroring 5b's impKey check).
+				sqFull = zoho.crm.getRecordById("Quotes", sqId.toLong());
+				if(isNull(sqFull)) { continue; }
+				sqStg = ifnull(sqFull.get("Quote_Stage"), "").toString().trim();
+				if(sqStg != "Closed Lost") { scafSkip = true; }
+				sqKeys = ifnull(sqFull.get("Quote_Applied_Activity_Keys"), "").toString().replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+				for each sk in sqKeys.toList("\n") { if(sk.trim() == scafKey) { scafSkip = true; } }
+			}
+		}
+		if(!scafSkip)
+		{
+			// Company-Tier Target-ACV benchmark (Account is authoritative for tier).
+			scafTierNum = ifnull(accRec.get("Company_Tier"), "").toString().trim();
+			scafTarget = 0;
+			if(scafTierNum == "1") { scafTarget = 26000; }
+			else if(scafTierNum == "2") { scafTarget = 16500; }
+			else if(scafTierNum == "3") { scafTarget = 10500; }
+
+			scafLine = Map();
+			scafLinePm = Map(); scafLinePm.put("id", scafProdId); scafLine.put("Product_Name", scafLinePm);
+			scafLine.put("Quantity", 1);
+			scafLine.put("Quoted_Item_Pricing_Tier", "Base");
+			// List_Price 0 so Zoho does not inherit the Product Unit_Price and fabricate a total.
+			scafLine.put("List_Price", 0);
+			scafLines = List(); scafLines.add(scafLine);
+
+			scafMap = Map();
+			scafMap.put("Subject", automation.buildQuoteSubject(accountName, scafProdName, "Acquisition scaffold", ifnull(targetDeal.get("Deal_Name"), "").toString()));
+			scafMap.put("Quote_Stage", "Draft");
+			scafMap.put("Quote_Type", "Acquisition");
+			scafAccM = Map(); scafAccM.put("id", accountId); scafMap.put("Account_Name", scafAccM);
+			scafDealM = Map(); scafDealM.put("id", targetDealId); scafMap.put("Deal_Name", scafDealM);
+			scafQpM = Map(); scafQpM.put("id", scafProdId); scafMap.put("Quote_Product", scafQpM);
+			scafMap.put("Opportunity_Type", quoteOppType);
+			scafMap.put("Quote_Target_ACV", scafTarget);
+			scafMap.put("Quote_Last_Deal_ID", targetDealId);
+			scafCid = "";
+			if(sourceContactId != "") { scafCid = sourceContactId; }
+			else if(primaryContactId != "") { scafCid = primaryContactId; }
+			if(scafCid != "") { scafScM = Map(); scafScM.put("id", scafCid); scafMap.put("Contact_Name", scafScM); }
+			scafMap.put("Contract_ACV", 0);
+			scafMap.put("Quoted_Items", scafLines);
+			scafMap.put("Quote_Applied_Activity_Keys", scafKey);
+			scafBody = Map(); scafDataL = List(); scafDataL.add(scafMap); scafBody.put("data", scafDataL); scafBody.put("trigger", List());
+			scafHdrM = Map(); scafHdrM.put("Content-Type", "application/json");
+			scafResp = invokeurl
+			[
+				url: "https://www.zohoapis.eu/crm/v6/Quotes"
+				type: POST
+				parameters: scafBody.toString()
+				connection: "zoho_crm"
+				headers: scafHdrM
+			];
+			automation.logAutomationEvent("processDeal", "Deals", targetDealId, "scaffold_quote_created", scafProdName, {"target_acv":scafTarget.toString(), "resp":ifnull(scafResp, "").toString()});
+		}
+	}
+
+	// ===================================================================
+	// 9. Confirmed prerequisites + Contract_ACV / Contract_Signed_Date establishment
+	//    For each Confirmed Quote: require BOTH dates; else demote to On Hold + Manual Review.
+	//    On first valid Confirmed: stamp Contract_ACV (pre-existing positive preserved) + Contract_Signed_Date.
+	//    MUST run BEFORE the Amount recompute (§6) and the term ledger (§7): an undated-Confirmed
+	//    Quote is demoted to On Hold here, so the DB re-reads in §6/§7 exclude it from the
+	//    Confirmed-term ledger and count it at its On-Hold total in Amount.
+	// ===================================================================
+	confirmedQuotes = zoho.crm.getRelatedRecords("Quotes", "Deals", targetDealId.toLong());
+	if(confirmedQuotes != null && confirmedQuotes.size() > 0 && !confirmedQuotes.toString().startsWith("{\"code\""))
+	{
+		for each dq in confirmedQuotes
+		{
+			dqId = "";
+			if(!isNull(dq.get("id"))) { dqId = dq.get("id").toString(); }
+			if(dqId == "") { continue; }
+			fullQ = zoho.crm.getRecordById("Quotes", dqId.toLong());
+			if(isNull(fullQ) || isNull(fullQ.get("id"))) { continue; }
+			// D1: Confirmed = terms agreed (NOT signed); Closed Won = SIGNED. Both may establish
+			// Contract_ACV; ONLY Closed Won stamps Contract_Signed_Date. Confirmed still requires
+			// both dates (else On Hold); a Closed Won with missing dates is still signed here and its
+			// successor-date gap is surfaced by the 10 lifecycle review, not demoted.
+			qStageEstab = ifnull(fullQ.get("Quote_Stage"), "").toString();
+			if(qStageEstab != "Confirmed" && qStageEstab != "Closed Won") { continue; }
+
+			cStart = ifnull(fullQ.get("Contract_Date_Start"), "").toString();
+			cEnd = ifnull(fullQ.get("Contract_Date_End"), "").toString();
+			if(qStageEstab == "Confirmed" && (cStart == "" || cEnd == ""))
+			{
+				// Confirmed requires BOTH dates -> move to On Hold + Manual Review; no ACV/ledger.
+				zoho.crm.updateRecord("Quotes", dqId.toLong(), {"Quote_Stage":"On Hold"}, noTrigger);
+				result.put("reviewRequired", true);
+				if(!reviewReasons.contains("confirmed_missing_dates")) { reviewReasons.add("confirmed_missing_dates"); }
+				automation.createAuxTask(primaryContactId, targetDealId, "Manual Review", "Quote " + dqId + " confirmed without both contract dates; moved to On Hold. Add Contract Date Start + End to confirm.");
+				automation.logAutomationEvent("processDeal", "Deals", targetDealId, "confirmed_missing_dates", dqId, null);
+			}
+			else
+			{
+				qUpd2 = Map();
+				existingAcv = ifnull(fullQ.get("Contract_ACV"), "").toString();
+				if(existingAcv == "" || ifnull(fullQ.get("Contract_ACV"), "0").toDecimal() <= 0)
+				{
+					g = ifnull(fullQ.get("Grand_Total"), "0").toDecimal();
+					s = ifnull(fullQ.get("Sub_Total"), "0").toDecimal();
+					stampAcv = 0.0;
+					if(g > 0) { stampAcv = g; } else { stampAcv = s; }
+					if(stampAcv > 0) { qUpd2.put("Contract_ACV", stampAcv); }
+				}
+				// D1: Contract_Signed_Date is the SIGNED event -> ONLY on Closed Won, NEVER on Confirmed.
+				if(qStageEstab == "Closed Won" && ifnull(fullQ.get("Contract_Signed_Date"), "").toString() == "")
+				{
+					qUpd2.put("Contract_Signed_Date", zoho.currentdate.toString("yyyy-MM-dd"));
+				}
+				if(qUpd2.size() > 0)
+				{
+					zoho.crm.updateRecord("Quotes", dqId.toLong(), qUpd2, noTrigger);
+					automation.logAutomationEvent("processDeal", "Deals", targetDealId, "signed_or_confirmed_stamped", dqId, qUpd2);
+				}
+			}
+		}
+	}
+
+	// ===================================================================
+	// 10. A/E/R TRANSITION LIFECYCLE (Phase 3) -- Closed Won is the SIGNED trigger.
+	//     Acq CW -> ensure the single open Renewal; Exp CW -> update it (no new slot);
+	//     Ren CW -> next open Renewal; Ren CL -> churn (Deal Lost iff no other open Quote).
+	//     Idempotent via Quote_Applied_Lifecycle_Keys. Runs AFTER 9 (signed establishment)
+	//     and BEFORE 6 (Amount) so a newly-created successor Renewal is counted. Self-guards
+	//     (Deal/Quote existence + per-transition idempotency keys), so it is safe on the import
+	//     call and the async WF001d re-fire alike.
+	// ===================================================================
+	automation.applyQuoteLifecycle(targetDealId);
+	// applyQuoteLifecycle may have CHURNED the Deal (Renewal Closed Lost -> Lost + Lost_Reasons) or
+	// added a successor Renewal Quote. Re-read targetDeal so the Amount recompute (6), viability (8),
+	// and valuation hierarchy (8b) all see the LIVE post-lifecycle state -- otherwise a churn leaves a
+	// Lost Deal valued at the pre-contract tier pipeline (stale Open state) instead of 0.
+	targetDeal = zoho.crm.getRecordById("Deals", targetDealId.toLong());
+	if(isNull(targetDeal) || isNull(targetDeal.get("id")))
+	{
+		result.put("outcome", "deal_vanished_post_lifecycle");
+		return result.toString();
+	}
+
+	// ===================================================================
+	// 6. Recalculate Deal.Amount = SUM of OPEN quote totals (non-Closed-Lost AND non-Closed-Won)
+	//    Re-read Quotes (after Quoted_Items writes) so calculated totals are current.
+	// ===================================================================
+	totalAmount = 0.0;
+	quoteCount = 0;
+	// Phase 1: product identity + controlling-Contact gathered INSIDE the Amount loop (no extra reads).
+	nonLostProdKeys = List();          // distinct normalised Quote_Product keys across non-lost Quotes
+	nonLostProdIdByKey = Map();        // productKey -> Products record id (for stamping Deal_Product)
+	ctrlContactId = "";                // controlling Quote's Contact (most-advanced non-lost Quote)
+	ctrlContactRank = -1;
+	ctrlContactQuoteId = 0;
+	qStageRankMap = {"Draft":1, "Negotiation":2, "On Hold":2, "Delivered":3, "Confirmed":4, "Closed Won":5};
+	dealQuotesAmt = zoho.crm.getRelatedRecords("Quotes", "Deals", targetDealId.toLong());
+	if(dealQuotesAmt != null && dealQuotesAmt.size() > 0 && !dealQuotesAmt.toString().startsWith("{\"code\""))
+	{
+		for each dq in dealQuotesAmt
+		{
+			dqId = "";
+			if(!isNull(dq.get("id"))) { dqId = dq.get("id").toString(); }
+			if(dqId == "") { continue; }
+			// re-read for current calculated totals
+			fullQ = zoho.crm.getRecordById("Quotes", dqId.toLong());
+			if(isNull(fullQ) || isNull(fullQ.get("id"))) { continue; }
+			qStg = ifnull(fullQ.get("Quote_Stage"), "").toString();
+			// OPEN pipeline only (user decision): exclude Closed Lost AND Closed Won. A signed
+			// (Closed Won) Quote is contract history -> reported from Quote/contract reporting, not
+			// carried in the active Deal.Amount; its value lives on via the successor Renewal (10).
+			if(qStg == "Closed Lost" || qStg == "Closed Won") { continue; }
+			quoteCount = quoteCount + 1;
+
+			grand = ifnull(fullQ.get("Grand_Total"), "0").toDecimal();
+			sub = ifnull(fullQ.get("Sub_Total"), "0").toDecimal();
+			contractAcv = ifnull(fullQ.get("Contract_ACV"), "0").toDecimal();
+
+			// Contract_ACV-first for ALL non-lost stages (Quote ACV is authoritative; a scaffold Draft
+			// may carry Contract_ACV with no Quoted_Items lines and must not be undercounted). Target
+			// ACV is NEVER used here — it is only the §8b pre-contract fallback.
+			qTotal = 0.0;
+			if(contractAcv > 0) { qTotal = contractAcv; }
+			else if(grand > 0) { qTotal = grand; }
+			else if(sub > 0) { qTotal = sub; }
+			totalAmount = totalAmount + qTotal;
+
+			// --- Phase 1: gather this non-lost Quote's product key + controlling Contact ---
+			qpLk = fullQ.get("Quote_Product");
+			if(!isNull(qpLk) && !isNull(qpLk.get("name")))
+			{
+				qpk = automation.computeProductKey(qpLk.get("name").toString());
+				if(qpk != "")
+				{
+					if(!nonLostProdKeys.contains(qpk)) { nonLostProdKeys.add(qpk); }
+					if(!isNull(qpLk.get("id"))) { nonLostProdIdByKey.put(qpk, qpLk.get("id").toString()); }
+				}
+			}
+			qcLk = fullQ.get("Contact_Name");
+			if(!isNull(qcLk) && !isNull(qcLk.get("id")))
+			{
+				qCid = qcLk.get("id").toString();
+				qRank = ifnull(qStageRankMap.get(qStg), 0).toLong();
+				if(qRank > ctrlContactRank || (qRank == ctrlContactRank && dqId.toLong() > ctrlContactQuoteId))
+				{
+					ctrlContactRank = qRank;
+					ctrlContactQuoteId = dqId.toLong();
+					ctrlContactId = qCid;
+				}
+			}
+		}
+	}
+
+	// Deal.Amount is the SUM of active OPEN (non-Closed-Lost, non-Closed-Won) Quote totals. The prior
+	// provisional Product.Unit_Price sum (when zero Quotes existed) is REMOVED (Root Cause D):
+	// it fabricated a contractual Amount from list prices, concealed the absence of a real
+	// contract Quote, and violated the Amount invariant. With no Quotes, Amount is 0.
+	totalAmount = totalAmount.round(2);
+	info "Amount recompute: quoteCount=" + quoteCount + " totalAmount=" + totalAmount;
+
+	// ===================================================================
+	// 6b. Phase 1 — resolve the Deal's PRODUCT identity + compose the product-scoped Deal_Key.
+	//     Precedence (never "::active", never partial):
+	//       - Deal_Product / Deal_Product_Key present -> AUTHORITATIVE; compose Deal_Key from it,
+	//         and flag any disagreeing non-lost Quote [quote_product_mismatch] (do NOT auto-move).
+	//       - else derive from non-lost child Quotes: EXACTLY ONE unique product key -> stamp + compose;
+	//         >1 unique -> [quote_product_mismatch], do NOT stamp Deal_Product / compose Deal_Key;
+	//         0 -> [product_unresolved], do NOT compose Deal_Key.
+	//     (dUpd does not exist yet; stamping of Deal_Product/Key/Deal_Key happens in §8.)
+	// ===================================================================
+	dealProductKey = ifnull(targetDeal.get("Deal_Product_Key"), "").toString().trim();
+	dealProductId = "";
+	dpExisting = targetDeal.get("Deal_Product");
+	if(!isNull(dpExisting) && !isNull(dpExisting.get("id"))) { dealProductId = dpExisting.get("id").toString(); }
+	if(dealProductKey == "" && !isNull(dpExisting) && !isNull(dpExisting.get("name")))
+	{
+		dealProductKey = automation.computeProductKey(dpExisting.get("name").toString());
+	}
+	dealProductResolved = false;
+
+	if(dealProductKey != "")
+	{
+		// AUTHORITATIVE Deal product — compose from it; flag any Quote that disagrees.
+		dealProductResolved = true;
+		dealKey = accountKey + "::" + dealProductKey;
+		qDisagree = false;
+		for each pk in nonLostProdKeys
+		{
+			if(pk.toString() != dealProductKey) { qDisagree = true; }
+		}
+		if(qDisagree)
+		{
+			result.put("reviewRequired", true);
+			if(!reviewReasons.contains("quote_product_mismatch")) { reviewReasons.add("quote_product_mismatch"); }
+			automation.createManualReview(primaryContactId, targetDealId, "quote_product_mismatch", "Deal_Product=" + dealProductKey + " but non-lost Quote products = " + nonLostProdKeys.toString() + ". Reroute mismatched Quotes to the correct Product Deal (not auto-moved).");
+			automation.logAutomationEvent("processDeal", "Deals", targetDealId, "product_mismatch", "quote_vs_deal_product", {"deal":dealProductKey, "quotes":nonLostProdKeys.toString()});
+		}
+	}
+	else if(nonLostProdKeys.size() == 1)
+	{
+		// derive from the single unique non-lost Quote product
+		dealProductResolved = true;
+		dealProductKey = nonLostProdKeys.get(0).toString();
+		dealProductId = ifnull(nonLostProdIdByKey.get(dealProductKey), "").toString();
+		dealKey = accountKey + "::" + dealProductKey;
+	}
+	else if(nonLostProdKeys.size() > 1)
+	{
+		// ambiguous — do NOT stamp Deal_Product or compose Deal_Key; never auto-pick.
+		result.put("reviewRequired", true);
+		if(!reviewReasons.contains("quote_product_mismatch")) { reviewReasons.add("quote_product_mismatch"); }
+		automation.createManualReview(primaryContactId, targetDealId, "quote_product_mismatch", "Deal has non-lost Quotes for multiple Products " + nonLostProdKeys.toString() + " and no authoritative Deal_Product; cannot resolve a single Product. Reroute Quotes to the correct Product Deals.");
+		automation.logAutomationEvent("processDeal", "Deals", targetDealId, "product_mismatch", "multiple_quote_products", {"keys":nonLostProdKeys.toString()});
+	}
+	else
+	{
+		// No authoritative Deal_Product AND no non-lost Quote product.
+		//   FTP+ (commercial) -> genuinely unresolved: Manual Review [product_unresolved].
+		//   Pre-FTP early-stage -> LEGACY COEXISTENCE GUARD (narrow): leave the Deal UNTOUCHED
+		//     (no [product_unresolved], no re-key, no stamp) while Phase 1 runs before the Phase 2
+		//     creators exist. dealKey stays "" so §8 never writes it (never restores "::active");
+		//     dealProductResolved stays false so §8 stamps nothing. This tolerates legacy
+		//     productless early-stage Deals until Phase 2 / fresh import replaces them.
+		ftpPlus = (effectiveOppType == "FTP" || effectiveOppType == "RTP");
+		if(ftpPlus)
+		{
+			result.put("reviewRequired", true);
+			if(!reviewReasons.contains("product_unresolved")) { reviewReasons.add("product_unresolved"); }
+			automation.createManualReview(primaryContactId, targetDealId, "product_unresolved", "FTP+ Deal has no Deal_Product and no non-lost Quote with a resolvable Product; cannot compose a product-scoped Deal_Key.");
+			automation.logAutomationEvent("processDeal", "Deals", targetDealId, "product_unresolved", "ftp_no_product_identity", {"oppType":effectiveOppType});
+		}
+		else
+		{
+			automation.logAutomationEvent("processDeal", "Deals", targetDealId, "product_skip_legacy_early_stage", "no_product_evidence_pre_ftp", {"oppType":effectiveOppType});
+		}
+	}
+
+	// ===================================================================
+	// 7. Contractual-term ledger (Confirmed/Closed-Won only)
+	//    term key = Deal + Opportunity_Type + Contract_Date_Start + Contract_Date_End
+	// ===================================================================
+	// Gather all Quotes once for ledger + gates.
+	allDealQuotes = zoho.crm.getRelatedRecords("Quotes", "Deals", targetDealId.toLong());
+	termMap = Map();           // termKey -> aggregate map
+	termKeysOrder = List();
+	relevantQuotes = List();   // full Quote maps for the effective OppType (for gates)
+	hasAnyConfirmed = false;
+
+	if(allDealQuotes != null && allDealQuotes.size() > 0 && !allDealQuotes.toString().startsWith("{\"code\""))
+	{
+		for each dq in allDealQuotes
+		{
+			dqId = "";
+			if(!isNull(dq.get("id"))) { dqId = dq.get("id").toString(); }
+			if(dqId == "") { continue; }
+			fullQ = zoho.crm.getRecordById("Quotes", dqId.toLong());
+			if(isNull(fullQ) || isNull(fullQ.get("id"))) { continue; }
+			qStg = ifnull(fullQ.get("Quote_Stage"), "").toString();
+			qOppT = ifnull(fullQ.get("Opportunity_Type"), "").toString();
+
+			if(qOppT == quoteOppType) { relevantQuotes.add(fullQ); }
+
+			// ledger contributors: Confirmed / Closed Won. (D1 governs the SIGNED EVENT - see 9
+			// Contract_Signed_Date + 10 transitions, both Closed-Won-only - but the contract-term
+			// ledger stays Confirmed-inclusive so imported Confirmed contracts keep their aggregates
+			// and existing ledgers are never wiped. Making the ledger signed-only would require the
+			// import to emit Closed Won for genuinely-signed contracts; that is a coupled decision.)
+			if(qStg == "Confirmed" || qStg == "Closed Won")
+			{
+				hasAnyConfirmed = true;
+				qStart = ifnull(fullQ.get("Contract_Date_Start"), "").toString();
+				qEnd = ifnull(fullQ.get("Contract_Date_End"), "").toString();
+				termKey = qOppT + "|" + qStart + "|" + qEnd;
+
+				agg = termMap.get(termKey);
+				if(isNull(agg))
+				{
+					agg = Map();
+					agg.put("oppType", qOppT);
+					agg.put("start", qStart);
+					agg.put("end", qEnd);
+					agg.put("acv", 0.0);
+					agg.put("brandsList", List());
+					agg.put("planProductsList", List());
+					agg.put("planProductsLower", List());
+					agg.put("planTypeSet", List());
+					agg.put("signedMax", "");
+					agg.put("highestQuoteId", 0);
+					agg.put("quoteCount", 0);
+					termMap.put(termKey, agg);
+					termKeysOrder.add(termKey);
+				}
+
+				// ACV per quote (frozen Contract_ACV if positive, else Grand/Sub)
+				cAcv = ifnull(fullQ.get("Contract_ACV"), "0").toDecimal();
+				g = ifnull(fullQ.get("Grand_Total"), "0").toDecimal();
+				s = ifnull(fullQ.get("Sub_Total"), "0").toDecimal();
+				qAcv = 0.0;
+				if(cAcv > 0) { qAcv = cAcv; }
+				else if(g > 0) { qAcv = g; }
+				else { qAcv = s; }
+				agg.put("acv", ifnull(agg.get("acv"), 0).toDecimal() + qAcv);
+				agg.put("quoteCount", ifnull(agg.get("quoteCount"), 0).toLong() + 1);
+
+				// derive family + plan type from the Quote_Product (family = Product_Plan_Products, NOT SKU)
+				qpId = "";
+				qpL = fullQ.get("Quote_Product");
+				if(!isNull(qpL) && !isNull(qpL.get("id"))) { qpId = qpL.get("id").toString(); }
+				if(qpId != "")
+				{
+					qProd = zoho.crm.getRecordById("Products", qpId.toLong());
+					if(!isNull(qProd) && !isNull(qProd.get("id")))
+					{
+						fam = ifnull(qProd.get("Product_Plan_Products"), "").toString().trim();
+						if(fam == "Jurnii Cortext") { fam = "Jurnii Cortex"; }
+						pt = ifnull(qProd.get("Product_Plan_Type"), "").toString().trim();
+						if(pt == "Flexible") { pt = "Flex"; }
+						ppLower = agg.get("planProductsLower");
+						if(fam != "" && !ppLower.contains(fam.toLowerCase()))
+						{
+pplTmp = agg.get("planProductsList"); pplTmp.add(fam);
+							ppLower.add(fam.toLowerCase());
+						}
+						ptsTmp = agg.get("planTypeSet"); if(pt != "" && !ptsTmp.contains(pt)) { ptsTmp.add(pt); }
+					}
+				}
+
+				// brands: collect distinct nonblank line brand counts (never summed).
+				// Deluge getRecordById DROPS custom subform fields (Quoted_Item_Plan_Brands), so the
+				// ledger brand count never derived. Re-read the Quoted_Items via the REST API, which
+				// returns the custom subform fields, then collect brands from there.
+				qLines = List();
+				qLinesGet = invokeurl
+				[
+					url: "https://www.zohoapis.eu/crm/v6/Quotes/" + dqId
+					type: GET
+					connection: "zoho_crm"
+				];
+				if(!isNull(qLinesGet) && !isNull(qLinesGet.get("data")) && qLinesGet.get("data").size() > 0)
+				{
+					qLinesRb = qLinesGet.get("data").get(0).get("Quoted_Items");
+					if(!isNull(qLinesRb)) { qLines = qLinesRb; }
+				}
+				if(qLines.size() > 0)
+				{
+					for each ql in qLines
+					{
+						qb = ifnull(ql.get("Quoted_Item_Plan_Brands"), "").toString().trim();
+						brsTmp = agg.get("brandsList"); if(qb != "" && qb != "null" && !brsTmp.contains(qb)) { brsTmp.add(qb); }
+					}
+				}
+
+				// signed date max + highest quote id
+				qSigned = ifnull(fullQ.get("Contract_Signed_Date"), "").toString();
+				if(qSigned != "") { sMaxS = ifnull(agg.get("signedMax"), "").toString(); sMaxN = 0; if(sMaxS != "") { sMaxN = sMaxS.replaceAll("-", "").toLong(); } if(qSigned.replaceAll("-", "").toLong() > sMaxN) { agg.put("signedMax", qSigned); } }
+				if(dqId.toLong() > ifnull(agg.get("highestQuoteId"), 0).toLong()) { agg.put("highestQuoteId", dqId.toLong()); }
+			}
+		}
+	}
+
+	// ===================================================================
+	// 8. Build Deal-update map (Deal_Key, Amount, primary Contact, viability, stage,
+	//    Product_Interest_Staging, ledger fields, completion stamps)
+	// ===================================================================
+	dUpd = Map();
+
+	// Deal_Key is product-scoped; write ONLY when composed (§6b resolved a single Product). Never
+	// write empty / "::active" / partial. (isQuoteSrc guard preserved: quote-sourced reconciles do
+	// not clobber the key set by the creator.)
+	if(dealKey != "" && ifnull(targetDeal.get("Deal_Key"), "").toString() != dealKey && !isQuoteSrc) { dUpd.put("Deal_Key", dealKey); }
+
+	// Stamp Deal_Product / Deal_Product_Key when a single Product was resolved (§6b).
+	if(dealProductResolved && dealProductKey != "")
+	{
+		if(ifnull(targetDeal.get("Deal_Product_Key"), "").toString() != dealProductKey) { dUpd.put("Deal_Product_Key", dealProductKey); }
+		if(dealProductId != "" && dealProductId.matches("[0-9]+"))
+		{
+			curDpId = "";
+			curDp2 = targetDeal.get("Deal_Product");
+			if(!isNull(curDp2) && !isNull(curDp2.get("id"))) { curDpId = curDp2.get("id").toString(); }
+			if(curDpId != dealProductId) { dpm = Map(); dpm.put("id", dealProductId); dUpd.put("Deal_Product", dpm); }
+		}
+	}
+
+	currentAmount = ifnull(targetDeal.get("Amount"), "0").toDecimal();
+	// Deal.Amount is set by the valuation-hierarchy block AFTER viability is resolved (it needs the
+	// final Lost/Open state), not here. `totalAmount` (active OPEN priced Quote sum, non-CL/non-CW) is
+	// carried forward as the Quote-authority input.
+
+	// primary Contact
+	primaryContactsRaw = targetDeal.get("Primary_Contact");
+	primaryContactIdsList = List();
+	if(primaryContactsRaw != null)
+	{
+		pcStr = primaryContactsRaw.toString();
+		if(pcStr.startsWith("[") && pcStr.endsWith("]") && pcStr.contains("{"))
+		{
+			for each pcItem in primaryContactsRaw
+			{
+				if(pcItem != null && pcItem.get("id") != null) { primaryContactIdsList.add(pcItem.get("id").toString()); }
+			}
+		}
+	}
+	// Deal.Contact = controlling Quote.Contact (the most-advanced non-lost Quote, resolved in §6b)
+	// when present; otherwise the furthest-stage open Account Contact (prior behaviour).
+	// Spec: Quote.Contact -> Deal.Contact.
+	dealContactId = furthestContactId;
+	if(ctrlContactId != "") { dealContactId = ctrlContactId; }
+	if(dealContactId != "")
+	{
+		if(dealContactId != currentPrimaryId) { dUpd.put("Contact_Name", dealContactId); }
+		if(!primaryContactIdsList.contains(dealContactId))
+		{
+			pcList = List();
+			for each existingPcId in primaryContactIdsList
+			{
+				existingPcMap = Map(); existingPcMap.put("id", existingPcId.toLong()); pcList.add(existingPcMap);
+			}
+			newPcMap = Map(); newPcMap.put("id", dealContactId.toLong()); pcList.add(newPcMap);
+			dUpd.put("Primary_Contact", pcList);
+			primaryContactIdsList.add(dealContactId);
+		}
+	}
+
+	// completion dates source = furthest primary contact's dates
+	dealPcDates = Map();
+	dealPcMaxRank = -1;
+	dealPcBestContactId = "";
+	for each pcId in primaryContactIdsList
+	{
+		pcStage = contactStageMap.get(pcId);
+		if(pcStage != null && pcStage != "")
+		{
+			pcRank = ifnull(stageRanks.get(pcStage), 1).toLong();
+			if(pcRank > dealPcMaxRank) { dealPcMaxRank = pcRank; dealPcBestContactId = pcId; }
+		}
+	}
+	if(dealPcBestContactId == "" && furthestContactId != "") { dealPcBestContactId = furthestContactId; }
+	if(dealPcBestContactId != "") { dealPcDates = contactDatesMap.get(dealPcBestContactId); }
+
+	// Product Interest staging string
+	aggregatedPIStr = "";
+	for each apiItem in aggregatedPIList
+	{
+		aggregatedPIStr = aggregatedPIStr + if(aggregatedPIStr != "", ", ", "") + apiItem;
+	}
+	// F1 FIX (2026-06-24): Deals.Product_Interest_Staging does NOT exist (COQL rejects it), so
+	// this write was a silent no-op. Product interest is read from Contact Products_Linked / Product_Interest_Staging
+	// and resolved onto the Deal as Contract_*_Plan_Products via the Quote/Quoted_Items flow above —
+	// not as a Deal staging string. aggregatedPIStr is retained only for logging/diagnostics.
+	automation.logAutomationEvent("processDeal", "Deals", targetDealId.toString(), "product_interest", "resolved_to_contract_products", {"aggregated":aggregatedPIStr});
+
+	// viability + stage roll-up
+	dealReasonForLoss = ifnull(targetDeal.get("Reason_For_Loss__s"), "").toString();
+	dealLostReasons = ifnull(targetDeal.get("Lost_Reasons"), "").toString();
+	hasLossReason = dealReasonForLoss != "" || dealLostReasons != "";
+
+	// COM-2: resolve the viable-Contact set from the Deal Contact Roles (per-Deal), NOT all
+	// Account-related Contacts. This mirrors routeContactSequence's canonical definition exactly:
+	// candidate set = Deal role Contacts + Deal.Contact_Name (primary); count only State = Open.
+	// COM-3 fail-safe: a lookup failure must NEVER be read as "zero viable Contacts". The
+	// Deal-Contact-Roles related-list API name can vary by org, so resolve it defensively
+	// (Contacts off Deals, then Contact_Roles); a valid (even empty) list response starts with "[";
+	// an error/NO_CONTENT/null is treated as UNRESOLVED.
+	dealViabilityResolved = false;
+	// "Contact_Roles" is the valid Deals relation ("Contacts" is NOT and always errors).
+	// Each entry's id IS the Contact id.
+	dealRoleContacts = zoho.crm.getRelatedRecords("Contact_Roles", "Deals", targetDealId.toLong());
+	if(!isNull(dealRoleContacts) && dealRoleContacts.toString().startsWith("[")) { dealViabilityResolved = true; }
+
+	dealCandidateIds = List();
+	dealAnyContactOpen = false;
+	dealAnyContactWorking = false;
+	// Gather role Contacts ONLY when the related-list read resolved...
+	if(dealViabilityResolved)
+	{
+		for each rc in dealRoleContacts
+		{
+			rcId = "";
+			if(!isNull(rc.get("id"))) { rcId = rc.get("id").toString(); }
+			if(rcId != "" && rcId != "null" && !dealCandidateIds.contains(rcId)) { dealCandidateIds.add(rcId); }
+		}
+	}
+	// ...but ALWAYS evaluate the Deal's Primary Contact (Contact_Name): its State is known via a
+	// direct read and does NOT depend on the lag-prone role-list. A positively-Open primary proves
+	// viability even when the role-list read failed, so a freshly-created Deal is never falsely flagged.
+	if(currentPrimaryId != "" && currentPrimaryId != "null" && !dealCandidateIds.contains(currentPrimaryId)) { dealCandidateIds.add(currentPrimaryId); }
+	for each candId in dealCandidateIds
+	{
+		candFull = zoho.crm.getRecordById("Contacts", candId.toLong());
+		if(!isNull(candFull) && !isNull(candFull.get("id")) && ifnull(candFull.get("State"), "").toString() == "Open")
+		{
+			dealAnyContactOpen = true;
+			if(ifnull(candFull.get("Status"), "").toString() == "Working") { dealAnyContactWorking = true; }
+		}
+	}
+	dealHasContacts = dealCandidateIds.size() > 0;
+	info "Deal-Roles viability: resolved=" + dealViabilityResolved + " candidates=" + dealCandidateIds.size() + " anyOpen=" + dealAnyContactOpen + " anyWorking=" + dealAnyContactWorking;
+
+	// SIGNED-CONFIRMATION TRIGGER (part 1 of 2): did the Deal cross into Onboarding for the
+	// FIRST time on THIS reconcile? Set true only at the RTP-floor stage write below when the
+	// stored Opportunity_Stage was BELOW Onboarding and the floor raises it to Onboarding. The
+	// signed-confirmation email is dispatched from part 2 (after termComplete is known), gated on
+	// this flag + termComplete, so it fires exactly on the confirmed-signing crossing.
+	crossedIntoOnboarding = false;
+
+	if(hasLossReason)
+	{
+		// Explicit Deal loss reason is independent confident evidence -> always close.
+		// Deals are never "Won"; no bare State/Status (Contact/Account-only).
+		if(ifnull(targetDeal.get("Opportunity_State"), "") != "Lost") { dUpd.put("Opportunity_State", "Lost"); }
+		if(ifnull(targetDeal.get("Opportunity_Status"), "") != "Closed") { dUpd.put("Opportunity_Status", "Closed"); }
+	}
+	else if(dealViabilityResolved && dealHasContacts && !dealAnyContactOpen)
+	{
+		// COM-3: close ONLY when the Deal-Contact-Roles viable set was resolved WITH CONFIDENCE
+		// (the related-list read succeeded and was examined) and no role Contact is Open.
+		if(ifnull(targetDeal.get("Opportunity_State"), "") != "Lost") { dUpd.put("Opportunity_State", "Lost"); }
+		if(ifnull(targetDeal.get("Opportunity_Status"), "") != "Closed") { dUpd.put("Opportunity_Status", "Closed"); }
+	}
+	else if(dealAnyContactOpen)
+	{
+		// Positive viability WINS — at least one candidate (often the Primary) is Open — so keep the
+		// Deal Open even if the role-list read failed. No Manual Review on the fresh/healthy path.
+		targetOppStatus = if(dealAnyContactWorking, "Working", "New");
+		if(ifnull(targetDeal.get("Opportunity_State"), "") != "Open") { dUpd.put("Opportunity_State", "Open"); }
+		if(ifnull(targetDeal.get("Opportunity_Status"), "") != targetOppStatus) { dUpd.put("Opportunity_Status", targetOppStatus); }
+		// Never-regress Opportunity_Stage; honour the durable RTP floor (targetStage may exceed bestStage).
+		currentOppStage = ifnull(targetDeal.get("Opportunity_Stage"), "").toString();
+		currentRank = ifnull(stageRanks.get(currentOppStage), 0).toLong();
+		floorRank = targetRank;
+		floorStage = targetStage;
+		if(currentRank < floorRank)
+		{
+			dUpd.put("Opportunity_Stage", floorStage);
+			dUpd.put("Stage", effectiveOppType);
+			// FIRST-time crossing into Onboarding (stored stage was below Onboarding, floor
+			// raises it to Onboarding) -> mark for the signed-confirmation dispatch below.
+			if(floorStage == "Onboarding" && currentRank < onboardingRank) { crossedIntoOnboarding = true; }
+		}
+		else if(storedStage != effectiveOppType && effectiveOppType == "RTP")
+		{
+			// keep Opportunity Type aligned to the RTP floor even if the 8-stage didn't change
+			dUpd.put("Stage", effectiveOppType);
+		}
+	}
+	else if(!dealViabilityResolved)
+	{
+		// COM-3 fail-safe: reached ONLY when no positively-Open Contact (not even the Primary) was
+		// found AND the role-list read failed -> viability is genuinely indeterminate. Never silently
+		// close: leave Opportunity_State unchanged, log, raise Manual Review (mirrors routeContactSequence).
+		result.put("reviewRequired", true);
+		if(!reviewReasons.contains("deal_viability_unresolved")) { reviewReasons.add("deal_viability_unresolved"); }
+		automation.createAuxTask(primaryContactId, targetDealId, "Manual Review", "Deal Contact Roles viability could not be resolved (related-list read failed) and no Open Contact was found. Opportunity_State left unchanged. Review whether any viable Contact remains before closing the Deal.");
+		automation.logAutomationEvent("processDeal", "Deals", targetDealId, "viability_check_unresolved", "opportunity_state_unchanged", null);
+	}
+
+	// ===================================================================
+	// 8a2. Company Tier mirror (the ACCOUNT is live-authoritative)
+	//      Company_Tier is an Account attribute; Deal.Company_Tier is only a mirror/cache for the
+	//      Target-ACV benchmark. Keep the Deal mirror in lock-step with the Account: set/update it
+	//      when they differ, and CLEAR it when the Account tier is removed. There is NO manual
+	//      Deal-level tier override field, so the Account always wins — no [company_tier_conflict].
+	//      §8b derives the pipeline Amount from the LIVE Account tier (acctTierLive), so an Account
+	//      tier change (1->3, or ->blank) re-prices the Deal on the next reconcile (WF001c ->
+	//      processAccount -> processDeal). The Deal-tier field write here is the cache refresh.
+	// ===================================================================
+	dealTierCur = ifnull(targetDeal.get("Company_Tier"), "").toString().trim();
+	acctTierLive = ifnull(accRec.get("Company_Tier"), "").toString().trim();
+	if(dealTierCur != acctTierLive)
+	{
+		dUpd.put("Company_Tier", acctTierLive);
+		automation.logAutomationEvent("processDeal", "Deals", targetDealId, "company_tier_mirror", acctTierLive, {"from":dealTierCur, "account":accountId});
+	}
+
+	// ===================================================================
+	// 8b. Deal.Amount valuation hierarchy (Amount is BOTH the contracted value AND the
+	//     pre-contract pipeline value). Precedence:
+	//       1) Lost (any type) -> 0  (lost override wins over Quotes/Target/imported ACV)
+	//       2) active OPEN (non-CL, non-CW) PRICED Quotes -> SUM of their totals (totalAmount > 0;
+	//          includes Confirmed imported-ACV Quotes — value comes from the Quote)
+	//       3) Open + Opportunity Type in {MQL,SQL,FTP} + no priced Quote -> Target ACV (from tier)
+	//       4) Open RTP + no priced Quote -> 0 (NEVER Target ACV as an actual renewal value)
+	//       5) otherwise -> 0
+	//     Target ACV is computed from the LIVE Account Company Tier (authoritative; the Deal tier is a
+	//     mirror) using the same rule as the formula field (1->26000, 2->16500, 3->10500, else 0);
+	//     Product.Unit_Price is NEVER used.
+	// ===================================================================
+	resolvedOppState = ifnull(dUpd.get("Opportunity_State"), ifnull(targetDeal.get("Opportunity_State"), "")).toString();
+	finalAmount = 0.0;
+	amountBasis = "none";
+	if(resolvedOppState == "Lost")
+	{
+		finalAmount = 0.0;
+		amountBasis = "lost_override";
+	}
+	else if(totalAmount > 0)
+	{
+		finalAmount = totalAmount;
+		amountBasis = "quote_sum";
+	}
+	else if(effectiveOppType == "MQL" || effectiveOppType == "SQL" || effectiveOppType == "FTP")
+	{
+		// pre-contract pipeline fallback = Target ACV from the LIVE Account Company Tier (authoritative).
+		// Account is the source of truth; the Deal-tier field is just a mirror (see §8a2). Reading the
+		// live Account tier here means an Account tier change (1->3, or ->blank) re-prices the Deal and
+		// a removed Account tier yields 0 (never a stale Deal-mirror value).
+		amtTier = acctTierLive;
+		if(amtTier == "1") { finalAmount = 26000; }
+		else if(amtTier == "2") { finalAmount = 16500; }
+		else if(amtTier == "3") { finalAmount = 10500; }
+		else { finalAmount = 0.0; }
+		amountBasis = "target_acv_pipeline";
+		if(finalAmount == 0.0)
+		{
+			result.put("reviewRequired", true);
+			if(!reviewReasons.contains("pipeline_target_acv_unresolved")) { reviewReasons.add("pipeline_target_acv_unresolved"); }
+			automation.createAuxTask(primaryContactId, targetDealId, "Manual Review", "[pipeline_target_acv_unresolved] Open " + effectiveOppType + " Deal has no priced Quote and no Account Company Tier, so the Target-ACV pipeline Amount is 0. Set Company Tier on the Account.");
+		}
+	}
+	else
+	{
+		// Open RTP (or other) with no priced Quote: do NOT use Target ACV as an actual renewal value.
+		finalAmount = 0.0;
+		amountBasis = "rtp_no_quote_zero";
+		if(effectiveOppType == "RTP")
+		{
+			result.put("reviewRequired", true);
+			if(!reviewReasons.contains("rtp_missing_commercial_evidence")) { reviewReasons.add("rtp_missing_commercial_evidence"); }
+			automation.createAuxTask(primaryContactId, targetDealId, "Manual Review", "[rtp_missing_commercial_evidence] Open RTP Deal has no active priced Quote and no imported-ACV Quote; Amount left at 0 (Target ACV is a benchmark, not an RTP renewal value). Add the renewal Quote / imported contract ACV.");
+		}
+	}
+	finalAmount = finalAmount.round(2);
+	if(currentAmount != finalAmount) { dUpd.put("Amount", finalAmount); }
+	info "Amount hierarchy: basis=" + amountBasis + " oppType=" + effectiveOppType + " state=" + resolvedOppState + " quoteSum=" + totalAmount + " final=" + finalAmount;
+
+	// ---- ledger fields onto the Deal ----
+	// Initial term: date-identity write-once; aggregates recalc as quotes join.
+	// Current term: chosen between aggregated terms (Start -> termSignedDate -> highestQuoteId).
+	if(hasAnyConfirmed)
+	{
+		// pick "current" term
+		currentTermKey = "";
+		bestStart = "";
+		bestSigned = "";
+		bestHi = 0;
+		for each tk in termKeysOrder
+		{
+			agg = termMap.get(tk);
+			tStart = ifnull(agg.get("start"), "").toString();
+			tSigned = ifnull(agg.get("signedMax"), "").toString();
+			tHi = ifnull(agg.get("highestQuoteId"), 0).toLong(); tStartN = 0; if(tStart != "") { tStartN = tStart.replaceAll("-", "").toLong(); } tSignedN = 0; if(tSigned != "") { tSignedN = tSigned.replaceAll("-", "").toLong(); } bStartN = 0; if(bestStart != "") { bStartN = bestStart.replaceAll("-", "").toLong(); } bSignedN = 0; if(bestSigned != "") { bSignedN = bestSigned.replaceAll("-", "").toLong(); }
+			pick = false;
+			if(currentTermKey == "") { pick = true; }
+			else if(tStartN > bStartN) { pick = true; }
+			else if(tStart == bestStart && tSignedN > bSignedN) { pick = true; }
+			else if(tStart == bestStart && tSigned == bestSigned && tHi > bestHi) { pick = true; }
+			if(pick) { currentTermKey = tk; bestStart = tStart; bestSigned = tSigned; bestHi = tHi; }
+		}
+
+		// Initial term: the existing Initial date identity if populated, else the earliest term by start.
+		initialStartExisting = ifnull(targetDeal.get("Contract_Initial_Date_Start"), "").toString();
+		initialEndExisting = ifnull(targetDeal.get("Contract_Initial_Date_End"), "").toString();
+		initialTermKey = "";
+		if(initialStartExisting != "")
+		{
+			// match an aggregated term that shares the Initial date identity
+			for each tk in termKeysOrder
+			{
+				agg = termMap.get(tk);
+				if(ifnull(agg.get("start"), "").toString() == initialStartExisting && ifnull(agg.get("end"), "").toString() == initialEndExisting) { initialTermKey = tk; }
+			}
+		}
+		if(initialTermKey == "")
+		{
+			// earliest term by start date (write-once identity if none recorded yet)
+			earliestStart = "";
+			for each tk in termKeysOrder
+			{
+				agg = termMap.get(tk);
+				tStart = ifnull(agg.get("start"), "").toString();
+				eStartN = 0; if(earliestStart != "") { eStartN = earliestStart.replaceAll("-", "").toLong(); } tStartN2 = 0; if(tStart != "") { tStartN2 = tStart.replaceAll("-", "").toLong(); } if(initialTermKey == "" || tStartN2 < eStartN) { initialTermKey = tk; earliestStart = tStart; }
+			}
+		}
+
+		// write Initial aggregates
+		if(initialTermKey != "")
+		{
+			iagg = termMap.get(initialTermKey);
+			iAcv = ifnull(iagg.get("acv"), 0).toDecimal().round(2);
+			dUpd.put("Contract_Initial_ACV", iAcv);
+			if(initialStartExisting == "") { dUpd.put("Contract_Initial_Date_Start", ifnull(iagg.get("start"), "").toString()); }
+			if(initialEndExisting == "") { dUpd.put("Contract_Initial_Date_End", ifnull(iagg.get("end"), "").toString()); }
+			// Plan Products (live MULTI-select Pick List) -> write the full distinct family list
+			iPP = iagg.get("planProductsList");
+			if(iPP.size() > 0) { dUpd.put("Contract_Initial_Plan_Products", iPP); }
+			iPT = iagg.get("planTypeSet");
+			if(iPT.size() == 1) { dUpd.put("Contract_Initial_Plan_Type", iPT.get(0)); }
+			// Plan Brands: common nonblank -> write; single -> write; conflicting -> review (do not write)
+			iBrands = iagg.get("brandsList");
+			if(iBrands.size() == 1) { dUpd.put("Contract_Initial_Plan_Brands", iBrands.get(0).toLong()); }
+			else if(iBrands.size() > 1)
+			{
+				result.put("reviewRequired", true);
+				if(!reviewReasons.contains("ledger_conflicting_brands")) { reviewReasons.add("ledger_conflicting_brands"); }
+				automation.createAuxTask(primaryContactId, targetDealId, "Manual Review", "Conflicting Plan Brands across the Initial contract term Quotes: " + iBrands.toString() + ". Resolve before reporting.");
+			}
+		}
+
+		// write Current aggregates
+		if(currentTermKey != "")
+		{
+			cagg = termMap.get(currentTermKey);
+			cAcvAgg = ifnull(cagg.get("acv"), 0).toDecimal().round(2);
+			dUpd.put("Contract_Current_ACV", cAcvAgg);
+			dUpd.put("Contract_Current_Date_Start", ifnull(cagg.get("start"), "").toString());
+			dUpd.put("Contract_Current_Date_End", ifnull(cagg.get("end"), "").toString());
+			cPP = cagg.get("planProductsList");
+			if(cPP.size() > 0) { dUpd.put("Contract_Current_Plan_Products", cPP); }
+			cPT = cagg.get("planTypeSet");
+			if(cPT.size() == 1) { dUpd.put("Contract_Current_Plan_Type", cPT.get(0)); }
+			cBrands = cagg.get("brandsList");
+			if(cBrands.size() == 1) { dUpd.put("Contract_Current_Plan_Brands", cBrands.get(0).toLong()); }
+			else if(cBrands.size() > 1)
+			{
+				result.put("reviewRequired", true);
+				if(!reviewReasons.contains("ledger_conflicting_brands")) { reviewReasons.add("ledger_conflicting_brands"); }
+			}
+		}
+	}
+	else
+	{
+		// no Confirmed/Closed-Won quotes remain: preserve Initial date identity, reset Initial aggregates,
+		// clear Current fields. Manual Review when an Initial identity previously existed.
+		if(ifnull(targetDeal.get("Contract_Initial_Date_Start"), "").toString() != "" || ifnull(targetDeal.get("Contract_Initial_ACV"), "").toString() != "")
+		{
+			dUpd.put("Contract_Initial_ACV", 0);
+			dUpd.put("Contract_Initial_Plan_Products", "");
+			dUpd.put("Contract_Initial_Plan_Type", "");
+			dUpd.put("Contract_Initial_Plan_Brands", "");
+			result.put("reviewRequired", true);
+			if(!reviewReasons.contains("ledger_initial_emptied")) { reviewReasons.add("ledger_initial_emptied"); }
+			automation.createAuxTask(primaryContactId, targetDealId, "Manual Review", "All Confirmed/Closed-Won Quotes left the contract ledger; Initial term aggregates reset to 0 (date identity preserved). Verify the contract state.");
+		}
+		if(ifnull(targetDeal.get("Contract_Current_Date_Start"), "").toString() != "" || ifnull(targetDeal.get("Contract_Current_ACV"), "").toString() != "")
+		{
+			dUpd.put("Contract_Current_ACV", 0);
+			dUpd.put("Contract_Current_Date_Start", "");
+			dUpd.put("Contract_Current_Date_End", "");
+			dUpd.put("Contract_Current_Plan_Products", "");
+			dUpd.put("Contract_Current_Plan_Type", "");
+			dUpd.put("Contract_Current_Plan_Brands", "");
+		}
+	}
+
+	// ===================================================================
+	// 10. Stage-completion date stamping + write Deal + Account rollups
+	// ===================================================================
+	stagesList = {"Marketing Consent", "Demo Booking", "Demo Confirmation", "Demo Hosted", "Proposal Preparation", "Commercial Agreement"};
+	stageFields = Map();
+	stageFields.put("Marketing Consent", "Marketing_Qualification_Completed_At");
+	stageFields.put("Demo Booking", "Demo_Booking_Completed_At");
+	stageFields.put("Demo Confirmation", "Demo_Confirmation_Completed_At");
+	stageFields.put("Demo Hosted", "Demo_Hosted_Completed_At");
+	stageFields.put("Proposal Preparation", "Proposal_Preparation_Completed_At");
+	stageFields.put("Commercial Agreement", "Commercial_Agreement_Completed_At");
+	// NOTE: Deal-level Onboarding_Completed_At / Renewal_Completed_At are PHANTOM (do not exist).
+	// They are intentionally absent from stageFields so they are NEVER written.
+
+	finalOppStage = ifnull(dUpd.get("Opportunity_Stage"), ifnull(targetDeal.get("Opportunity_Stage"), "Marketing Consent")).toString();
+	finalRank = ifnull(stageRanks.get(finalOppStage), 1).toLong();
+
+	for each stageItem in stagesList
+	{
+		stageItemRank = ifnull(stageRanks.get(stageItem), 0).toLong();
+		if(stageItemRank <= finalRank)
+		{
+			fieldApi = stageFields.get(stageItem);
+			if(fieldApi != null && targetDeal.get(fieldApi) == null && dUpd.get(fieldApi) == null)
+			{
+				pcDateVal = "";
+				if(dealPcDates != null) { pcDateVal = ifnull(dealPcDates.get(stageItem), ""); }
+				if(pcDateVal != "") { dUpd.put(fieldApi, pcDateVal.toString()); }
+				// Store local CRM time without an explicit timezone. XXX stored one hour
+				// behind in BST; literal Z stored one hour ahead; raw DateTime was ignored.
+				else { dUpd.put(fieldApi, zoho.currenttime.toString("yyyy-MM-dd'T'HH:mm:ss")); }
+			}
+		}
+	}
+
+	if(dUpd.size() > 0)
+	{
+		info "Deal updateRecord payload: " + dUpd.toString();
+		dealUpdResp = zoho.crm.updateRecord("Deals", targetDealId.toLong(), dUpd, noTrigger);
+		info "Deal updateRecord resp: " + dealUpdResp;
+	}
+
+	// ---- Account State / Status rollup ----
+	// COM-5: the CLOSE branch may only roll the Account to Lost/Closed when finalDeals was
+	// actually RESOLVED (a valid list response starting with "[" that the loop examined).
+	// An error/NO_CONTENT/null response must NOT be read as "zero open Deals" and silently
+	// close the Account — mirror the viability fail-safe used for the Deal above.
+	finalDeals = zoho.crm.getRelatedRecords("Deals", "Accounts", accountId.toLong());
+	finalDealsResolved = false;
+	anyDealOpen = false;
+	anyDealWorking = false;
+	if(!isNull(finalDeals) && finalDeals.toString().startsWith("["))
+	{
+		finalDealsResolved = true;
+		for each fd in finalDeals
+		{
+			fdId = "";
+			if(!isNull(fd.get("id"))) { fdId = fd.get("id").toString(); }
+			if(fdId != "")
+			{
+				fdFull = zoho.crm.getRecordById("Deals", fdId.toLong());
+				if(!isNull(fdFull) && !isNull(fdFull.get("id")))
+				{
+					fdState  = ifnull(fdFull.get("Opportunity_State"), "").toString();
+					fdStatus = ifnull(fdFull.get("Opportunity_Status"), "").toString();
+					if(fdState == "Open")
+					{
+						anyDealOpen = true;
+						if(fdStatus == "Working") { anyDealWorking = true; }
+					}
+				}
+			}
+		}
+	}
+
+	accUpd = Map();
+	accRecRefresh = zoho.crm.getRecordById("Accounts", accountId.toLong());
+	currState = ifnull(accRecRefresh.get("State"), "");
+	currStatus = ifnull(accRecRefresh.get("Status"), "");
+	if(anyDealOpen)
+	{
+		if(currState != "Open") { accUpd.put("State", "Open"); }
+		targetStatus = if(anyDealWorking, "Working", "New");
+		if(currStatus != targetStatus) { accUpd.put("Status", targetStatus); }
+	}
+	else if(finalDealsResolved)
+	{
+		// CLOSE only with confidence: the Deals related-list resolved and no Deal was Open.
+		if(currState != "Lost") { accUpd.put("State", "Lost"); }
+		if(currStatus != "Closed") { accUpd.put("Status", "Closed"); }
+	}
+	else
+	{
+		// COM-5 fail-safe: Deals related-list unresolved -> skip the Account write, log only.
+		automation.logAutomationEvent("processDeal", "Accounts", accountId, "account_rollup_unresolved", "account_state_unchanged", {"deal":targetDealId});
+	}
+	if(accUpd.size() > 0)
+	{
+		zoho.crm.updateRecord("Accounts", accountId.toLong(), accUpd, noTrigger);
+	}
+
+	// ---- Account customer classification rollup (Account_Status) ----
+	// Deal state + Amount + lifecycle are now committed, so refresh the Account's customer
+	// classification directly. This makes Quote-driven Closed Won (-> Active Customer) and churn
+	// (all Product Deals Lost -> Churned) reflect on Accounts.Account_Status WITHOUT depending on
+	// WF001c firing on Account edits. rollupAccountState writes ONLY Accounts.State (Open/Lost) and
+	// Accounts.Account_Status (Prospect/Active Customer/Churned) trigger-suppressed; it NEVER touches
+	// Accounts.Status (New/Working/Closed, maintained by the operational rollup above).
+	automation.rollupAccountState(accountId);
+
+	// ===================================================================
+	// 11. Term-completion transition gates (route AT MOST ONE; verify by re-read)
+	//     Quote-source reconciliations never route a transition (handled by adapter).
+	// ===================================================================
+	// Refresh primary Contact + Deal post-write for accurate gate evaluation.
+	dealPost = zoho.crm.getRecordById("Deals", targetDealId.toLong());
+	dealOppStageNow = ifnull(dealPost.get("Opportunity_Stage"), "").toString();
+	primaryStageNow = "";
+	if(primaryContactId != "")
+	{
+		pcRec = zoho.crm.getRecordById("Contacts", primaryContactId.toLong());
+		if(!isNull(pcRec) && !isNull(pcRec.get("id"))) { primaryStageNow = ifnull(pcRec.get("Stage"), "").toString(); }
+	}
+
+	// Re-read the relevant Quotes fresh: §9 may have demoted a Confirmed Quote to On Hold
+	// (missing dates), and §5 updates changed Quoted_Items. The §7 relevantQuotes snapshot is
+	// stale for stage-gating, so rebuild it from live records before evaluating the gates.
+	relevantQuotes = List();
+	// SIGNING-VERIFIED (oppType-agnostic): the FTP->RTP quoteOppType flip at the RTP floor
+	// EXCLUDES the initial FTP quote from relevantQuotes, so termComplete is false at the signing
+	// crossing (this is why the signed-confirmation gate on termComplete never fired). This flag
+	// verifies signing independently: a Confirmed/Closed-Won quote for the Deal's CURRENT term
+	// (matching Contract_Current_Date), regardless of Opportunity_Type. Used by the
+	// signed-confirmation dispatch below.
+	signedTermExists = false;
+	sigTermStart = ifnull(dealPost.get("Contract_Current_Date_Start"), "").toString();
+	sigTermEnd = ifnull(dealPost.get("Contract_Current_Date_End"), "").toString();
+	gateQuotes = zoho.crm.getRelatedRecords("Quotes", "Deals", targetDealId.toLong());
+	if(gateQuotes != null && gateQuotes.size() > 0 && !gateQuotes.toString().startsWith("{\"code\""))
+	{
+		for each gq in gateQuotes
+		{
+			gqId = "";
+			if(!isNull(gq.get("id"))) { gqId = gq.get("id").toString(); }
+			if(gqId == "") { continue; }
+			gqFull = zoho.crm.getRecordById("Quotes", gqId.toLong());
+			if(isNull(gqFull) || isNull(gqFull.get("id"))) { continue; }
+			sgStg = ifnull(gqFull.get("Quote_Stage"), "").toString();
+			if((sgStg == "Confirmed" || sgStg == "Closed Won") && sigTermStart != "" && ifnull(gqFull.get("Contract_Date_Start"), "").toString() == sigTermStart && ifnull(gqFull.get("Contract_Date_End"), "").toString() == sigTermEnd) { signedTermExists = true; }
+			if(ifnull(gqFull.get("Opportunity_Type"), "").toString() == quoteOppType) { relevantQuotes.add(gqFull); }
+		}
+	}
+
+	// re-derive relevant Quote stage picture (effective OppType, non-Closed-Lost activity-updatable)
+	relUpdatableCount = 0;
+	relDeliveredCount = 0;
+	relDraftOrHold = 0;
+	relNonDelivered = 0;
+	for each rq in relevantQuotes
+	{
+		rqStg = ifnull(rq.get("Quote_Stage"), "").toString();
+		if(rqStg == "Closed Lost") { continue; }
+		if(rqStg == "Draft" || rqStg == "Negotiation" || rqStg == "Delivered" || rqStg == "On Hold")
+		{
+			relUpdatableCount = relUpdatableCount + 1;
+			if(rqStg == "Delivered") { relDeliveredCount = relDeliveredCount + 1; }
+			if(rqStg == "Draft" || rqStg == "On Hold") { relDraftOrHold = relDraftOrHold + 1; }
+			if(rqStg != "Delivered") { relNonDelivered = relNonDelivered + 1; }
+		}
+	}
+
+	// termComplete for the CURRENT effective term: termQuoteCount>0 AND every non-Closed-Lost quote for the
+	// effective-OppType current-date term is Confirmed/Closed Won.
+	termQuoteCount = 0;
+	termAllConfirmed = true;
+	curTermStart = ifnull(dealPost.get("Contract_Current_Date_Start"), "").toString();
+	curTermEnd = ifnull(dealPost.get("Contract_Current_Date_End"), "").toString();
+	for each rq in relevantQuotes
+	{
+		rqStg = ifnull(rq.get("Quote_Stage"), "").toString();
+		if(rqStg == "Closed Lost") { continue; }
+		rqStart = ifnull(rq.get("Contract_Date_Start"), "").toString();
+		rqEnd = ifnull(rq.get("Contract_Date_End"), "").toString();
+		if(curTermStart != "" && rqStart == curTermStart && rqEnd == curTermEnd)
+		{
+			termQuoteCount = termQuoteCount + 1;
+			if(rqStg != "Confirmed" && rqStg != "Closed Won") { termAllConfirmed = false; }
+		}
+	}
+	termComplete = (termQuoteCount > 0 && termAllConfirmed);
+
+	// =========================================================================
+	// SIGNED-CONFIRMATION EMAIL — SINGLE AUTHORITATIVE DISPATCH (Onboarding floor-crossing).
+	// Fires exactly when THIS reconcile advanced the Deal into Onboarding for the FIRST time
+	// (crossedIntoOnboarding, set at the RTP-floor stage write in section 8) AND the signing is
+	// verified (signedTermExists: a Confirmed/Closed-Won Quote for the current term). We use
+	// signedTermExists, NOT termComplete: at the floor crossing the RTP floor has flipped
+	// quoteOppType to RTP, so the initial FTP Quote is excluded from the termComplete quote set
+	// and termComplete reads false exactly when signing occurs. signedTermExists is oppType-agnostic.
+	//
+	// This is the REAL signing path. The discrete commercial:signed trigger never fires: the RTP
+	// floor writes Opportunity_Stage=Onboarding before that gate is evaluated, so its
+	// primaryStageNow=="Commercial Agreement" precondition is already false (proven live
+	// 2026-07-20 via the Contact Stage audit trail + handleCallOutcome function log).
+	//
+	// Placed OUTSIDE if(!isQuoteSrc) so whichever reconcile performs the crossing (quote- or
+	// activity-source) dispatches it, and BEFORE the (now-dead) commercial:signed branch below.
+	// sendSequencedEmail is the SOLE sender and owns SendKey dedup + its own blocked/failed
+	// Manual Reviews: a repeat reconcile finds the audit and idempotency-skips (no duplicate
+	// email/task), and a genuine block/failure raises a visible review rather than vanishing.
+	// crossedIntoOnboarding is true on exactly one reconcile (the never-regress floor prevents a
+	// second crossing), so this dispatches once.
+	// =========================================================================
+	if(crossedIntoOnboarding && signedTermExists && primaryContactId != "")
+	{
+		automation.logAutomationEvent("processDeal", "Contacts", primaryContactId, "signed_confirmation_selected", "commercials_signed_confirmation", {"deal":targetDealId, "stage":"Onboarding", "trigger":"onboarding_floor_crossing"});
+		sigMsgId = automation.sendSequencedEmail(primaryContactId, targetDealId, "Onboarding", 0, "commercials_signed_confirmation", "", "");
+		sigResult = "not_sent_or_idempotent";
+		if(ifnull(sigMsgId, "").toString() != "") { sigResult = "sent"; }
+		automation.logAutomationEvent("processDeal", "Contacts", primaryContactId, "signed_confirmation_dispatch", sigResult, {"deal":targetDealId, "stage":"Onboarding", "message_id":ifnull(sigMsgId, "").toString()});
+	}
+
+	routedTransition = "";
+
+	// Only an activity-source reconciliation may route a transition. Quote-source recompute-only.
+	if(!isQuoteSrc)
+	{
+		// ---- Signed -> commercial:signed (term complete) ----
+		if(termComplete && primaryStageNow == "Commercial Agreement" && dealOppStageNow == "Commercial Agreement")
+		{
+			routedTransition = "commercial:signed";
+			automation.routeContactSequence(primaryContactId, targetDealId, "commercial:signed", "{}");
+			// verify: Stage at Onboarding/Renewal AND Deal at/above RTP floor
+			pcV = zoho.crm.getRecordById("Contacts", primaryContactId.toLong());
+			dealV = zoho.crm.getRecordById("Deals", targetDealId.toLong());
+			pcStageV = ifnull(pcV.get("Stage"), "").toString();
+			dealStageV = ifnull(dealV.get("Opportunity_Stage"), "").toString();
+			dealRankV = ifnull(stageRanks.get(dealStageV), 0).toLong();
+			if((pcStageV == "Onboarding" || pcStageV == "Renewal") && dealRankV >= onboardingRank)
+			{
+				// NOTE: the signed-confirmation email is NO LONGER dispatched from this
+				// commercial:signed branch. This lifecycle reaches Onboarding via the RTP
+				// floor recompute (section 6b), NOT this trigger — the floor writes
+				// Opportunity_Stage=Onboarding before this gate is ever evaluated, so
+				// primaryStageNow=="Commercial Agreement" is already false and this branch
+				// is dead for the confirmed-Quote + completed-Call path (proven live 2026-07-20).
+				// The single authoritative dispatch now lives at the Onboarding floor-crossing
+				// in section 6b (search: signed_confirmation_selected). This branch is left
+				// intact (routing + verify) but performs no email dispatch.
+				result.put("transitionRouted", true);
+				result.put("routedTrigger", "commercial:signed");
+				result.put("success", true);
+				result.put("outcome", "transition_routed");
+				return result.toString();
+			}
+			else
+			{
+				result.put("transitionRouted", false);
+				result.put("routedTrigger", "");
+				result.put("reviewRequired", true);
+				if(!reviewReasons.contains("commercial_transition_failed")) { reviewReasons.add("commercial_transition_failed"); }
+				automation.createAuxTask(primaryContactId, targetDealId, "Manual Review", "commercial:signed routed but the expected Stage transition (Onboarding/Renewal at/above RTP) was not observed on re-read. Investigate the sequence router.");
+				result.put("success", false);
+				result.put("outcome", "transition_not_applied");
+				return result.toString();
+			}
+		}
+		// ---- Delivered -> commercial:sent ----
+		else if(relDeliveredCount >= 1 && relDraftOrHold == 0 && relNonDelivered == 0 && primaryStageNow == "Proposal Preparation" && dealOppStageNow == "Proposal Preparation")
+		{
+			routedTransition = "commercial:sent";
+			automation.routeContactSequence(primaryContactId, targetDealId, "commercial:sent", "{}");
+			// verify: both at Commercial Agreement
+			pcV = zoho.crm.getRecordById("Contacts", primaryContactId.toLong());
+			dealV = zoho.crm.getRecordById("Deals", targetDealId.toLong());
+			pcStageV = ifnull(pcV.get("Stage"), "").toString();
+			dealStageV = ifnull(dealV.get("Opportunity_Stage"), "").toString();
+			if(pcStageV == "Commercial Agreement" && dealStageV == "Commercial Agreement")
+			{
+				result.put("transitionRouted", true);
+				result.put("routedTrigger", "commercial:sent");
+				result.put("success", true);
+				result.put("outcome", "transition_routed");
+				return result.toString();
+			}
+			else
+			{
+				result.put("transitionRouted", false);
+				result.put("routedTrigger", "");
+				result.put("reviewRequired", true);
+				if(!reviewReasons.contains("commercial_transition_failed")) { reviewReasons.add("commercial_transition_failed"); }
+				automation.createAuxTask(primaryContactId, targetDealId, "Manual Review", "commercial:sent routed but both records did not reach Commercial Agreement on re-read. Investigate the sequence router.");
+				result.put("success", false);
+				result.put("outcome", "transition_not_applied");
+				return result.toString();
+			}
+		}
+	}
+
+	// ===================================================================
+	// 12. Normal return (no transition routed)
+	// ===================================================================
+	result.put("success", true);
+	if(ifnull(result.get("reviewRequired"), false) == true)
+	{
+		result.put("outcome", "reconciled_with_review");
+	}
+	else
+	{
+		result.put("outcome", "reconciled");
+	}
+	automation.logAutomationEvent("processDeal", "Deals", targetDealId, "done", ifnull(result.get("outcome"), "").toString(), {"amount":totalAmount.toString(), "quoteCount":quoteCount.toString(), "routed":routedTransition});
+	return result.toString();
+}

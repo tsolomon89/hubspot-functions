@@ -1,0 +1,14 @@
+void automation.handleEmailClicked(string relatedDealIdStr, string relatedContactIdStr)
+{
+	// =========================================================================
+	// handleEmailClicked — WF009e wrapper
+	//
+	// Thin entry point invoked by WF009e (Emails / Outgoing email / Clicked).
+	// Delegates to handleEmailEvent with eventType="clicked" hardcoded so the
+	// workflow UI does not bind a static literal that becomes immutable post-
+	// save. emailRecordIdStr is hardcoded to "0" because the Emails module
+	// exposes no Id merge field; the core only uses it for logging.
+	// =========================================================================
+
+	automation.handleEmailEvent("0", "clicked", relatedDealIdStr, relatedContactIdStr);
+}

@@ -1,0 +1,14 @@
+void automation.handleEmailReplied(string relatedDealIdStr, string relatedContactIdStr)
+{
+	// =========================================================================
+	// handleEmailReplied — WF009a wrapper
+	//
+	// Thin entry point invoked by WF009a (Emails / Outgoing email / Replied).
+	// Delegates to handleEmailEvent with eventType="replied" hardcoded so the
+	// workflow UI does not bind a static literal that becomes immutable post-
+	// save. emailRecordIdStr is hardcoded to "0" because the Emails module
+	// exposes no Id merge field; the core only uses it for logging.
+	// =========================================================================
+
+	automation.handleEmailEvent("0", "replied", relatedDealIdStr, relatedContactIdStr);
+}

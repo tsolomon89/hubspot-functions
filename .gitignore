@@ -1,0 +1,29 @@
+# Node.js & Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dist/
+
+# HubSpot CLI Credentials & Local Config
+.env
+.env.*
+!.env.example
+hubspot.config.yml
+.hscli/
+*.pem
+
+# Data Safety & Production CRM Exports
+*.csv
+**/*.csv
+.agents/context/example_data/
+.agents/context/import_tests/
+
+# Scratch & Temporary Directories
+scratch/
+tmp/
+*.log
+
+# OS Metadata
+.DS_Store
+Thumbs.db
