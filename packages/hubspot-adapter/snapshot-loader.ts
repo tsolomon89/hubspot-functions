@@ -71,6 +71,9 @@ export class HubSpotSnapshotLoader {
       ]);
       const cProps = contact.properties || {};
 
+      let companySuppressed = false;
+      let compRelKey = '';
+
       try {
         const companyAssocs = await this.client.crm.associations.v4.basicApi.getPage(
           'contact',
@@ -79,35 +82,48 @@ export class HubSpotSnapshotLoader {
         );
         if (companyAssocs.results && companyAssocs.results.length > 0) {
           companyKey = String(companyAssocs.results[0].toObjectId);
+          
+          // Hydrate associated Company details for suppression aggregation & B2B canonical key check
+          try {
+            const compRecord = await this.client.crm.companies.basicApi.getById(companyKey, [
+              'coa_relationship_key',
+              'coa_automation_suppressed'
+            ]);
+            compRelKey = compRecord.properties?.coa_relationship_key || '';
+            companySuppressed = compRecord.properties?.coa_automation_suppressed === 'true' || compRecord.properties?.coa_automation_suppressed === '1';
+          } catch (err: any) {
+            if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+          }
         }
       } catch (err: any) {
         if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      // Canonical Relationship Key Resolution: if Contact lacks coa_relationship_key, attempt Company lookup before fallback
-      relationshipKey = cProps.coa_relationship_key || '';
-      if (!relationshipKey && companyKey) {
-        try {
-          const compRecord = await this.client.crm.companies.basicApi.getById(companyKey, ['coa_relationship_key']);
-          if (compRecord.properties?.coa_relationship_key) {
-            relationshipKey = compRecord.properties.coa_relationship_key;
-          }
-        } catch (err: any) {
-          if (err?.statusCode !== 404 && err?.status !== 404) throw err;
-        }
+      // B2B Canonical Relationship Resolution & Mismatch Fail-Closed Gate
+      const contactRelKey = cProps.coa_relationship_key || '';
+      let relationshipMismatch = false;
+
+      if (relationshipType === 'b2b' && contactRelKey && compRelKey && contactRelKey !== compRelKey) {
+        relationshipMismatch = true;
+        logger.error('B2B Relationship Key Mismatch between Contact and associated Company', { contactRelKey, compRelKey });
       }
-      if (!relationshipKey) {
-        relationshipKey = companyKey ? `comp_${companyKey}` : `cnt_${recordRef.objectId}`;
+
+      if (relationshipType === 'b2b' && compRelKey) {
+        relationshipKey = compRelKey;
+      } else {
+        relationshipKey = contactRelKey || compRelKey || (companyKey ? `comp_${companyKey}` : `cnt_${recordRef.objectId}`);
       }
 
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
+      const contactSuppressed = cProps.coa_automation_suppressed === 'true' || cProps.coa_automation_suppressed === '1';
       facts = {
-        email: cProps.email,
-        contactEmail: cProps.email,
-        lifecycleStage: cProps.lifecyclestage,
+        email: cProps.email || undefined,
+        contactEmail: cProps.email || undefined,
+        lifecycleStage: cProps.lifecyclestage || undefined,
         marketingConsent: cProps.coa_marketing_consent === 'true' || cProps.coa_marketing_consent === '1',
-        automationSuppressed: cProps.coa_automation_suppressed === 'true' || cProps.coa_automation_suppressed === '1'
+        automationSuppressed: Boolean(contactSuppressed || companySuppressed || relationshipMismatch),
+        relationshipKeyMismatch: relationshipMismatch
       };
       openedAt = parseHubSpotTimestamp(cProps.createdate) || openedAt;
 
@@ -127,6 +143,10 @@ export class HubSpotSnapshotLoader {
       ]);
       const compProps = company.properties || {};
 
+      let contactSuppressed = false;
+      let contactEmail: string | undefined = undefined;
+      let contactRelKey = '';
+
       try {
         const contactAssocs = await this.client.crm.associations.v4.basicApi.getPage(
           'company',
@@ -135,20 +155,46 @@ export class HubSpotSnapshotLoader {
         );
         if (contactAssocs.results && contactAssocs.results.length > 0) {
           contactKeys = contactAssocs.results.map(r => String(r.toObjectId));
+          
+          // Hydrate primary Contact details for suppression aggregation & email
+          try {
+            const primaryContact = await this.client.crm.contacts.basicApi.getById(contactKeys[0], [
+              'email',
+              'coa_relationship_key',
+              'coa_automation_suppressed'
+            ]);
+            contactEmail = primaryContact.properties?.email || undefined;
+            contactRelKey = primaryContact.properties?.coa_relationship_key || '';
+            contactSuppressed = primaryContact.properties?.coa_automation_suppressed === 'true' || primaryContact.properties?.coa_automation_suppressed === '1';
+          } catch (err: any) {
+            if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+          }
         }
       } catch (err: any) {
         if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      relationshipKey = compProps.coa_relationship_key || `comp_${recordRef.objectId}`;
+      const compRelKey = compProps.coa_relationship_key || '';
+      let relationshipMismatch = false;
+
+      if (relationshipType === 'b2b' && compRelKey && contactRelKey && compRelKey !== contactRelKey) {
+        relationshipMismatch = true;
+        logger.error('B2B Relationship Key Mismatch between Company and primary Contact', { compRelKey, contactRelKey });
+      }
+
+      relationshipKey = compRelKey || contactRelKey || `comp_${recordRef.objectId}`;
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
+      const compSuppressed = compProps.coa_automation_suppressed === 'true' || compProps.coa_automation_suppressed === '1';
       facts = {
-        domain: compProps.domain,
-        companyName: compProps.name,
-        lifecycleStage: compProps.lifecyclestage,
+        domain: compProps.domain || undefined,
+        companyName: compProps.name || undefined,
+        email: contactEmail,
+        contactEmail: contactEmail,
+        lifecycleStage: compProps.lifecyclestage || undefined,
         marketingConsent: compProps.coa_marketing_consent === 'true' || compProps.coa_marketing_consent === '1',
-        automationSuppressed: compProps.coa_automation_suppressed === 'true' || compProps.coa_automation_suppressed === '1'
+        automationSuppressed: Boolean(compSuppressed || contactSuppressed || relationshipMismatch),
+        relationshipKeyMismatch: relationshipMismatch
       };
       openedAt = parseHubSpotTimestamp(compProps.createdate) || openedAt;
 
@@ -293,7 +339,7 @@ export class HubSpotSnapshotLoader {
       throw new Error(`INVALID_ENROLLMENT: Unsupported objectType '${recordRef.objectType}'`);
     }
 
-    // Hydrate subject contact facts
+    // Hydrate subject contact & company suppression for Lead/Deal enrollment
     if (contactKeys.length > 0) {
       try {
         const primaryContact = await this.client.crm.contacts.basicApi.getById(contactKeys[0], [
@@ -309,6 +355,17 @@ export class HubSpotSnapshotLoader {
           facts.marketingConsent = true;
         }
         if (pcProps.coa_automation_suppressed === 'true' || pcProps.coa_automation_suppressed === '1') {
+          facts.automationSuppressed = true;
+        }
+      } catch (err: any) {
+        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+      }
+    }
+
+    if (companyKey) {
+      try {
+        const compRecord = await this.client.crm.companies.basicApi.getById(companyKey, ['coa_automation_suppressed']);
+        if (compRecord.properties?.coa_automation_suppressed === 'true' || compRecord.properties?.coa_automation_suppressed === '1') {
           facts.automationSuppressed = true;
         }
       } catch (err: any) {
