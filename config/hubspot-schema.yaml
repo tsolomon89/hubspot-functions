@@ -351,6 +351,23 @@ pipelines:
           stageId: "disqualified"
           displayOrder: 4
 
+    - name: "B2C Qualification Lead Pipeline"
+      pipelineId: "b2c_qualification_lead_pipeline"
+      displayOrder: 2
+      stages:
+        - label: "MQL"
+          stageId: "mql"
+          displayOrder: 1
+        - label: "SQL"
+          stageId: "sql"
+          displayOrder: 2
+        - label: "Qualified"
+          stageId: "qualified"
+          displayOrder: 3
+        - label: "Disqualified"
+          stageId: "disqualified"
+          displayOrder: 4
+
   deals:
     - name: "B2B Transaction Deal Pipeline"
       pipelineId: "b2b_transaction_deal_pipeline"
@@ -361,6 +378,26 @@ pipelines:
           displayOrder: 1
           metadata:
             probability: 0.20
+        - label: "Closed Won"
+          stageId: "closedwon"
+          displayOrder: 2
+          metadata:
+            probability: 1.00
+        - label: "Closed Lost"
+          stageId: "closedlost"
+          displayOrder: 3
+          metadata:
+            probability: 0.00
+
+    - name: "B2C Transaction Deal Pipeline"
+      pipelineId: "b2c_transaction_deal_pipeline"
+      displayOrder: 2
+      stages:
+        - label: "Open"
+          stageId: "open"
+          displayOrder: 1
+          metadata:
+            probability: 0.50
         - label: "Closed Won"
           stageId: "closedwon"
           displayOrder: 2

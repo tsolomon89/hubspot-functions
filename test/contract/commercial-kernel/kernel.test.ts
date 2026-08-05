@@ -16,8 +16,9 @@ describe('Pure Commercial Kernel Contract Tests', () => {
       MQL: [{
         key: 'mql_consent',
         name: 'Consent',
+        predicate: 'property',
         scope: 'relationship',
-        predicates: [{ predicate: 'marketingConsent', value: true }]
+        params: { property: 'marketingConsent', equals: true }
       }],
       SQL: [],
       FTP: [],
@@ -50,7 +51,7 @@ describe('Pure Commercial Kernel Contract Tests', () => {
     expect(evaluation.unsatisfiedGoalKeys).toHaveLength(0);
   });
 
-  it('should evaluate MQL qualification as PENDING when marketing consent is missing', () => {
+  it('should evaluate MQL qualification as PENDING when marketing consent is false', () => {
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_test',
       relationshipKey: 'rel_123',
@@ -129,14 +130,14 @@ describe('Pure Commercial Kernel Contract Tests', () => {
           id: 'ev_1',
           predicate: 'activityExists',
           scope: 'opportunity',
-          occurredAt: '2026-08-01T12:00:00Z', // Before predecessor completion
+          occurredAt: '2026-08-01T12:00:00Z',
           data: { activityType: 'MEETING' }
         },
         {
           id: 'ev_2',
           predicate: 'activityExists',
           scope: 'opportunity',
-          occurredAt: '2026-08-03T12:00:00Z', // After predecessor completion
+          occurredAt: '2026-08-03T12:00:00Z',
           data: { activityType: 'MEETING' }
         }
       ]

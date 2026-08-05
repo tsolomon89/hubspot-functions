@@ -10,6 +10,10 @@ hubspotPipelines:
     closedwon: 1.00
     closedlost: 0.00
 
+offeringPolicy:
+  productOfferingKeyProperty: "hs_sku"
+  rtpPolicy: "carryForward"
+
 goalsByOpportunityType:
   MQL:
     - key: "b2b_marketing_consent"
@@ -30,14 +34,14 @@ goalsByOpportunityType:
         outcome: "COMPLETED"
 
   FTP:
-    - key: "b2b_contract_signed"
-      name: "First B2B transaction contract signed"
+    - key: "b2b_deal_closed_won"
+      name: "First B2B transaction deal closed won"
       predicate: "transactionExists"
       scope: "opportunity"
 
   RTP:
-    - key: "b2b_renewal_order"
-      name: "Subsequent B2B transaction order"
+    - key: "b2b_deal_closed_won_repeat"
+      name: "Subsequent B2B transaction deal closed won"
       predicate: "transactionExists"
       scope: "sincePredecessorCompletion"
 

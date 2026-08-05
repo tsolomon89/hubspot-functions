@@ -70,6 +70,13 @@ export function injectUniversalGoals(config: QualificationConfig): Qualification
   };
 }
 
+export function parseInstant(val?: string | number): number {
+  if (!val) return 0;
+  if (typeof val === 'number') return val;
+  const parsed = Date.parse(val);
+  return isNaN(parsed) ? 0 : parsed;
+}
+
 export function evaluateSinglePredicate(
   predicateName: string,
   params: Record<string, unknown> | undefined,
@@ -84,9 +91,9 @@ export function evaluateSinglePredicate(
     }
     case 'hasIdentity':
     case 'anyCommunicationChannel': {
-      const email = snapshot.facts.email || snapshot.facts.contactEmail;
-      const phone = snapshot.facts.phone;
-      const satisfied = Boolean(email || phone);
+      const email = snapshot.facts.email || snapshot.facts.contactEmail || (snapshot.subject.kind === 'CONTACT' && snapshot.subject.email);
+      const phone = snapshot.facts.phone || (snapshot.subject.kind === 'CONTACT' && snapshot.subject.phone);
+      const satisfied = Boolean((email && String(email).trim() !== '') || (phone && String(phone).trim() !== ''));
       return { satisfied, evidenceRefs: satisfied ? ['fact_communication_channel'] : [] };
     }
     case 'marketingConsent': {
@@ -95,12 +102,13 @@ export function evaluateSinglePredicate(
     }
     case 'hasOfferingInterest':
     case 'offeringKnown': {
+      const hasSnapshotOfferings = Boolean(snapshot.offerings && snapshot.offerings.length > 0);
       const products = snapshot.facts.products || snapshot.facts.offeringKeys || snapshot.facts.offering || snapshot.facts.lineItems;
-      const hasOffering = Array.isArray(products) ? products.length > 0 : Boolean(products);
-      const evMatches = matchingEvidence.filter(e => e.predicate === 'offeringKnown' || e.data?.productKey);
-      const satisfied = hasOffering || evMatches.length > 0;
+      const hasOfferingFact = Array.isArray(products) ? products.length > 0 : Boolean(products);
+      const evMatches = matchingEvidence.filter(e => e.predicate === 'offeringKnown' || e.data?.productKey || e.data?.offeringKey);
+      const satisfied = hasSnapshotOfferings || hasOfferingFact || evMatches.length > 0;
       const refs = evMatches.map(e => e.id);
-      if (hasOffering) refs.push('fact_offering_known');
+      if (hasSnapshotOfferings || hasOfferingFact) refs.push('fact_offering_known');
       return { satisfied, evidenceRefs: refs };
     }
     case 'activityExists': {
@@ -123,10 +131,11 @@ export function evaluateSinglePredicate(
       const evMatches = matchingEvidence.filter(e => e.predicate === 'transactionExists' || e.data?.transactionId || e.data?.orderId);
       
       let hasFactTransaction = false;
-      if (snapshot.facts.transactionCompleted === true || snapshot.facts.stage === 'closedwon') {
-        const factTxTime = (snapshot.facts.transactionCompletedAt as string) || snapshot.openedAt;
+      if (snapshot.facts.transactionCompleted === true || snapshot.facts.stage === 'closedwon' || snapshot.opportunityState === 'WON') {
+        const factTxTime = parseInstant((snapshot.facts.transactionCompletedAt as string) || snapshot.openedAt);
         if (scope === 'sincePredecessorCompletion') {
-          hasFactTransaction = Boolean(snapshot.predecessorCompletedAt && factTxTime >= snapshot.predecessorCompletedAt);
+          const predTime = parseInstant(snapshot.predecessorCompletedAt);
+          hasFactTransaction = Boolean(predTime > 0 && factTxTime >= predTime);
         } else {
           hasFactTransaction = true;
         }
@@ -136,6 +145,15 @@ export function evaluateSinglePredicate(
       const refs = evMatches.map(e => e.id);
       if (hasFactTransaction) refs.push('fact_transaction_completed');
       return { satisfied, evidenceRefs: refs };
+    }
+    case 'count': {
+      const targetPredicate = params?.targetPredicate as string;
+      const minCount = Number(params?.minCount ?? 1);
+      const maxCount = params?.maxCount !== undefined ? Number(params.maxCount) : Infinity;
+      const filtered = matchingEvidence.filter(e => e.predicate === targetPredicate);
+      const count = filtered.length;
+      const satisfied = count >= minCount && count <= maxCount;
+      return { satisfied, evidenceRefs: satisfied ? filtered.map(e => e.id) : [] };
     }
     case 'property': {
       const propName = params?.property as string;
@@ -163,7 +181,7 @@ export function evaluateSinglePredicate(
       return { satisfied, evidenceRefs: satisfied ? [`fact_prop_${propName}`] : [] };
     }
     default:
-      return { satisfied: false, evidenceRefs: [] };
+      throw new Error(`UNKNOWN_PREDICATE_ERROR: Evaluator received unsupported predicate '${predicateName}'`);
   }
 }
 
@@ -171,35 +189,57 @@ export function evaluatePredicate(
   goal: GoalDefinition,
   snapshot: OpportunitySnapshot
 ): { satisfied: boolean; manualReviewRequired?: boolean; evidenceRefs: string[] } {
-  // Enforce evidence window scope rules
+  // Enforce evidence window scope rules with strict instant parsing
+  const openedAtInstant = parseInstant(snapshot.openedAt);
+  const predecessorCompletedAtInstant = parseInstant(snapshot.predecessorCompletedAt);
+
   const matchingEvidence = snapshot.evidence.filter(ev => {
-    if (goal.scope === 'opportunity' && ev.occurredAt < snapshot.openedAt) {
+    const evInstant = parseInstant(ev.occurredAt);
+    if (goal.scope === 'opportunity' && openedAtInstant > 0 && evInstant < openedAtInstant) {
       return false;
     }
     if (goal.scope === 'sincePredecessorCompletion') {
-      if (!snapshot.predecessorCompletedAt || ev.occurredAt < snapshot.predecessorCompletedAt) {
+      if (!predecessorCompletedAtInstant || evInstant < predecessorCompletedAtInstant) {
         return false;
       }
     }
     return true;
   });
 
-  const predicatesList = goal.predicates && goal.predicates.length > 0 
-    ? goal.predicates.map(p => ({ predicate: p.predicate, params: { ...goal.params, ...p, equals: (p as any).value ?? goal.params?.equals } }))
-    : [{ predicate: goal.predicate || 'property', params: goal.params }];
-
-  let allSatisfied = true;
-  let manualReviewRequired = false;
-  const allRefs: string[] = [];
-
-  for (const pred of predicatesList) {
-    const res = evaluateSinglePredicate(pred.predicate, pred.params, goal.scope, snapshot, matchingEvidence);
-    if (res.manualReviewRequired) manualReviewRequired = true;
-    if (!res.satisfied) allSatisfied = false;
-    allRefs.push(...res.evidenceRefs);
+  // Handle recursive composition: all, any, not
+  if (goal.predicate === 'all') {
+    const subGoals = goal.conditions || [];
+    const allRefs: string[] = [];
+    for (const sub of subGoals) {
+      const res = evaluatePredicate(sub, snapshot);
+      if (res.manualReviewRequired) return { satisfied: false, manualReviewRequired: true, evidenceRefs: [] };
+      if (!res.satisfied) return { satisfied: false, evidenceRefs: [] };
+      allRefs.push(...res.evidenceRefs);
+    }
+    return { satisfied: true, evidenceRefs: allRefs };
   }
 
-  return { satisfied: allSatisfied, manualReviewRequired, evidenceRefs: allRefs };
+  if (goal.predicate === 'any') {
+    const subGoals = goal.conditions || [];
+    const allRefs: string[] = [];
+    for (const sub of subGoals) {
+      const res = evaluatePredicate(sub, snapshot);
+      if (res.satisfied) {
+        allRefs.push(...res.evidenceRefs);
+        return { satisfied: true, evidenceRefs: allRefs };
+      }
+    }
+    return { satisfied: false, evidenceRefs: [] };
+  }
+
+  if (goal.predicate === 'not') {
+    const subGoals = goal.conditions || [];
+    if (subGoals.length === 0) return { satisfied: false, evidenceRefs: [] };
+    const res = evaluatePredicate(subGoals[0], snapshot);
+    return { satisfied: !res.satisfied, evidenceRefs: res.satisfied ? [] : ['fact_not_satisfied'] };
+  }
+
+  return evaluateSinglePredicate(goal.predicate, goal.params, goal.scope, snapshot, matchingEvidence);
 }
 
 export function evaluateOpportunity(

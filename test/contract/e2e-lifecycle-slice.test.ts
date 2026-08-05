@@ -15,14 +15,15 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       MQL: [{
         key: 'mql_consent',
         name: 'Consent',
+        predicate: 'property',
         scope: 'relationship',
-        predicates: [{ predicate: 'marketingConsent', value: true }]
+        params: { property: 'marketingConsent', equals: true }
       }],
       SQL: [{
         key: 'sql_offering',
         name: 'Offering Known',
-        scope: 'relationship',
-        predicates: [{ predicate: 'offeringKnown', value: true }]
+        predicate: 'offeringKnown',
+        scope: 'opportunity'
       }],
       FTP: [],
       RTP: []

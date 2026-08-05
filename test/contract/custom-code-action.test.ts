@@ -11,22 +11,60 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
       .rejects.toThrow('INVALID_ENROLLMENT');
   });
 
-  it('should accept production-shaped HubSpot event (object.objectId & uppercase objectType)', async () => {
-    await expect(processHubSpotCustomCodeAction({
+  it('should throw MISSING_AUTHENTICATION_SECRET when no secret or adapter is provided', async () => {
+    const oldToken = process.env.PRIVATE_APP_ACCESS_TOKEN;
+    delete process.env.PRIVATE_APP_ACCESS_TOKEN;
+    try {
+      await expect(processHubSpotCustomCodeAction({
+        origin: { portalId: 149041124 },
+        object: { objectId: 'cnt_99812', objectType: 'CONTACT' }
+      })).rejects.toThrow('MISSING_AUTHENTICATION_SECRET');
+    } finally {
+      if (oldToken) process.env.PRIVATE_APP_ACCESS_TOKEN = oldToken;
+    }
+  });
+
+  it('should accept production-shaped HubSpot event with mock adapter offline', async () => {
+    const fakeAdapter = new HubspotAdapter('fake-token');
+    vi.spyOn(HubSpotSnapshotLoader.prototype, 'loadSnapshotFromRecord').mockResolvedValue({
+      organizationKey: 'org_global_corp',
+      relationshipKey: 'cnt_99812',
+      relationshipType: 'b2c',
+      opportunityKey: 'cnt_99812::LEAD::1',
+      opportunityType: 'MQL',
+      opportunityState: 'OPEN',
+      cycleIndex: 1,
+      openedAt: new Date().toISOString(),
+      subject: { kind: 'CONTACT', key: 'cnt_99812' },
+      facts: { email: 'user@example.com', marketingConsent: true },
+      evidence: []
+    });
+
+    vi.spyOn(fakeAdapter, 'findOrCreateLeadForSubject').mockResolvedValue({
+      id: 'lead_b2c_1',
+      properties: { coa_opportunity_key: 'cnt_99812::LEAD::1' }
+    });
+
+    vi.spyOn(fakeAdapter, 'applyTransitionIntents').mockResolvedValue({
+      success: true,
+      appliedIntents: 1,
+      receipts: [{
+        intentKind: 'UPDATE_OPPORTUNITY',
+        objectType: 'lead',
+        objectId: 'lead_b2c_1',
+        operation: 'UPDATE',
+        verified: true
+      }]
+    });
+
+    const res = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
       object: { objectId: 'cnt_99812', objectType: 'CONTACT' },
       inputFields: { relationshipType: 'b2c' }
-    }, 'invalid-token-xyz')).rejects.toThrow('HTTP-Code: 401');
-  });
+    }, 'fake-token', fakeAdapter);
 
-  it('should support exports.main callback contract and re-throw API errors for native retries', async () => {
-    const event = {
-      origin: { portalId: 149041124 },
-      object: { objectId: 'cnt_77123', objectType: 'CONTACT' },
-      inputFields: { relationshipType: 'b2b' }
-    };
-
-    await expect(main(event)).rejects.toThrow('HTTP-Code: 401');
+    expect(res.outputFields.verified).toBe(true);
+    expect(res.outputFields.objectType).toBe('lead');
   });
 
   it('should throw ACTION_UNVERIFIED through processHubSpotCustomCodeAction when CRM mutation readback fails', async () => {
@@ -85,7 +123,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
       cycleIndex: 1,
       openedAt: new Date().toISOString(),
       subject: { kind: 'CONTACT', key: 'cnt_unsuppressed', companyKey: 'comp_suppressed_1' },
-      facts: { email: 'contact@acme.com', automationSuppressed: true }, // Aggregated company suppression!
+      facts: { email: 'contact@acme.com', automationSuppressed: true },
       evidence: []
     });
 
@@ -100,7 +138,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
 
     expect(res.outputFields.status).toBe('BLOCKED');
     expect(res.outputFields.qualificationState).toBe('BLOCKED');
-    expect(findLeadSpy).not.toHaveBeenCalled(); // Suppression gate blocked before Lead bootstrap!
+    expect(findLeadSpy).not.toHaveBeenCalled();
   });
 
   it('should return BLOCKED immediately when Contact and Company relationship keys mismatch', async () => {

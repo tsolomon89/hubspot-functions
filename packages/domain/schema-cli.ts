@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as yaml from 'yaml';
 import { HubspotAdapter } from '../hubspot-adapter';
 import { logger } from '../observability';
+import { OrganizationConfigResolver } from './config-resolver';
 
 export interface SchemaDiff {
   propertyGroupsToCreate: any[];
@@ -101,12 +102,7 @@ export class SchemaTool {
     const pipelinesToCreate: any[] = [];
     const pipelinesToUpdate: any[] = [];
 
-    const hasAnyCustomProperty = currentAccountSchema?.properties && 
-      Object.values(currentAccountSchema.properties).some((arr: any) => 
-        Array.isArray(arr) && arr.some((p: any) => p.name && p.name.startsWith('coa_'))
-      );
-
-    if (!currentAccountSchema || !hasAnyCustomProperty) {
+    if (!currentAccountSchema) {
       for (const group of (manifest.propertyGroups || [])) {
         propertyGroupsToCreate.push(group);
       }
@@ -123,61 +119,71 @@ export class SchemaTool {
           pipelinesToCreate.push({ objectType: objType, ...pipe });
         }
       }
-    } else {
-      // Compare property groups
-      for (const group of (manifest.propertyGroups || [])) {
-        for (const objType of group.objectTypes || ['deals', 'companies', 'leads', 'contacts']) {
-          const existingGroups = currentAccountSchema.propertyGroups?.[objType] || [];
-          const exists = existingGroups.some((g: any) => g.name === group.name);
-          if (!exists) {
-            propertyGroupsToCreate.push({ ...group, targetObjectType: objType });
-          }
+      return {
+        propertyGroupsToCreate,
+        propertiesToCreate,
+        associationLabelsToCreate,
+        pipelinesToCreate,
+        pipelinesToUpdate
+      };
+    }
+
+    // Independent category comparison - NO shortcut assumptions!
+    
+    // 1. Compare property groups per object type
+    for (const group of (manifest.propertyGroups || [])) {
+      for (const objType of group.objectTypes || ['deals', 'companies', 'leads', 'contacts']) {
+        const existingGroups = currentAccountSchema.propertyGroups?.[objType] || [];
+        const exists = existingGroups.some((g: any) => g.name === group.name);
+        if (!exists) {
+          propertyGroupsToCreate.push({ ...group, targetObjectType: objType });
         }
       }
+    }
 
-      // Compare properties
-      for (const [objType, props] of Object.entries(manifest.properties || {})) {
-        const existingProps = currentAccountSchema.properties[objType] || [];
-        for (const p of (props as any[])) {
-          const existing = existingProps.find((e: any) => e.name === p.name);
-          if (!existing || existing.type !== p.type) {
-            propertiesToCreate.push({ objectType: objType, ...p });
-          }
+    // 2. Compare properties per object type
+    for (const [objType, props] of Object.entries(manifest.properties || {})) {
+      const existingProps = currentAccountSchema.properties?.[objType] || [];
+      for (const p of (props as any[])) {
+        const existing = existingProps.find((e: any) => e.name === p.name);
+        if (!existing) {
+          propertiesToCreate.push({ objectType: objType, ...p });
+        } else if (existing.type !== p.type) {
+          throw new Error(`SCHEMA_CONFLICT: Property '${p.name}' on '${objType}' exists with type '${existing.type}', expected '${p.type}'`);
         }
       }
+    }
 
-      // Compare pipelines and individual stages (missing stages, display order, probability)
-      for (const [objType, pipes] of Object.entries(manifest.pipelines || {})) {
-        const existingPipes = currentAccountSchema.pipelines?.[objType] || [];
-        for (const pipe of (pipes as any[])) {
-          const existing = existingPipes.find((e: any) => e.id === pipe.pipelineId || e.label === pipe.name);
-          if (!existing) {
-            pipelinesToCreate.push({ objectType: objType, ...pipe });
-          } else {
-            // Compare stages: missing stages, stage order, or probability diffs
-            const existingStages = existing.stages || [];
-            const manifestStages = pipe.stages || [];
-            
-            let stageDiff = false;
-            for (const mStage of manifestStages) {
-              const eStage = existingStages.find((s: any) => (s.id || s.stageId) === mStage.stageId);
-              if (!eStage) {
-                stageDiff = true;
-                break;
-              }
-              if (mStage.displayOrder !== undefined && eStage.displayOrder !== undefined && Number(mStage.displayOrder) !== Number(eStage.displayOrder)) {
-                stageDiff = true;
-                break;
-              }
-              if (mStage.metadata?.probability !== undefined && eStage.metadata?.probability !== undefined && String(mStage.metadata.probability) !== String(eStage.metadata.probability)) {
-                stageDiff = true;
-                break;
-              }
+    // 3. Compare pipelines and stages
+    for (const [objType, pipes] of Object.entries(manifest.pipelines || {})) {
+      const existingPipes = currentAccountSchema.pipelines?.[objType] || [];
+      for (const pipe of (pipes as any[])) {
+        const existing = existingPipes.find((e: any) => e.id === pipe.pipelineId || e.label === pipe.name);
+        if (!existing) {
+          pipelinesToCreate.push({ objectType: objType, ...pipe });
+        } else {
+          const existingStages = existing.stages || [];
+          const manifestStages = pipe.stages || [];
+          
+          let stageDiff = false;
+          for (const mStage of manifestStages) {
+            const eStage = existingStages.find((s: any) => (s.id || s.stageId) === mStage.stageId);
+            if (!eStage) {
+              stageDiff = true;
+              break;
             }
+            if (mStage.displayOrder !== undefined && eStage.displayOrder !== undefined && Number(mStage.displayOrder) !== Number(eStage.displayOrder)) {
+              stageDiff = true;
+              break;
+            }
+            if (mStage.metadata?.probability !== undefined && eStage.metadata?.probability !== undefined && String(mStage.metadata.probability) !== String(eStage.metadata.probability)) {
+              stageDiff = true;
+              break;
+            }
+          }
 
-            if (stageDiff) {
-              pipelinesToUpdate.push({ objectType: objType, existingPipelineId: existing.id || pipe.pipelineId, ...pipe });
-            }
+          if (stageDiff) {
+            pipelinesToUpdate.push({ objectType: objType, existingPipelineId: existing.id || pipe.pipelineId, ...pipe });
           }
         }
       }
@@ -192,13 +198,29 @@ export class SchemaTool {
     };
   }
 
-  public async apply(diff: SchemaDiff, hsAdapter?: HubspotAdapter): Promise<{ applied: boolean; count: number; errors: string[] }> {
+  public async apply(
+    diff: SchemaDiff, 
+    hsAdapter?: HubspotAdapter,
+    portalId?: number | string
+  ): Promise<{ applied: boolean; count: number; errors: string[] }> {
     if (!hsAdapter) {
       logger.warn('SchemaTool.apply called without authenticated HubSpot client; returning unapplied diff count.');
       return { applied: false, count: 0, errors: ['No authenticated HubSpot client provided'] };
     }
 
-    // Inspect account state first before applying diff!
+    // Enforce account role guard if portalId provided
+    if (portalId) {
+      const resolver = new OrganizationConfigResolver();
+      const inst = resolver.resolvePortalInstallation(portalId);
+      if (!inst) {
+        throw new Error(`UNSUPPORTED_PORTAL: Portal '${portalId}' is not registered`);
+      }
+      if (inst.accountRole !== 'developer-test') {
+        throw new Error(`NON_DEVELOPER_TEST_PORTAL_MUTATION_GUARD: Portal '${portalId}' role is '${inst.accountRole}', expected 'developer-test'`);
+      }
+    }
+
+    // Inspect account state first before applying diff
     const currentAccountState = await this.inspect(hsAdapter);
     const actualDiff = this.plan(currentAccountState);
 
@@ -269,7 +291,7 @@ export class SchemaTool {
       }
     }
 
-    // 4. Update Existing Pipelines (Patch missing/modified stages rather than recreating)
+    // 4. Update Existing Pipelines
     for (const pipe of actualDiff.pipelinesToUpdate) {
       const targetObj = pipe.objectType || 'deals';
       const pipelineId = pipe.existingPipelineId || pipe.pipelineId;
@@ -334,7 +356,7 @@ if (require.main === module) {
     }
   } else if (mode === 'apply') {
     const diff = tool.plan();
-    tool.apply(diff, hsAdapter).then(result => {
+    tool.apply(diff, hsAdapter, 149041124).then(result => {
       console.log('Schema Apply Result:', JSON.stringify(result, null, 2));
       if (!result.applied && result.errors.length > 0) {
         process.exit(1);

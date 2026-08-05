@@ -1,6 +1,5 @@
 export * from './identity';
 export * from './config-resolver';
-export * from './schema-cli';
 
 export function computeOpportunityKey(relationshipKey: string, opportunityType: string, cycleIndex: number = 1): string {
   return `${relationshipKey}::${opportunityType}::${cycleIndex}`;

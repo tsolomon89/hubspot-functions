@@ -2,6 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "CommercialModelConfig",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "organizationKey",
     "configVersion",
@@ -10,36 +11,94 @@
     "goalsByOpportunityType"
   ],
   "properties": {
-    "organizationKey": { "type": "string" },
-    "configVersion": { "type": "string" },
-    "relationshipType": { "type": "string" },
+    "organizationKey": { "type": "string", "minLength": 1 },
+    "configVersion": { "type": "string", "minLength": 1 },
+    "relationshipType": { "type": "string", "minLength": 1 },
     "hubspotPipelines": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["leadPipelineId", "dealPipelineId", "dealStageProbabilities"],
       "properties": {
-        "leadPipelineId": { "type": "string" },
-        "dealPipelineId": { "type": "string" },
+        "leadPipelineId": { "type": "string", "minLength": 1 },
+        "dealPipelineId": { "type": "string", "minLength": 1 },
         "dealStageProbabilities": {
           "type": "object",
-          "additionalProperties": { "type": "number" }
+          "additionalProperties": false,
+          "required": ["open", "closedwon", "closedlost"],
+          "properties": {
+            "open": { "type": "number", "minimum": 0, "maximum": 1 },
+            "closedwon": { "type": "number", "minimum": 1, "maximum": 1 },
+            "closedlost": { "type": "number", "minimum": 0, "maximum": 0 }
+          }
         }
+      }
+    },
+    "offeringPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "productOfferingKeyProperty": { "type": "string" },
+        "rtpPolicy": { "type": "string", "enum": ["carryForward", "emptyUntilKnown"] }
       }
     },
     "goalsByOpportunityType": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["MQL", "SQL", "FTP", "RTP"],
       "properties": {
-        "MQL": { "type": "array" },
-        "SQL": { "type": "array" },
-        "FTP": { "type": "array" },
-        "RTP": { "type": "array" }
+        "MQL": { "$ref": "#/definitions/goalArray" },
+        "SQL": { "$ref": "#/definitions/goalArray" },
+        "FTP": { "$ref": "#/definitions/goalArray" },
+        "RTP": { "$ref": "#/definitions/goalArray" }
       }
     },
     "featureFlags": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "automationSuppressed": { "type": "boolean" },
         "dryRunTransactions": { "type": "boolean" }
+      }
+    }
+  },
+  "definitions": {
+    "goalArray": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/goalSpec" }
+    },
+    "goalSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "name", "predicate", "scope"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "predicate": {
+          "type": "string",
+          "enum": [
+            "anyCommunicationChannel",
+            "property",
+            "associationExists",
+            "activityExists",
+            "offeringKnown",
+            "transactionExists",
+            "count",
+            "all",
+            "any",
+            "not"
+          ]
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["subject", "relationship", "opportunity", "sincePredecessorCompletion"]
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "conditions": {
+          "$ref": "#/definitions/goalArray"
+        }
       }
     }
   }

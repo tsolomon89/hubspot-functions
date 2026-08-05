@@ -1,11 +1,11 @@
-import { OrganizationConfigResolver } from '../../packages/domain';
+import { OrganizationConfigResolver } from '../../packages/domain/config-resolver';
 import { HubspotAdapter, HubSpotSnapshotLoader } from '../../packages/hubspot-adapter';
 import { evaluateOpportunity, planTransition } from '../../packages/commercial-kernel';
 import { logger } from '../../packages/observability';
 
 export interface HubSpotEventPayload {
   origin?: { portalId?: number };
-  object?: { objectId?: string; id?: string; objectType?: string };
+  object?: { objectId?: string | number; id?: string | number; objectType?: string };
   inputFields?: Record<string, any>;
 }
 
@@ -27,11 +27,17 @@ export async function processHubSpotCustomCodeAction(
   adapterInstance?: HubspotAdapter
 ): Promise<CustomCodeActionResult> {
   const portalId = event?.origin?.portalId;
-  const rawObjectId = event?.object?.objectId || event?.object?.id;
+  const rawObjectId = event?.object?.objectId !== undefined ? String(event.object.objectId) : (event?.object?.id !== undefined ? String(event.object.id) : undefined);
   const rawObjectType = event?.object?.objectType;
 
   if (!portalId || !rawObjectId || rawObjectId === '0' || !rawObjectType) {
     throw new Error("INVALID_ENROLLMENT: Missing valid origin.portalId, object.objectId, or object.objectType in HubSpot event payload");
+  }
+
+  // Fail fast if required access token secret is missing and no fake adapter supplied
+  const token = accessToken || process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
+  if (!adapterInstance && (!token || token.trim() === '')) {
+    throw new Error("MISSING_AUTHENTICATION_SECRET: PRIVATE_APP_ACCESS_TOKEN secret is missing or empty");
   }
 
   const objectType = String(rawObjectType).toLowerCase();
@@ -44,7 +50,7 @@ export async function processHubSpotCustomCodeAction(
   const offeringInput = event?.inputFields?.offeringKeys || event?.inputFields?.coa_offering_keys;
 
   const config = OrganizationConfigResolver.resolveConfigByPortalId(portalId, { relationshipType: relTypeInput });
-  const adapter = adapterInstance || new HubspotAdapter(accessToken);
+  const adapter = adapterInstance || new HubspotAdapter(token);
   const snapshotLoader = new HubSpotSnapshotLoader(adapter);
 
   // Load subject snapshot first
@@ -113,7 +119,7 @@ export async function processHubSpotCustomCodeAction(
 
       return {
         outputFields: {
-          objectId: lead.id,
+          objectId: String(lead.id),
           objectType: 'lead',
           opportunityKey: leadSnapshot.opportunityKey,
           qualificationState: evalRes.qualificationState,

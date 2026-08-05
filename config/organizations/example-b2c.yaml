@@ -1,4 +1,4 @@
-organizationKey: "org_consumer_brand"
+organizationKey: "org_global_corp"
 configVersion: "1.0.0"
 relationshipType: "b2c"
 
@@ -10,6 +10,10 @@ hubspotPipelines:
     closedwon: 1.00
     closedlost: 0.00
 
+offeringPolicy:
+  productOfferingKeyProperty: "hs_sku"
+  rtpPolicy: "emptyUntilKnown"
+
 goalsByOpportunityType:
   MQL: []
 
@@ -20,14 +24,14 @@ goalsByOpportunityType:
       scope: "opportunity"
 
   FTP:
-    - key: "b2c_checkout_payment"
-      name: "First B2C checkout order payment"
+    - key: "b2c_deal_closed_won"
+      name: "First B2C transaction deal closed won"
       predicate: "transactionExists"
       scope: "opportunity"
 
   RTP:
-    - key: "b2c_repeat_checkout"
-      name: "Repeat B2C checkout order payment"
+    - key: "b2c_deal_closed_won_repeat"
+      name: "Repeat B2C transaction deal closed won"
       predicate: "transactionExists"
       scope: "sincePredecessorCompletion"
 

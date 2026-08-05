@@ -1,7 +1,7 @@
 export type SubjectKind = 'CONTACT' | 'COMPANY' | 'COMPANY_CONTACTS';
 
 export interface ContactRef {
-  email: string;
+  email?: string;
   firstName?: string;
   lastName?: string;
   phone?: string;
@@ -25,6 +25,17 @@ export function sanitizeKey(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '_');
 }
 
+export function deriveRelationshipKey(
+  organizationKey: string,
+  relationshipType: string,
+  subjectAnchor: string
+): string {
+  const cleanOrg = sanitizeKey(organizationKey);
+  const cleanRel = sanitizeKey(relationshipType);
+  const cleanAnchor = sanitizeKey(subjectAnchor);
+  return `rel_${cleanOrg}_${cleanRel}_${cleanAnchor}`;
+}
+
 export function resolveSubjectIdentity(
   contactInput?: ContactRef,
   companyInput?: CompanyRef
@@ -38,9 +49,9 @@ export function resolveSubjectIdentity(
       domain: companyInput.domain ? companyInput.domain.trim().toLowerCase() : undefined
     };
 
-    if (contactInput && contactInput.email) {
-      const email = contactInput.email.trim().toLowerCase();
-      // Subject key is the Company Key; contact is associated under the same Company subject
+    if (contactInput && (contactInput.email || contactInput.phone)) {
+      const email = contactInput.email ? contactInput.email.trim().toLowerCase() : undefined;
+      const anchor = email || sanitizeKey(contactInput.phone || 'phone_contact');
       return {
         kind: 'COMPANY_CONTACTS',
         subjectKey: companyKey,
@@ -51,7 +62,7 @@ export function resolveSubjectIdentity(
           lastName: contactInput.lastName ? contactInput.lastName.trim() : undefined,
           phone: contactInput.phone ? contactInput.phone.trim() : undefined
         },
-        associatedContactEmails: [email]
+        associatedContactEmails: email ? [email] : []
       };
     }
 
@@ -62,19 +73,21 @@ export function resolveSubjectIdentity(
     };
   }
 
-  if (contactInput && contactInput.email) {
-    const email = contactInput.email.trim().toLowerCase();
+  if (contactInput && (contactInput.email || contactInput.phone)) {
+    const email = contactInput.email ? contactInput.email.trim().toLowerCase() : undefined;
+    const phone = contactInput.phone ? contactInput.phone.trim() : undefined;
+    const subjectKey = email || sanitizeKey(phone || 'phone_contact');
     return {
       kind: 'CONTACT',
-      subjectKey: email,
+      subjectKey,
       contact: {
         email,
         firstName: contactInput.firstName ? contactInput.firstName.trim() : undefined,
         lastName: contactInput.lastName ? contactInput.lastName.trim() : undefined,
-        phone: contactInput.phone ? contactInput.phone.trim() : undefined
+        phone
       }
     };
   }
 
-  throw new Error('Invalid subject input: Must provide either a valid Contact email or Company name');
+  throw new Error('Invalid subject input: Must provide either a valid Contact email/phone or Company name');
 }

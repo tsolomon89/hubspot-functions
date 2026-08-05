@@ -3,13 +3,19 @@ export type OpportunityState = 'OPEN' | 'WON' | 'LOST';
 export type QualificationState = 'PENDING' | 'SATISFIED' | 'BLOCKED' | 'MANUAL_REVIEW';
 
 export type CommercialSubjectRef =
-  | { kind: 'CONTACT'; key: string; companyKey?: string }
+  | { kind: 'CONTACT'; key: string; companyKey?: string; phone?: string; email?: string }
   | { kind: 'COMPANY'; key: string; contactKeys?: string[]; companyKey?: string };
+
+export interface OfferingRef {
+  offeringKey: string;
+  quantity?: number;
+  unitPrice?: number;
+}
 
 export interface EvidenceRecord {
   id: string;
   predicate: string;
-  scope: 'relationship' | 'opportunity' | 'sincePredecessorCompletion';
+  scope: 'subject' | 'relationship' | 'opportunity' | 'sincePredecessorCompletion';
   occurredAt: string;
   data: Record<string, unknown>;
 }
@@ -25,6 +31,8 @@ export interface OpportunitySnapshot {
   openedAt: string;
   predecessorOpportunityKey?: string;
   predecessorCompletedAt?: string;
+  mqlCompletedAt?: string;
+  offerings?: OfferingRef[];
   subject: CommercialSubjectRef;
   facts: Record<string, unknown>;
   evidence: EvidenceRecord[];
@@ -36,15 +44,16 @@ export interface EvaluationResult {
   unsatisfiedGoalKeys: string[];
   evidenceRefsByGoal: Record<string, string[]>;
   evaluatedConfigVersion: string;
+  mqlCompletedAt?: string;
 }
 
 export interface GoalDefinition {
   key: string;
   name: string;
-  predicate?: string;
-  predicates?: Array<{ predicate: string; value?: any; params?: Record<string, unknown> }>;
-  scope?: 'relationship' | 'opportunity' | 'sincePredecessorCompletion';
+  predicate: string;
+  scope: 'subject' | 'relationship' | 'opportunity' | 'sincePredecessorCompletion';
   params?: Record<string, unknown>;
+  conditions?: GoalDefinition[];
   universal?: boolean;
 }
 
@@ -56,12 +65,18 @@ export interface HubSpotPipelineConfig {
   dealStageProbabilities?: Record<string, number>;
 }
 
+export interface OfferingPolicyConfig {
+  productOfferingKeyProperty?: string;
+  rtpPolicy?: 'carryForward' | 'emptyUntilKnown';
+}
+
 export interface QualificationConfig {
   organizationKey: string;
   configVersion: string;
   relationshipType: string;
   goalsByOpportunityType: Record<OpportunityType, GoalDefinition[]>;
   hubspotPipelines?: HubSpotPipelineConfig;
+  offeringPolicy?: OfferingPolicyConfig;
   featureFlags?: {
     automationSuppressed?: boolean;
     dryRunTransactions?: boolean;
@@ -83,6 +98,7 @@ export type TransitionIntent =
         targetDealStage?: string; 
         mqlCompletedAt?: string;
         unsatisfiedGoalKeys?: string[];
+        offerings?: OfferingRef[];
       } 
     }
   | { 
@@ -92,6 +108,8 @@ export type TransitionIntent =
       successorType: OpportunityType; 
       cycleIndex: number; 
       subject?: CommercialSubjectRef;
+      offerings?: OfferingRef[];
+      predecessorCompletedAt?: string;
     }
   | { 
       kind: 'PROJECT_LIFECYCLE_STAGE'; 

@@ -5,7 +5,8 @@
   "description": "HubSpot Commercial Operations Automation Foundation",
   "main": "dist/hubspot-custom-code/reconcile-record.js",
   "scripts": {
-    "build": "npx ts-node scripts/compile-configs.ts && tsc --noEmit && npm run build:custom-code",
+    "config:validate": "npx ts-node scripts/validate-configs.ts",
+    "build": "npm run config:validate && npx ts-node scripts/compile-configs.ts && tsc --noEmit && npm run build:custom-code",
     "build:custom-code": "node scripts/build-custom-code-action.js",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -20,6 +21,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "esbuild": "^0.25.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3",

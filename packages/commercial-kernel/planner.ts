@@ -4,8 +4,38 @@ import {
   QualificationConfig, 
   TransitionIntent, 
   OpportunityType, 
-  CommercialSubjectRef 
+  CommercialSubjectRef,
+  GoalDefinition
 } from './types';
+
+export const SUPPORTED_PREDICATES = new Set([
+  'anyCommunicationChannel',
+  'property',
+  'associationExists',
+  'activityExists',
+  'offeringKnown',
+  'transactionExists',
+  'count',
+  'all',
+  'any',
+  'not',
+  'manualReview',
+  'hasIdentity',
+  'marketingConsent',
+  'hasOfferingInterest',
+  'transactionComplete'
+]);
+
+function validateGoal(goal: GoalDefinition, path: string, errors: string[]) {
+  if (!goal.key) errors.push(`${path}: Missing goal key`);
+  if (!goal.predicate) errors.push(`${path}: Missing predicate`);
+  if (goal.predicate && !SUPPORTED_PREDICATES.has(goal.predicate)) {
+    errors.push(`${path}: Unsupported predicate '${goal.predicate}'`);
+  }
+  if (['all', 'any', 'not'].includes(goal.predicate) && goal.conditions) {
+    goal.conditions.forEach((sub, i) => validateGoal(sub, `${path}.conditions[${i}]`, errors));
+  }
+}
 
 export function validateCommercialModel(config: QualificationConfig): { valid: boolean; errors: string[] } {
   const errors: string[] = [];
@@ -18,6 +48,10 @@ export function validateCommercialModel(config: QualificationConfig): { valid: b
     for (const oppType of ['MQL', 'SQL', 'FTP', 'RTP'] as OpportunityType[]) {
       if (!Array.isArray(config.goalsByOpportunityType[oppType])) {
         errors.push(`goalsByOpportunityType.${oppType} must be an array`);
+      } else {
+        config.goalsByOpportunityType[oppType].forEach((g, i) => {
+          validateGoal(g, `goalsByOpportunityType.${oppType}[${i}]`, errors);
+        });
       }
     }
   }
@@ -60,8 +94,11 @@ export function projectLifecycleStage(
 export function planTransition(
   snapshot: OpportunitySnapshot,
   evaluation: EvaluationResult,
-  config: QualificationConfig
+  config: QualificationConfig,
+  nowInstant?: string
 ): TransitionIntent[] {
+  const currentNow = nowInstant || new Date().toISOString();
+
   // Replay Safety: Lost opportunities are terminal NOOP
   if (snapshot.opportunityState === 'LOST') {
     return [{ kind: 'NOOP', reason: 'Opportunity is LOST' }];
@@ -96,7 +133,8 @@ export function planTransition(
       details: { 
         unsatisfiedGoalKeys: evaluation.unsatisfiedGoalKeys,
         targetLeadStage: currentLeadStage,
-        targetDealStage: currentDealStage
+        targetDealStage: currentDealStage,
+        offerings: snapshot.offerings
       }
     }];
   }
@@ -111,7 +149,12 @@ export function planTransition(
       opportunityKey: snapshot.opportunityKey,
       newState: 'OPEN',
       qualificationState: 'SATISFIED',
-      details: { targetOpportunityType: 'SQL', targetLeadStage: 'sql', mqlCompletedAt: new Date().toISOString() }
+      details: { 
+        targetOpportunityType: 'SQL', 
+        targetLeadStage: 'sql', 
+        mqlCompletedAt: currentNow,
+        offerings: snapshot.offerings
+      }
     });
     intents.push({
       kind: 'PROJECT_LIFECYCLE_STAGE',
@@ -125,7 +168,7 @@ export function planTransition(
       opportunityKey: snapshot.opportunityKey,
       newState: 'WON',
       qualificationState: 'SATISFIED',
-      details: { targetLeadStage: 'qualified' }
+      details: { targetLeadStage: 'qualified', offerings: snapshot.offerings }
     });
     intents.push({
       kind: 'PROJECT_LIFECYCLE_STAGE',
@@ -139,7 +182,9 @@ export function planTransition(
       successorKey,
       successorType: 'FTP',
       cycleIndex: 1,
-      subject: snapshot.subject
+      subject: snapshot.subject,
+      offerings: snapshot.offerings,
+      predecessorCompletedAt: snapshot.mqlCompletedAt || currentNow
     });
   } else if (snapshot.opportunityType === 'FTP') {
     intents.push({
@@ -155,13 +200,16 @@ export function planTransition(
       stage: 'customer'
     });
     const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', 1);
+    const rtpOfferings = config.offeringPolicy?.rtpPolicy === 'emptyUntilKnown' ? [] : (snapshot.offerings || []);
     intents.push({
       kind: 'CREATE_SUCCESSOR',
       predecessorKey: snapshot.opportunityKey,
       successorKey,
       successorType: 'RTP',
       cycleIndex: 1,
-      subject: snapshot.subject
+      subject: snapshot.subject,
+      offerings: rtpOfferings,
+      predecessorCompletedAt: (snapshot.facts.closedAt as string) || currentNow
     });
   } else if (snapshot.opportunityType === 'RTP') {
     intents.push({
@@ -178,13 +226,16 @@ export function planTransition(
     });
     const nextCycle = (snapshot.cycleIndex || 1) + 1;
     const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', nextCycle);
+    const rtpOfferings = config.offeringPolicy?.rtpPolicy === 'emptyUntilKnown' ? [] : (snapshot.offerings || []);
     intents.push({
       kind: 'CREATE_SUCCESSOR',
       predecessorKey: snapshot.opportunityKey,
       successorKey,
       successorType: 'RTP',
       cycleIndex: nextCycle,
-      subject: snapshot.subject
+      subject: snapshot.subject,
+      offerings: rtpOfferings,
+      predecessorCompletedAt: (snapshot.facts.closedAt as string) || currentNow
     });
   }
 

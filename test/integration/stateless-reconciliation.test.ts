@@ -29,6 +29,7 @@ describe('Stateless Commercial Operations Reconciliation Integration Suite', () 
           key: 'meeting_goal',
           name: 'Positive meeting',
           predicate: 'activityExists',
+          scope: 'opportunity',
           params: { activityType: 'MEETING', outcome: 'COMPLETED' }
         }],
         FTP: [],

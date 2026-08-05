@@ -1,0 +1,98 @@
+version: "1.0.0"
+executionPortalId: 149041124
+accountRole: "developer-test"
+
+workflows:
+  - name: "COA Contact Bootstrap & Communication Reconciliation"
+    objectType: "CONTACT"
+    relationshipTypeRouting: "b2b, b2c"
+    triggers:
+      enrollment: "email IS_SET OR phone IS_SET OR coa_marketing_consent IS_SET OR coa_automation_suppressed IS_SET"
+      reEnrollment: true
+    customCodeAction:
+      runtime: "nodejs20.x"
+      bundleHash: "dist/hubspot-custom-code/reconcile-record.js"
+      secretName: "PRIVATE_APP_ACCESS_TOKEN"
+      inputFields:
+        - name: "relationshipType"
+          source: "coa_relationship_type"
+        - name: "offeringKeys"
+          source: "coa_offering_keys"
+      outputFields:
+        - objectId
+        - objectType
+        - opportunityKey
+        - qualificationState
+        - appliedIntentsCount
+        - verified
+        - status
+    enabled: true
+
+  - name: "COA Company B2B Subject Routing"
+    objectType: "COMPANY"
+    relationshipTypeRouting: "b2b"
+    triggers:
+      enrollment: "name IS_SET OR domain IS_SET OR coa_automation_suppressed IS_SET"
+      reEnrollment: true
+    customCodeAction:
+      runtime: "nodejs20.x"
+      bundleHash: "dist/hubspot-custom-code/reconcile-record.js"
+      secretName: "PRIVATE_APP_ACCESS_TOKEN"
+      inputFields:
+        - name: "relationshipType"
+          constant: "b2b"
+      outputFields:
+        - objectId
+        - objectType
+        - opportunityKey
+        - qualificationState
+        - appliedIntentsCount
+        - verified
+        - status
+    enabled: true
+
+  - name: "COA Lead Progression Reconciliation"
+    objectType: "LEAD"
+    relationshipTypeRouting: "b2b, b2c"
+    triggers:
+      enrollment: "hs_pipeline_stage IS_SET OR coa_offering_keys IS_SET"
+      reEnrollment: true
+    customCodeAction:
+      runtime: "nodejs20.x"
+      bundleHash: "dist/hubspot-custom-code/reconcile-record.js"
+      secretName: "PRIVATE_APP_ACCESS_TOKEN"
+      inputFields:
+        - name: "relationshipType"
+          source: "coa_relationship_type"
+      outputFields:
+        - objectId
+        - objectType
+        - opportunityKey
+        - qualificationState
+        - appliedIntentsCount
+        - verified
+        - status
+    enabled: true
+
+  - name: "COA Deal Transaction Progression"
+    objectType: "DEAL"
+    relationshipTypeRouting: "b2b, b2c"
+    triggers:
+      enrollment: "dealstage IS_SET"
+      reEnrollment: true
+    customCodeAction:
+      runtime: "nodejs20.x"
+      bundleHash: "dist/hubspot-custom-code/reconcile-record.js"
+      secretName: "PRIVATE_APP_ACCESS_TOKEN"
+      inputFields:
+        - name: "relationshipType"
+          source: "coa_relationship_type"
+      outputFields:
+        - objectId
+        - objectType
+        - opportunityKey
+        - qualificationState
+        - appliedIntentsCount
+        - verified
+        - status
+    enabled: true
