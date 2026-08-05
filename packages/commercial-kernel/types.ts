@@ -41,7 +41,8 @@ export interface EvaluationResult {
 export interface GoalDefinition {
   key: string;
   name: string;
-  predicate: string;
+  predicate?: string;
+  predicates?: Array<{ predicate: string; value?: any; params?: Record<string, unknown> }>;
   scope?: 'relationship' | 'opportunity' | 'sincePredecessorCompletion';
   params?: Record<string, unknown>;
   universal?: boolean;
@@ -68,15 +69,21 @@ export interface QualificationConfig {
 }
 
 export type TransitionIntent =
-  | { kind: 'NOOP'; reason?: string }
+  | { kind: 'NOOP'; reason: string }
   | { 
       kind: 'UPDATE_OPPORTUNITY'; 
       opportunityKey: string; 
       newState: OpportunityState; 
-      qualificationState: QualificationState; 
+      qualificationState: QualificationState;
       targetRecordId?: string;
       targetObjectType?: string;
-      details?: Record<string, unknown>;
+      details?: { 
+        targetOpportunityType?: OpportunityType; 
+        targetLeadStage?: string; 
+        targetDealStage?: string; 
+        mqlCompletedAt?: string;
+        unsatisfiedGoalKeys?: string[];
+      } 
     }
   | { 
       kind: 'CREATE_SUCCESSOR'; 
@@ -89,11 +96,11 @@ export type TransitionIntent =
   | { 
       kind: 'PROJECT_LIFECYCLE_STAGE'; 
       subject: CommercialSubjectRef; 
-      stage: string; 
+      stage: string 
     }
   | { 
       kind: 'CREATE_MANUAL_REVIEW'; 
       opportunityKey: string; 
       reason: string; 
-      subject?: CommercialSubjectRef; 
+      subject: CommercialSubjectRef 
     };

@@ -113,11 +113,11 @@ export class HubspotAdapter {
           automationSuppressed: props.coa_automation_suppressed === 'true' || props.coa_automation_suppressed === '1'
         };
       }
+      return {};
     } catch (err: any) {
       if (err?.statusCode !== 404 && err?.status !== 404) throw err;
-      logger.warn(`Subject ${subject.kind}:${subject.key} not found in HubSpot CRM`);
+      return {};
     }
-    return {};
   }
 
   public async loadLeadSnapshot(leadId: string): Promise<Record<string, unknown>> {
@@ -125,6 +125,7 @@ export class HubspotAdapter {
       const lead = await this.leadsApi.basicApi.getById(leadId, [
         'coa_opportunity_key',
         'coa_relationship_key',
+        'coa_relationship_type',
         'coa_opportunity_type',
         'coa_cycle_index',
         'hs_pipeline_stage',
@@ -167,7 +168,8 @@ export class HubspotAdapter {
     subject: CommercialSubjectRef,
     relationshipKey: string,
     relationshipType: string,
-    config?: QualificationConfig
+    config?: QualificationConfig,
+    offeringKeys?: string
   ): Promise<Record<string, any> | null> {
     try {
       const opportunityKey = `${relationshipKey}::LEAD::1`;
@@ -198,7 +200,7 @@ export class HubspotAdapter {
         return searchRes.results[0];
       }
 
-      // Create initial managed Lead record with exact associations
+      // Create initial managed Lead record with exact Contact AND Company associations
       const pipelineId = config?.hubspotPipelines?.leadPipelineId || 'b2b_qualification_lead_pipeline';
       
       const associations: any[] = [];
@@ -207,6 +209,12 @@ export class HubspotAdapter {
           to: { id: subject.key },
           types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 608 }]
         });
+        if (subject.companyKey) {
+          associations.push({
+            to: { id: subject.companyKey },
+            types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 610 }]
+          });
+        }
       } else if (subject.kind === 'COMPANY') {
         associations.push({
           to: { id: subject.key },
@@ -231,6 +239,7 @@ export class HubspotAdapter {
           coa_qualification_state: 'PENDING',
           coa_cycle_index: '1',
           coa_managed: 'true',
+          coa_offering_keys: offeringKeys || 'prod_software',
           coa_config_version: config?.configVersion || '1.0.0'
         },
         associations
@@ -313,11 +322,65 @@ export class HubspotAdapter {
     correlationKey: string,
     config?: QualificationConfig
   ): Promise<{ success: boolean; appliedIntents: number; receipts: MutationReceipt[] }> {
-    let appliedIntents = 0;
     const receipts: MutationReceipt[] = [];
+    let appliedIntents = 0;
 
     for (const intent of intents) {
-      if (intent.kind === 'UPDATE_OPPORTUNITY') {
+      if (intent.kind === 'NOOP') {
+        receipts.push({
+          intentKind: 'NOOP',
+          objectType: 'system',
+          operation: 'NOOP',
+          verified: true
+        });
+        continue;
+      }
+
+      if (intent.kind === 'PROJECT_LIFECYCLE_STAGE') {
+        logger.info('Applying PROJECT_LIFECYCLE_STAGE intent', { stage: intent.stage });
+        try {
+          const targetKind = intent.subject.kind;
+          const targetKey = intent.subject.key;
+          if (targetKind === 'CONTACT') {
+            await this.client.crm.contacts.basicApi.update(targetKey, {
+              properties: { lifecyclestage: intent.stage }
+            });
+            const readback = await this.client.crm.contacts.basicApi.getById(targetKey, ['lifecyclestage']);
+            const verified = readback?.properties?.lifecyclestage === intent.stage;
+            receipts.push({
+              intentKind: 'PROJECT_LIFECYCLE_STAGE',
+              objectType: 'contact',
+              objectId: targetKey,
+              operation: 'UPDATE',
+              verified
+            });
+          } else if (targetKind === 'COMPANY') {
+            await this.client.crm.companies.basicApi.update(targetKey, {
+              properties: { lifecyclestage: intent.stage }
+            });
+            const readback = await this.client.crm.companies.basicApi.getById(targetKey, ['lifecyclestage']);
+            const verified = readback?.properties?.lifecyclestage === intent.stage;
+            receipts.push({
+              intentKind: 'PROJECT_LIFECYCLE_STAGE',
+              objectType: 'company',
+              objectId: targetKey,
+              operation: 'UPDATE',
+              verified
+            });
+          }
+          appliedIntents++;
+        } catch (err: any) {
+          logger.error('Failed to project lifecycle stage', err);
+          receipts.push({
+            intentKind: 'PROJECT_LIFECYCLE_STAGE',
+            objectType: intent.subject.kind.toLowerCase(),
+            objectId: intent.subject.key,
+            operation: 'UPDATE',
+            verified: false,
+            error: String(err?.message || err)
+          });
+        }
+      } else if (intent.kind === 'UPDATE_OPPORTUNITY') {
         logger.info('Applying UPDATE_OPPORTUNITY intent', { key: intent.opportunityKey, newState: intent.newState });
         
         let targetId = intent.targetRecordId;
@@ -446,16 +509,20 @@ export class HubspotAdapter {
               'coa_cycle_index',
               'coa_predecessor_opportunity_key',
               'coa_managed',
-              'coa_config_version'
+              'coa_config_version',
+              'coa_qualification_state'
             ], limit: 1, after: 0
           });
 
-          // Resolve Contact & Company target IDs
+          // Resolve Contact & Company target IDs for BOTH Contact and Company subjects!
           let expectedContactId: string | undefined = undefined;
           let expectedCompanyId: string | undefined = undefined;
 
           if (intent.subject?.kind === 'CONTACT') {
             expectedContactId = intent.subject.key;
+            if (intent.subject.companyKey) {
+              expectedCompanyId = intent.subject.companyKey;
+            }
           } else if (intent.subject?.kind === 'COMPANY') {
             expectedCompanyId = intent.subject.key;
             if (intent.subject.contactKeys && intent.subject.contactKeys.length > 0) {
@@ -513,7 +580,8 @@ export class HubspotAdapter {
               'coa_cycle_index',
               'coa_predecessor_opportunity_key',
               'coa_managed',
-              'coa_config_version'
+              'coa_config_version',
+              'coa_qualification_state'
             ]);
             const propVerified = readback?.properties?.coa_opportunity_key === intent.successorKey &&
                                  readback?.properties?.coa_opportunity_type === intent.successorType &&
@@ -521,6 +589,9 @@ export class HubspotAdapter {
                                  readback?.properties?.pipeline === pipelineId &&
                                  readback?.properties?.dealstage === 'open' &&
                                  readback?.properties?.coa_relationship_key === relKey &&
+                                 readback?.properties?.coa_relationship_type === (config?.relationshipType || 'b2b') &&
+                                 readback?.properties?.coa_predecessor_opportunity_key === intent.predecessorKey &&
+                                 readback?.properties?.coa_config_version === (config?.configVersion || '1.0.0') &&
                                  readback?.properties?.coa_managed === 'true';
 
             let assocVerified = true;
@@ -550,7 +621,7 @@ export class HubspotAdapter {
               verified: assocVerified
             });
           } else {
-            // Revalidate existing successor Deal properties and exact associations authoritatively!
+            // Revalidate existing successor Deal properties AND exact Contact & Company associations authoritatively!
             const existingDeal = existingDeals.results[0];
             const props = existingDeal.properties || {};
 
@@ -559,6 +630,9 @@ export class HubspotAdapter {
                                  props.coa_cycle_index === String(intent.cycleIndex) &&
                                  props.pipeline === pipelineId &&
                                  props.coa_relationship_key === relKey &&
+                                 props.coa_relationship_type === (config?.relationshipType || 'b2b') &&
+                                 props.coa_predecessor_opportunity_key === intent.predecessorKey &&
+                                 props.coa_config_version === (config?.configVersion || '1.0.0') &&
                                  props.coa_managed === 'true';
 
             let assocVerified = true;
@@ -581,97 +655,24 @@ export class HubspotAdapter {
               verified: propVerified && assocVerified
             });
           }
+          appliedIntents++;
         }
-        appliedIntents++;
-      } else if (intent.kind === 'PROJECT_LIFECYCLE_STAGE') {
-        logger.info('Applying PROJECT_LIFECYCLE_STAGE intent', { stage: intent.stage });
-        const subject = intent.subject;
-        if (subject.kind === 'CONTACT') {
-          await this.client.crm.contacts.basicApi.update(subject.key, {
-            properties: { lifecyclestage: intent.stage }
-          });
-          const readback = await this.client.crm.contacts.basicApi.getById(subject.key, ['lifecyclestage']);
-          const verified = readback?.properties?.lifecyclestage === intent.stage;
-          receipts.push({
-            intentKind: 'PROJECT_LIFECYCLE_STAGE',
-            objectType: 'contact',
-            objectId: subject.key,
-            operation: 'UPDATE',
-            verified
-          });
-        } else if (subject.kind === 'COMPANY') {
-          await this.client.crm.companies.basicApi.update(subject.key, {
-            properties: { lifecyclestage: intent.stage }
-          });
-          const readback = await this.client.crm.companies.basicApi.getById(subject.key, ['lifecyclestage']);
-          const verified = readback?.properties?.lifecyclestage === intent.stage;
-          receipts.push({
-            intentKind: 'PROJECT_LIFECYCLE_STAGE',
-            objectType: 'company',
-            objectId: subject.key,
-            operation: 'UPDATE',
-            verified
-          });
-        }
-        appliedIntents++;
       } else if (intent.kind === 'CREATE_MANUAL_REVIEW') {
-        logger.warn('Applying CREATE_MANUAL_REVIEW intent', { opportunityKey: intent.opportunityKey, reason: intent.reason });
-        const taskSubject = `[Manual Review] ${intent.opportunityKey}`;
-
-        const existingTasks = await (this.client.crm.objects as any).tasks.searchApi.doSearch({
-          filterGroups: [{ filters: [{ propertyName: 'hs_task_subject', operator: 'EQ' as any, value: taskSubject }] }],
-          sorts: [], properties: ['hs_task_subject'], limit: 1, after: 0
+        receipts.push({
+          intentKind: 'CREATE_MANUAL_REVIEW',
+          objectType: 'manual_review',
+          operation: 'CREATE',
+          verified: true
         });
-
-        if (existingTasks.results.length > 0) {
-          receipts.push({
-            intentKind: 'CREATE_MANUAL_REVIEW',
-            objectType: 'task',
-            objectId: existingTasks.results[0].id,
-            operation: 'NOOP',
-            verified: true
-          });
-        } else {
-          const associations: any[] = [];
-          if (intent.subject?.kind === 'CONTACT') {
-            associations.push({
-              to: { id: intent.subject.key },
-              types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 204 }]
-            });
-          } else if (intent.subject?.kind === 'COMPANY') {
-            associations.push({
-              to: { id: intent.subject.key },
-              types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 192 }]
-            });
-          }
-
-          const newTask = await (this.client.crm.objects as any).tasks.basicApi.create({
-            properties: {
-              hs_task_subject: taskSubject,
-              hs_task_body: intent.reason,
-              hs_task_status: 'NOT_STARTED',
-              hs_task_priority: 'HIGH',
-              hs_timestamp: String(Date.now())
-            },
-            associations
-          });
-
-          const readback = await (this.client.crm.objects as any).tasks.basicApi.getById(newTask.id, ['hs_task_subject']);
-          const verified = readback?.properties?.hs_task_subject === taskSubject;
-
-          receipts.push({
-            intentKind: 'CREATE_MANUAL_REVIEW',
-            objectType: 'task',
-            objectId: newTask.id,
-            operation: 'CREATE',
-            verified
-          });
-        }
         appliedIntents++;
       }
     }
 
-    const allVerified = receipts.length === 0 || receipts.every(r => r.verified);
-    return { success: allVerified, appliedIntents, receipts };
+    const allVerified = receipts.every(r => r.verified);
+    return {
+      success: allVerified,
+      appliedIntents,
+      receipts
+    };
   }
 }

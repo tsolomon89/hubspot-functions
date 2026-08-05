@@ -43,8 +43,11 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
         dealstage: 'open',
         coa_opportunity_key: 'rel_acme::FTP::1',
         coa_relationship_key: 'rel_acme',
+        coa_relationship_type: 'b2b',
         coa_opportunity_type: 'FTP',
         coa_cycle_index: '1',
+        coa_predecessor_opportunity_key: 'rel_acme::LEAD::1',
+        coa_config_version: '1.0.0',
         coa_managed: 'true'
       }
     });
@@ -120,6 +123,9 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
           coa_cycle_index: '1',
           pipeline: 'b2b_transaction_deal_pipeline',
           coa_relationship_key: 'rel_acme',
+          coa_relationship_type: 'b2b',
+          coa_predecessor_opportunity_key: 'rel_acme::LEAD::1',
+          coa_config_version: '1.0.0',
           coa_managed: 'true'
         }
       }]

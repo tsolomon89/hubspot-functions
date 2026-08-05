@@ -3,8 +3,11 @@ import { processHubSpotCustomCodeAction, main } from '../../src/custom-code-acti
 import { HubspotAdapter, HubSpotSnapshotLoader } from '../../packages/hubspot-adapter';
 
 describe('HubSpot Custom Code Action Contract Tests', () => {
-  it('should throw error when missing valid record ID in production-shaped HubSpot event payload', async () => {
+  it('should throw INVALID_ENROLLMENT when missing valid record ID or portal ID in event payload', async () => {
     await expect(processHubSpotCustomCodeAction({ object: { objectId: '0', objectType: 'CONTACT' } }))
+      .rejects.toThrow('INVALID_ENROLLMENT');
+
+    await expect(processHubSpotCustomCodeAction({ origin: { portalId: 149041124 }, object: { objectId: '123' } } as any))
       .rejects.toThrow('INVALID_ENROLLMENT');
   });
 
@@ -26,7 +29,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
     await expect(main(event)).rejects.toThrow('HTTP-Code: 401');
   });
 
-  it('should throw ACTION_UNVERIFIED when CRM mutation succeeds but readback property verification fails', async () => {
+  it('should throw ACTION_UNVERIFIED through processHubSpotCustomCodeAction when CRM mutation readback fails', async () => {
     const fakeAdapter = new HubspotAdapter('fake-token');
 
     vi.spyOn(fakeAdapter, 'findOrCreateLeadForSubject').mockResolvedValueOnce({

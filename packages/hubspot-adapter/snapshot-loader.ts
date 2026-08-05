@@ -26,14 +26,16 @@ export class HubSpotSnapshotLoader {
 
   public async loadSnapshotFromRecord(
     recordRef: HubSpotRecordRef,
-    organizationKey: string = 'org_default'
+    organizationKey: string = 'org_default',
+    relationshipType: string = 'b2b'
   ): Promise<OpportunitySnapshot> {
-    return this.loadPureSnapshotFromHubSpot(recordRef, organizationKey);
+    return this.loadPureSnapshotFromHubSpot(recordRef, organizationKey, relationshipType);
   }
 
   public async loadPureSnapshotFromHubSpot(
     recordRef: HubSpotRecordRef,
-    organizationKey: string = 'org_default'
+    organizationKey: string = 'org_default',
+    relationshipType: string = 'b2b'
   ): Promise<OpportunitySnapshot> {
     const rawType = (recordRef.objectType || '').toLowerCase();
 
@@ -65,7 +67,6 @@ export class HubSpotSnapshotLoader {
         'coa_relationship_type',
         'coa_marketing_consent',
         'coa_automation_suppressed',
-        'coa_offering_keys',
         'createdate'
       ]);
       const cProps = contact.properties || {};
@@ -83,7 +84,22 @@ export class HubSpotSnapshotLoader {
         if (err?.statusCode !== 404 && err?.status !== 404) throw err;
       }
 
-      relationshipKey = cProps.coa_relationship_key || companyKey || `cnt_${recordRef.objectId}`;
+      // Canonical Relationship Key Resolution: if Contact lacks coa_relationship_key, attempt Company lookup before fallback
+      relationshipKey = cProps.coa_relationship_key || '';
+      if (!relationshipKey && companyKey) {
+        try {
+          const compRecord = await this.client.crm.companies.basicApi.getById(companyKey, ['coa_relationship_key']);
+          if (compRecord.properties?.coa_relationship_key) {
+            relationshipKey = compRecord.properties.coa_relationship_key;
+          }
+        } catch (err: any) {
+          if (err?.statusCode !== 404 && err?.status !== 404) throw err;
+        }
+      }
+      if (!relationshipKey) {
+        relationshipKey = companyKey ? `comp_${companyKey}` : `cnt_${recordRef.objectId}`;
+      }
+
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
       facts = {
@@ -93,9 +109,6 @@ export class HubSpotSnapshotLoader {
         marketingConsent: cProps.coa_marketing_consent === 'true' || cProps.coa_marketing_consent === '1',
         automationSuppressed: cProps.coa_automation_suppressed === 'true' || cProps.coa_automation_suppressed === '1'
       };
-      if (cProps.coa_offering_keys) {
-        facts.offeringKeys = String(cProps.coa_offering_keys).split(',').map(s => s.trim());
-      }
       openedAt = parseHubSpotTimestamp(cProps.createdate) || openedAt;
 
     } else if (rawType === 'company' || rawType === '0-2') {
@@ -110,7 +123,6 @@ export class HubSpotSnapshotLoader {
         'coa_relationship_type',
         'coa_marketing_consent',
         'coa_automation_suppressed',
-        'coa_offering_keys',
         'createdate'
       ]);
       const compProps = company.properties || {};
@@ -138,9 +150,6 @@ export class HubSpotSnapshotLoader {
         marketingConsent: compProps.coa_marketing_consent === 'true' || compProps.coa_marketing_consent === '1',
         automationSuppressed: compProps.coa_automation_suppressed === 'true' || compProps.coa_automation_suppressed === '1'
       };
-      if (compProps.coa_offering_keys) {
-        facts.offeringKeys = String(compProps.coa_offering_keys).split(',').map(s => s.trim());
-      }
       openedAt = parseHubSpotTimestamp(compProps.createdate) || openedAt;
 
     } else if (rawType === 'lead' || rawType === '0-136') {
@@ -210,20 +219,6 @@ export class HubSpotSnapshotLoader {
       cycleIndex = Number(lProps.coa_cycle_index) || 1;
       openedAt = parseHubSpotTimestamp(lProps.createdate) || openedAt;
 
-      // Check if deterministic successor FTP Deal already exists in CRM
-      const successorFtpKey = `${relationshipKey}::FTP::1`;
-      try {
-        const dealSearch = await this.client.crm.deals.searchApi.doSearch({
-          filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: successorFtpKey }] }],
-          sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: 0
-        });
-        if (dealSearch.results && dealSearch.results.length > 0) {
-          facts.successorAlreadyExists = true;
-        }
-      } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
-      }
-
     } else if (rawType === 'deal' || rawType === '0-3') {
       const deal = await this.client.crm.deals.basicApi.getById(recordRef.objectId, [
         'dealname',
@@ -237,6 +232,7 @@ export class HubSpotSnapshotLoader {
         'coa_qualification_state',
         'coa_predecessor_opportunity_key',
         'coa_predecessor_completed_at',
+        'coa_offering_keys',
         'createdate'
       ]);
       const dProps = deal.properties || {};
@@ -287,25 +283,12 @@ export class HubSpotSnapshotLoader {
         opportunityState = 'OPEN';
       }
 
+      if (dProps.coa_offering_keys) {
+        facts.offeringKeys = String(dProps.coa_offering_keys).split(',').map(s => s.trim());
+      }
+
       openedAt = parseHubSpotTimestamp(dProps.createdate) || openedAt;
       predecessorCompletedAt = parseHubSpotTimestamp(dProps.coa_predecessor_completed_at) || undefined;
-
-      // Search if deterministic successor Deal already exists in CRM
-      const nextCycleIndex = opportunityType === 'FTP' ? 1 : cycleIndex + 1;
-      const successorType = opportunityType === 'FTP' ? 'RTP' : 'RTP';
-      const successorKey = `${relationshipKey}::${successorType}::${nextCycleIndex}`;
-
-      try {
-        const succSearch = await this.client.crm.deals.searchApi.doSearch({
-          filterGroups: [{ filters: [{ propertyName: 'coa_opportunity_key', operator: 'EQ' as any, value: successorKey }] }],
-          sorts: [], properties: ['coa_opportunity_key'], limit: 1, after: 0
-        });
-        if (succSearch.results && succSearch.results.length > 0) {
-          facts.successorAlreadyExists = true;
-        }
-      } catch (err: any) {
-        if (err?.statusCode !== 404 && err?.status !== 404) throw err;
-      }
     } else {
       throw new Error(`INVALID_ENROLLMENT: Unsupported objectType '${recordRef.objectType}'`);
     }
@@ -317,8 +300,7 @@ export class HubSpotSnapshotLoader {
           'email',
           'lifecyclestage',
           'coa_marketing_consent',
-          'coa_automation_suppressed',
-          'coa_offering_keys'
+          'coa_automation_suppressed'
         ]);
         const pcProps = primaryContact.properties || {};
         facts.email = pcProps.email || facts.email;
@@ -328,9 +310,6 @@ export class HubSpotSnapshotLoader {
         }
         if (pcProps.coa_automation_suppressed === 'true' || pcProps.coa_automation_suppressed === '1') {
           facts.automationSuppressed = true;
-        }
-        if (pcProps.coa_offering_keys && !facts.offeringKeys) {
-          facts.offeringKeys = String(pcProps.coa_offering_keys).split(',').map(s => s.trim());
         }
       } catch (err: any) {
         if (err?.statusCode !== 404 && err?.status !== 404) throw err;
@@ -370,7 +349,7 @@ export class HubSpotSnapshotLoader {
     return {
       organizationKey,
       relationshipKey,
-      relationshipType: 'b2b',
+      relationshipType: relationshipType || 'b2b',
       opportunityKey,
       opportunityType,
       opportunityState,

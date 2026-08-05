@@ -3,7 +3,7 @@ import { processHubSpotCustomCodeAction } from '../../src/custom-code-actions/re
 import { HubspotAdapter } from '../../packages/hubspot-adapter/adapter';
 
 describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', () => {
-  it('Should execute processHubSpotCustomCodeAction through Contact -> Lead -> FTP Deal -> Closed Won -> RTP1 Deal -> Closed Won -> RTP2 Deal with Replay Safety', async () => {
+  it('Should execute processHubSpotCustomCodeAction through Contact -> Lead -> FTP Deal -> Closed Won -> RTP1 Deal -> Closed Won -> RTP2 Deal with exact Contact and Company associations and Replay Safety', async () => {
     const meetingTime = String(Date.now() + 600000);
 
     // Stateful fake CRM store
@@ -16,7 +16,6 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
             coa_relationship_key: 'rel_acme_inc',
             coa_relationship_type: 'b2b',
             coa_marketing_consent: 'true',
-            coa_offering_keys: 'prod_software',
             lifecyclestage: 'lead'
           }
         }
@@ -209,16 +208,25 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
     // STEP 1: Process initial Contact enrollment -> Managed Lead created & progressed to SQL
     const step1Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
-      object: { objectId: 'cnt_1001', objectType: 'CONTACT' }
+      object: { objectId: 'cnt_1001', objectType: 'CONTACT' },
+      inputFields: { offeringKeys: 'prod_software' }
     }, 'fake-token', fakeAdapter);
 
     expect(step1Result.outputFields.objectType).toBe('lead');
     expect(step1Result.outputFields.qualificationState).toBe('SATISFIED');
-    expect(step1Result.outputFields.status).toBe('UPDATED');
+    expect(step1Result.outputFields.status).toBe('UPDATED_EXISTING');
 
     const createdLeadId = step1Result.outputFields.objectId;
     expect(createdLeadId).toBeDefined();
     expect(crmStore.leads[createdLeadId]).toBeDefined();
+
+    // Assert exact Contact AND Company associations on created Lead
+    const leadContactAssocs = crmStore.associations['lead->contact'].filter(a => a.from === createdLeadId);
+    const leadCompanyAssocs = crmStore.associations['lead->company'].filter(a => a.from === createdLeadId);
+    expect(leadContactAssocs.length).toBe(1);
+    expect(leadContactAssocs[0].to).toBe('cnt_1001');
+    expect(leadCompanyAssocs.length).toBe(1);
+    expect(leadCompanyAssocs[0].to).toBe('comp_5001');
 
     // STEP 2: Process created Lead enrollment -> Moves to Qualified & Creates FTP Deal
     const step2Result = await processHubSpotCustomCodeAction({
@@ -234,6 +242,14 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
     const ftpDeal = createdDeals[0];
     expect(ftpDeal.properties.coa_opportunity_type).toBe('FTP');
     expect(ftpDeal.properties.dealstage).toBe('open');
+
+    // Assert exact Contact AND Company associations on created FTP Deal
+    const ftpContactAssocs = crmStore.associations['deal->contact'].filter(a => a.from === ftpDeal.id);
+    const ftpCompanyAssocs = crmStore.associations['deal->company'].filter(a => a.from === ftpDeal.id);
+    expect(ftpContactAssocs.length).toBe(1);
+    expect(ftpContactAssocs[0].to).toBe('cnt_1001');
+    expect(ftpCompanyAssocs.length).toBe(1);
+    expect(ftpCompanyAssocs[0].to).toBe('comp_5001');
 
     // STEP 3: Replay Lead enrollment -> Idempotent NO_CHANGE
     const step3Result = await processHubSpotCustomCodeAction({
@@ -258,6 +274,16 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
     expect(rtp1Deal).toBeDefined();
     expect(rtp1Deal?.properties.coa_opportunity_key).toBe('rel_acme_inc::RTP::1');
 
+    if (rtp1Deal) {
+      // Assert exact Contact AND Company associations on created RTP1 Deal
+      const rtp1ContactAssocs = crmStore.associations['deal->contact'].filter(a => a.from === rtp1Deal.id);
+      const rtp1CompanyAssocs = crmStore.associations['deal->company'].filter(a => a.from === rtp1Deal.id);
+      expect(rtp1ContactAssocs.length).toBe(1);
+      expect(rtp1ContactAssocs[0].to).toBe('cnt_1001');
+      expect(rtp1CompanyAssocs.length).toBe(1);
+      expect(rtp1CompanyAssocs[0].to).toBe('comp_5001');
+    }
+
     // STEP 5: Replay FTP Deal enrollment -> Idempotent NO_CHANGE
     const step5Result = await processHubSpotCustomCodeAction({
       origin: { portalId: 149041124 },
@@ -281,6 +307,16 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
       const rtp2Deal = Object.values(crmStore.deals).find(d => d.properties.coa_opportunity_type === 'RTP' && d.properties.coa_cycle_index === '2');
       expect(rtp2Deal).toBeDefined();
       expect(rtp2Deal?.properties.coa_opportunity_key).toBe('rel_acme_inc::RTP::2');
+
+      if (rtp2Deal) {
+        // Assert exact Contact AND Company associations on created RTP2 Deal
+        const rtp2ContactAssocs = crmStore.associations['deal->contact'].filter(a => a.from === rtp2Deal.id);
+        const rtp2CompanyAssocs = crmStore.associations['deal->company'].filter(a => a.from === rtp2Deal.id);
+        expect(rtp2ContactAssocs.length).toBe(1);
+        expect(rtp2ContactAssocs[0].to).toBe('cnt_1001');
+        expect(rtp2CompanyAssocs.length).toBe(1);
+        expect(rtp2CompanyAssocs[0].to).toBe('comp_5001');
+      }
 
       // STEP 7: Replay RTP1 Deal enrollment -> Idempotent NO_CHANGE
       const step7Result = await processHubSpotCustomCodeAction({

@@ -8,8 +8,11 @@ export interface ResolveConfigOptions {
 }
 
 export class OrganizationConfigResolver {
-  public static resolveConfigByPortalId(portalId: number | string): QualificationConfig {
-    return new OrganizationConfigResolver().resolveConfig({ portalId });
+  public static resolveConfigByPortalId(
+    portalId: number | string,
+    options?: Omit<ResolveConfigOptions, 'portalId'>
+  ): QualificationConfig {
+    return new OrganizationConfigResolver().resolveConfig({ portalId, ...options });
   }
 
   public resolvePortalInstallation(portalId?: number | string): { organizationKey: string; defaultRelationshipType: string } | null {
@@ -61,7 +64,6 @@ export class OrganizationConfigResolver {
       if (valRes.valid) return config;
     }
 
-    // Fail closed explicitly if requested org key or relationship type is unknown
     throw new Error(`UNSUPPORTED_RELATIONSHIP_TYPE: Qualification configuration for '${orgKey}:${relType}' was not found`);
   }
 }

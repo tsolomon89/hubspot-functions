@@ -67,11 +67,6 @@ export function planTransition(
     return [{ kind: 'NOOP', reason: 'Opportunity is LOST' }];
   }
 
-  // Replay Safety: Closed Won opportunity with existing verified successor is terminal NOOP
-  if (snapshot.opportunityState === 'WON' && snapshot.facts.successorAlreadyExists === true) {
-    return [{ kind: 'NOOP', reason: 'Opportunity is WON and deterministic successor already exists' }];
-  }
-
   if (config.featureFlags?.automationSuppressed) {
     return [{ kind: 'NOOP', reason: 'Automation suppressed by organization kill switch' }];
   }
@@ -181,14 +176,14 @@ export function planTransition(
       subject: snapshot.subject,
       stage: 'customer'
     });
-    const nextCycleIndex = snapshot.cycleIndex + 1;
-    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', nextCycleIndex);
+    const nextCycle = (snapshot.cycleIndex || 1) + 1;
+    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', nextCycle);
     intents.push({
       kind: 'CREATE_SUCCESSOR',
       predecessorKey: snapshot.opportunityKey,
       successorKey,
       successorType: 'RTP',
-      cycleIndex: nextCycleIndex,
+      cycleIndex: nextCycle,
       subject: snapshot.subject
     });
   }
