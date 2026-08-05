@@ -1,0 +1,33 @@
+{
+  "portalId": 149041124,
+  "auditedAt": "2026-08-05T12:26:00Z",
+  "accountType": "DEVELOPER_TEST_ACCOUNT",
+  "capabilities": {
+    "hasLeadObject": true,
+    "hasQuoteObject": true,
+    "hasOrderObject": true,
+    "hasLineItemObject": true,
+    "hasCustomObjects": false
+  },
+  "supportedNativeProjections": [
+    "Contact",
+    "Company",
+    "Lead",
+    "Deal",
+    "Product",
+    "LineItem"
+  ],
+  "supportedEvidenceProviders": [
+    "Meeting",
+    "Call",
+    "Task",
+    "Cart",
+    "Order"
+  ],
+  "unimplementedConditionalProviders": [
+    "Invoice",
+    "Subscription",
+    "Project",
+    "Service"
+  ]
+}
