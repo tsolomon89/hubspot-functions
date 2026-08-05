@@ -23,16 +23,22 @@ describe('Schema Tool Plan & Apply Determinism', () => {
     const tool = new SchemaTool();
     const manifest = tool.loadManifest();
     
-    // Mock current account schema containing all manifest properties
+    // Mock current account schema containing all manifest properties and pipelines
     const mockCurrentSchema = {
       properties: {
         companies: manifest.properties.companies || [],
         deals: manifest.properties.deals || [],
+        leads: manifest.properties.leads || [],
         contacts: []
-      }
+      },
+      pipelines: (manifest.pipelines?.deals || []).map((p: any) => ({
+        id: p.pipelineId,
+        label: p.name
+      }))
     };
 
     const diff = tool.plan(mockCurrentSchema);
     expect(diff.propertiesToCreate.length).toEqual(0);
+    expect(diff.pipelinesToCreate.length).toEqual(0);
   });
 });

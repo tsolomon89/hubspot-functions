@@ -8,7 +8,6 @@ import {
   EvidenceRecord
 } from './types';
 
-// Universal Minimum Goals that cannot be deleted or weakened by configuration
 export const UNIVERSAL_MINIMUM_GOALS: Record<OpportunityType, GoalDefinition[]> = {
   MQL: [
     {
@@ -75,9 +74,15 @@ export function evaluatePredicate(
   goal: GoalDefinition,
   snapshot: OpportunitySnapshot
 ): { satisfied: boolean; evidenceRefs: string[] } {
+  // Enforce evidence window scope rules
   const matchingEvidence = snapshot.evidence.filter(ev => {
     if (goal.scope === 'opportunity' && ev.occurredAt < snapshot.openedAt) {
-      return false; // Out-of-window evidence ignored
+      return false; // Pre-opportunity evidence ignored
+    }
+    if (goal.scope === 'sincePredecessorCompletion') {
+      if (!snapshot.predecessorCompletedAt || ev.occurredAt <= snapshot.predecessorCompletedAt) {
+        return false; // Evidence prior to predecessor completion boundary ignored for RTP!
+      }
     }
     return true;
   });
@@ -108,9 +113,25 @@ export function evaluatePredicate(
       });
       return { satisfied: evMatches.length > 0, evidenceRefs: evMatches.map(e => e.id) };
     }
+    case 'associationExists': {
+      const objectType = goal.params?.objectType;
+      const evMatches = matchingEvidence.filter(e => e.data?.associatedObjectType === objectType || e.predicate === 'associationExists');
+      return { satisfied: evMatches.length > 0, evidenceRefs: evMatches.map(e => e.id) };
+    }
     case 'transactionExists': {
       const evMatches = matchingEvidence.filter(e => e.predicate === 'transactionExists' || e.data?.transactionId || e.data?.orderId);
-      const hasFactTransaction = Boolean(snapshot.facts.transactionCompleted || snapshot.facts.orderCompleted);
+      
+      // Fact-based transaction check: ONLY valid for current cycle if completed after predecessor boundary!
+      let hasFactTransaction = false;
+      if (snapshot.facts.transactionCompleted || snapshot.facts.orderCompleted) {
+        const factTxTime = (snapshot.facts.transactionCompletedAt as string) || snapshot.openedAt;
+        if (goal.scope === 'sincePredecessorCompletion') {
+          hasFactTransaction = Boolean(snapshot.predecessorCompletedAt && factTxTime > snapshot.predecessorCompletedAt);
+        } else {
+          hasFactTransaction = true;
+        }
+      }
+
       const satisfied = hasFactTransaction || evMatches.length > 0;
       const refs = evMatches.map(e => e.id);
       if (hasFactTransaction) refs.push('fact_transaction_completed');
@@ -118,10 +139,50 @@ export function evaluatePredicate(
     }
     case 'property': {
       const propName = goal.params?.property as string;
-      const expectedValue = goal.params?.equals;
       const val = snapshot.facts[propName];
-      const satisfied = expectedValue !== undefined ? val === expectedValue : val !== undefined && val !== null;
+
+      let satisfied = false;
+      if (goal.params?.equals !== undefined) {
+        satisfied = val === goal.params.equals;
+      } else if (goal.params?.notEquals !== undefined) {
+        satisfied = val !== goal.params.notEquals;
+      } else if (Array.isArray(goal.params?.in)) {
+        satisfied = (goal.params.in as any[]).includes(val);
+      } else if (goal.params?.greaterThan !== undefined) {
+        satisfied = Number(val) > Number(goal.params.greaterThan);
+      } else if (goal.params?.lessThan !== undefined) {
+        satisfied = Number(val) < Number(goal.params.lessThan);
+      } else {
+        satisfied = val !== undefined && val !== null;
+      }
+
       return { satisfied, evidenceRefs: satisfied ? [`fact_prop_${propName}`] : [] };
+    }
+    case 'count': {
+      const targetPredicate = goal.params?.targetPredicate as string;
+      const threshold = Number(goal.params?.threshold || 1);
+      const evMatches = matchingEvidence.filter(e => e.predicate === targetPredicate);
+      const satisfied = evMatches.length >= threshold;
+      return { satisfied, evidenceRefs: evMatches.map(e => e.id) };
+    }
+    case 'all': {
+      const subGoals = (goal.params?.goals as GoalDefinition[]) || [];
+      const results = subGoals.map(g => evaluatePredicate(g, snapshot));
+      const satisfied = results.every(r => r.satisfied);
+      const refs = results.flatMap(r => r.evidenceRefs);
+      return { satisfied, evidenceRefs: refs };
+    }
+    case 'any': {
+      const subGoals = (goal.params?.goals as GoalDefinition[]) || [];
+      const results = subGoals.map(g => evaluatePredicate(g, snapshot));
+      const satisfied = results.some(r => r.satisfied);
+      const refs = results.flatMap(r => r.evidenceRefs);
+      return { satisfied, evidenceRefs: refs };
+    }
+    case 'not': {
+      const subGoal = goal.params?.goal as GoalDefinition;
+      const result = subGoal ? evaluatePredicate(subGoal, snapshot) : { satisfied: false, evidenceRefs: [] };
+      return { satisfied: !result.satisfied, evidenceRefs: [] };
     }
     default: {
       return { satisfied: false, evidenceRefs: [] };
@@ -154,6 +215,10 @@ export function evaluateOpportunity(
   let qualificationState: QualificationState = 'PENDING';
   if (unsatisfiedGoalKeys.length === 0) {
     qualificationState = 'SATISFIED';
+  } else if (snapshot.facts.blocked === true) {
+    qualificationState = 'BLOCKED';
+  } else if (snapshot.facts.manualReviewRequired === true) {
+    qualificationState = 'MANUAL_REVIEW';
   }
 
   return {

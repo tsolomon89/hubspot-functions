@@ -20,9 +20,11 @@ export interface OpportunitySnapshot {
   relationshipType: string;
   opportunityKey: string;
   opportunityType: OpportunityType;
+  opportunityState: OpportunityState;
   cycleIndex: number;
   openedAt: string;
   predecessorOpportunityKey?: string;
+  predecessorCompletedAt?: string;
   subject: CommercialSubjectRef;
   facts: Record<string, unknown>;
   evidence: EvidenceRecord[];

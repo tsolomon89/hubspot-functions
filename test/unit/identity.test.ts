@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { resolveSubjectIdentity, sanitizeKey } from '../../packages/domain';
 
 describe('Universal Commercial Subject Identity Resolution', () => {
-  it('should resolve B2C Contact-only subject cleanly', () => {
+  it('should resolve Contact-only subject key as email without b2c_ prefix', () => {
     const subject = resolveSubjectIdentity({
       email: 'alice@example.com',
       firstName: 'Alice',
@@ -10,33 +10,33 @@ describe('Universal Commercial Subject Identity Resolution', () => {
     });
 
     expect(subject.kind).toBe('CONTACT');
-    expect(subject.subjectKey).toBe('b2c_alice_example.com');
+    expect(subject.subjectKey).toBe('alice@example.com');
     expect(subject.contact?.email).toBe('alice@example.com');
     expect(subject.company).toBeUndefined();
   });
 
-  it('should resolve Company-only subject', () => {
+  it('should resolve Company-only subject key as companyKey without prefixes', () => {
     const subject = resolveSubjectIdentity(undefined, {
       name: 'Acme Corp',
       domain: 'acme.com'
     });
 
     expect(subject.kind).toBe('COMPANY');
-    expect(subject.subjectKey).toBe('company_acme.com');
+    expect(subject.subjectKey).toBe('acme.com');
     expect(subject.company?.name).toBe('Acme Corp');
     expect(subject.contact).toBeUndefined();
   });
 
-  it('should resolve B2B Company + Contact subject', () => {
+  it('should associate B2B Contact under Company subject key (acme.com)', () => {
     const subject = resolveSubjectIdentity(
       { email: 'bob@acme.com', firstName: 'Bob' },
       { name: 'Acme Corp', domain: 'acme.com' }
     );
 
     expect(subject.kind).toBe('COMPANY_CONTACTS');
-    expect(subject.subjectKey).toBe('b2b_acme.com_bob_acme.com');
+    expect(subject.subjectKey).toBe('acme.com');
     expect(subject.company?.name).toBe('Acme Corp');
-    expect(subject.contact?.email).toBe('bob@acme.com');
+    expect(subject.associatedContactEmails).toContain('bob@acme.com');
   });
 
   it('should sanitize key characters safely', () => {

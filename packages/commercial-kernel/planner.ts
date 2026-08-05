@@ -7,6 +7,23 @@ import {
   CommercialSubjectRef 
 } from './types';
 
+export function validateCommercialModel(config: QualificationConfig): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!config.organizationKey) errors.push('Missing organizationKey');
+  if (!config.configVersion) errors.push('Missing configVersion');
+  if (!config.relationshipType) errors.push('Missing relationshipType');
+  if (!config.goalsByOpportunityType) {
+    errors.push('Missing goalsByOpportunityType');
+  } else {
+    for (const oppType of ['MQL', 'SQL', 'FTP', 'RTP'] as OpportunityType[]) {
+      if (!Array.isArray(config.goalsByOpportunityType[oppType])) {
+        errors.push(`goalsByOpportunityType.${oppType} must be an array`);
+      }
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
+
 export function deriveSuccessorKey(
   relationshipKey: string,
   successorType: OpportunityType,
@@ -42,10 +59,25 @@ export function planTransition(
   evaluation: EvaluationResult,
   config: QualificationConfig
 ): TransitionIntent[] {
-  const intents: TransitionIntent[] = [];
+  // Replay Safety: Prevent re-evaluating already closed opportunities
+  if (snapshot.opportunityState === 'WON' || snapshot.opportunityState === 'LOST') {
+    return [{ kind: 'NOOP', reason: `Opportunity is already closed (${snapshot.opportunityState})` }];
+  }
 
   if (config.featureFlags?.automationSuppressed) {
     return [{ kind: 'NOOP', reason: 'Automation suppressed by organization kill switch' }];
+  }
+
+  if (evaluation.qualificationState === 'BLOCKED') {
+    return [{ kind: 'NOOP', reason: 'Opportunity qualification is BLOCKED' }];
+  }
+
+  if (evaluation.qualificationState === 'MANUAL_REVIEW') {
+    return [{ 
+      kind: 'CREATE_MANUAL_REVIEW', 
+      opportunityKey: snapshot.opportunityKey, 
+      reason: 'Opportunity requires human manual review' 
+    }];
   }
 
   if (evaluation.qualificationState !== 'SATISFIED') {
@@ -59,12 +91,12 @@ export function planTransition(
   }
 
   // Opportunity is SATISFIED -> Close current opportunity as WON and plan successor
-  intents.push({
+  const intents: TransitionIntent[] = [{
     kind: 'UPDATE_OPPORTUNITY',
     opportunityKey: snapshot.opportunityKey,
     newState: 'WON',
     qualificationState: 'SATISFIED'
-  });
+  }];
 
   // Derived Lifecycle Stage projection
   const projectedStage = projectLifecycleStage(snapshot.opportunityType, 'SATISFIED');

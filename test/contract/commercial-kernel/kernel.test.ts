@@ -43,6 +43,7 @@ describe('Pure Commercial Kernel Contract Tests', () => {
       relationshipType: 'b2b',
       opportunityKey: 'rel_123::MQL::1',
       opportunityType: 'MQL',
+      opportunityState: 'OPEN',
       cycleIndex: 1,
       openedAt: '2026-08-05T00:00:00Z',
       subject: { kind: 'CONTACT', key: 'cnt_123' },
@@ -62,6 +63,7 @@ describe('Pure Commercial Kernel Contract Tests', () => {
       relationshipType: 'b2b',
       opportunityKey: 'rel_123::MQL::1',
       opportunityType: 'MQL',
+      opportunityState: 'OPEN',
       cycleIndex: 1,
       openedAt: '2026-08-05T00:00:00Z',
       subject: { kind: 'CONTACT', key: 'cnt_123' },
@@ -74,13 +76,14 @@ describe('Pure Commercial Kernel Contract Tests', () => {
     expect(evaluation.satisfiedGoalKeys).toContain('universal_mql_communication_channel');
   });
 
-  it('should plan transition from MQL to SQL upon MQL completion', () => {
+  it('should return NOOP when attempting to transition an already WON opportunity', () => {
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_test',
       relationshipKey: 'rel_123',
       relationshipType: 'b2b',
       opportunityKey: 'rel_123::MQL::1',
       opportunityType: 'MQL',
+      opportunityState: 'WON',
       cycleIndex: 1,
       openedAt: '2026-08-05T00:00:00Z',
       subject: { kind: 'CONTACT', key: 'cnt_123' },
@@ -91,85 +94,66 @@ describe('Pure Commercial Kernel Contract Tests', () => {
     const evaluation = evaluateOpportunity(snapshot, baseConfig);
     const intents = planTransition(snapshot, evaluation, baseConfig);
 
-    expect(intents).toHaveLength(3);
-    expect(intents[0]).toEqual({
-      kind: 'UPDATE_OPPORTUNITY',
-      opportunityKey: 'rel_123::MQL::1',
-      newState: 'WON',
-      qualificationState: 'SATISFIED'
-    });
-    expect(intents[1]).toEqual({
-      kind: 'PROJECT_LIFECYCLE_STAGE',
-      subject: { kind: 'CONTACT', key: 'cnt_123' },
-      stage: 'marketingqualifiedlead'
-    });
-    expect(intents[2]).toEqual({
-      kind: 'CREATE_SUCCESSOR',
-      predecessorKey: 'rel_123::MQL::1',
-      successorKey: 'rel_123::SQL::1',
-      successorType: 'SQL',
-      cycleIndex: 1
-    });
+    expect(intents).toHaveLength(1);
+    expect(intents[0].kind).toBe('NOOP');
+    if (intents[0].kind === 'NOOP') {
+      expect(intents[0].reason).toContain('Opportunity is already closed');
+    }
   });
 
-  it('should plan transition from SQL to FTP upon SQL completion', () => {
+  it('should enforce evidence window boundary for RTP cycle (sincePredecessorCompletion)', () => {
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_test',
       relationshipKey: 'rel_123',
       relationshipType: 'b2b',
-      opportunityKey: 'rel_123::SQL::1',
-      opportunityType: 'SQL',
-      cycleIndex: 1,
-      openedAt: '2026-08-05T00:00:00Z',
+      opportunityKey: 'rel_123::RTP::2',
+      opportunityType: 'RTP',
+      opportunityState: 'OPEN',
+      cycleIndex: 2,
+      openedAt: '2026-08-05T02:00:00Z',
+      predecessorOpportunityKey: 'rel_123::RTP::1',
+      predecessorCompletedAt: '2026-08-05T02:00:00Z',
       subject: { kind: 'CONTACT', key: 'cnt_123' },
-      facts: { email: 'user@example.com', products: ['product_core'] },
+      facts: {},
       evidence: [{
-        id: 'ev_meet_1',
-        predicate: 'activityExists',
-        scope: 'opportunity',
+        id: 'ev_old_tx',
+        predicate: 'transactionExists',
+        scope: 'sincePredecessorCompletion',
         occurredAt: '2026-08-05T01:00:00Z',
-        data: { activityType: 'MEETING', outcome: 'COMPLETED' }
+        data: { transactionId: 'tx_old' }
       }]
     };
 
     const evaluation = evaluateOpportunity(snapshot, baseConfig);
-    const intents = planTransition(snapshot, evaluation, baseConfig);
-
-    expect(evaluation.qualificationState).toBe('SATISFIED');
-    const successorIntent = intents.find(i => i.kind === 'CREATE_SUCCESSOR');
-    expect(successorIntent).toEqual({
-      kind: 'CREATE_SUCCESSOR',
-      predecessorKey: 'rel_123::SQL::1',
-      successorKey: 'rel_123::FTP::1',
-      successorType: 'FTP',
-      cycleIndex: 1
-    });
+    expect(evaluation.qualificationState).toBe('PENDING');
+    expect(evaluation.unsatisfiedGoalKeys).toContain('universal_rtp_subsequent_transaction');
   });
 
-  it('should derive RTP_2 successor from completed RTP_1 opportunity', () => {
+  it('should satisfy RTP cycle when transaction evidence occurs AFTER predecessor completion boundary', () => {
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_test',
       relationshipKey: 'rel_123',
       relationshipType: 'b2b',
-      opportunityKey: 'rel_123::RTP::1',
+      opportunityKey: 'rel_123::RTP::2',
       opportunityType: 'RTP',
-      cycleIndex: 1,
-      openedAt: '2026-08-05T00:00:00Z',
+      opportunityState: 'OPEN',
+      cycleIndex: 2,
+      openedAt: '2026-08-05T02:00:00Z',
+      predecessorOpportunityKey: 'rel_123::RTP::1',
+      predecessorCompletedAt: '2026-08-05T02:00:00Z',
       subject: { kind: 'CONTACT', key: 'cnt_123' },
-      facts: { transactionCompleted: true },
-      evidence: []
+      facts: {},
+      evidence: [{
+        id: 'ev_new_tx',
+        predicate: 'transactionExists',
+        scope: 'sincePredecessorCompletion',
+        occurredAt: '2026-08-05T03:00:00Z',
+        data: { transactionId: 'tx_new' }
+      }]
     };
 
     const evaluation = evaluateOpportunity(snapshot, baseConfig);
-    const intents = planTransition(snapshot, evaluation, baseConfig);
-
-    const successorIntent = intents.find(i => i.kind === 'CREATE_SUCCESSOR');
-    expect(successorIntent).toEqual({
-      kind: 'CREATE_SUCCESSOR',
-      predecessorKey: 'rel_123::RTP::1',
-      successorKey: 'rel_123::RTP::2',
-      successorType: 'RTP',
-      cycleIndex: 2
-    });
+    expect(evaluation.qualificationState).toBe('SATISFIED');
+    expect(evaluation.satisfiedGoalKeys).toContain('universal_rtp_subsequent_transaction');
   });
 });

@@ -5,6 +5,10 @@ yarn-debug.log*
 yarn-error.log*
 dist/
 
+# IDE & Tooling Configs
+.cursor/
+.vscode/
+
 # HubSpot CLI Credentials & Local Config
 .env
 .env.*

@@ -149,6 +149,26 @@ export class SchemaTool {
       }
     }
 
+    // 3. Create Pipelines
+    for (const pipe of diff.pipelinesToCreate) {
+      try {
+        await rawClient.crm.pipelines.pipelinesApi.create('deals', {
+          label: pipe.name,
+          displayOrder: pipe.displayOrder || 1,
+          stages: (pipe.stages || []).map((s: any) => ({
+            label: s.label,
+            displayOrder: s.displayOrder,
+            metadata: s.metadata || { probability: 0.5 }
+          }))
+        });
+        appliedCount++;
+      } catch (err: any) {
+        if (err.statusCode !== 409 && err.code !== 409) {
+          errors.push(`Failed to create deal pipeline ${pipe.name}: ${err.message}`);
+        }
+      }
+    }
+
     const applied = errors.length === 0;
     return { applied, count: appliedCount, errors };
   }
@@ -156,7 +176,7 @@ export class SchemaTool {
   public async readback(hsAdapter?: HubspotAdapter): Promise<{ verified: boolean; diffAfterApply: SchemaDiff }> {
     const inspected = await this.inspect(hsAdapter);
     const diffAfterApply = this.plan(inspected);
-    const verified = diffAfterApply.propertiesToCreate.length === 0;
+    const verified = diffAfterApply.propertiesToCreate.length === 0 && diffAfterApply.pipelinesToCreate.length === 0;
 
     return {
       verified,

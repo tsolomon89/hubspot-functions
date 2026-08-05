@@ -40,10 +40,10 @@ export function resolveSubjectIdentity(
 
     if (contactInput && contactInput.email) {
       const email = contactInput.email.trim().toLowerCase();
-      const subjectKey = `b2b_${companyKey}_${sanitizeKey(email)}`;
+      // Subject key is the Company Key; contact is associated under the same Company subject
       return {
         kind: 'COMPANY_CONTACTS',
-        subjectKey,
+        subjectKey: companyKey,
         company,
         contact: {
           email,
@@ -57,7 +57,7 @@ export function resolveSubjectIdentity(
 
     return {
       kind: 'COMPANY',
-      subjectKey: `company_${companyKey}`,
+      subjectKey: companyKey,
       company
     };
   }
@@ -66,7 +66,7 @@ export function resolveSubjectIdentity(
     const email = contactInput.email.trim().toLowerCase();
     return {
       kind: 'CONTACT',
-      subjectKey: `b2c_${sanitizeKey(email)}`,
+      subjectKey: email,
       contact: {
         email,
         firstName: contactInput.firstName ? contactInput.firstName.trim() : undefined,

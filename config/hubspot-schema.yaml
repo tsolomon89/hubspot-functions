@@ -4,7 +4,7 @@ project: "hubspot-functions"
 propertyGroups:
   - name: "commercial_operations_automation"
     label: "Commercial Operations Automation"
-    objectTypes: ["companies", "deals", "contacts"]
+    objectTypes: ["companies", "deals", "contacts", "leads"]
 
 properties:
   companies:
@@ -24,14 +24,14 @@ properties:
       hasUniqueValue: false
       description: "Relationship Type category (b2b, b2c, partnership, reseller)."
 
-  deals:
+  leads:
     - name: "coa_opportunity_key"
       label: "Opportunity Key"
       type: "string"
       fieldType: "text"
       groupName: "commercial_operations_automation"
       hasUniqueValue: true
-      description: "Canonical identity key for Opportunity."
+      description: "Canonical identity key for Lead Qualification Opportunity."
 
     - name: "coa_relationship_key"
       label: "Relationship Key"
@@ -51,11 +51,52 @@ properties:
           value: "MQL"
         - label: "SQL"
           value: "SQL"
+      description: "Qualification Opportunity Type (MQL or SQL)."
+
+    - name: "coa_qualification_state"
+      label: "Qualification State"
+      type: "enumeration"
+      fieldType: "select"
+      groupName: "commercial_operations_automation"
+      options:
+        - label: "PENDING"
+          value: "PENDING"
+        - label: "SATISFIED"
+          value: "SATISFIED"
+        - label: "BLOCKED"
+          value: "BLOCKED"
+        - label: "MANUAL_REVIEW"
+          value: "MANUAL_REVIEW"
+      description: "Current qualification state evaluated by commercial kernel."
+
+  deals:
+    - name: "coa_opportunity_key"
+      label: "Opportunity Key"
+      type: "string"
+      fieldType: "text"
+      groupName: "commercial_operations_automation"
+      hasUniqueValue: true
+      description: "Canonical identity key for Transaction Opportunity."
+
+    - name: "coa_relationship_key"
+      label: "Relationship Key"
+      type: "string"
+      fieldType: "text"
+      groupName: "commercial_operations_automation"
+      hasUniqueValue: false
+      description: "Canonical relationship key."
+
+    - name: "coa_opportunity_type"
+      label: "Opportunity Type"
+      type: "enumeration"
+      fieldType: "select"
+      groupName: "commercial_operations_automation"
+      options:
         - label: "FTP"
           value: "FTP"
         - label: "RTP"
           value: "RTP"
-      description: "Universal Opportunity Type (MQL, SQL, FTP, RTP)."
+      description: "Transaction Opportunity Type (FTP or RTP)."
 
     - name: "coa_cycle_index"
       label: "Cycle Index"
@@ -131,6 +172,46 @@ properties:
         - label: "False"
           value: "false"
       description: "Master kill switch for Commercial Operations Automation."
+
+pipelines:
+  leads:
+    - name: "B2B Qualification Lead Pipeline"
+      pipelineId: "b2b_qualification_lead_pipeline"
+      displayOrder: 1
+      stages:
+        - label: "MQL"
+          stageId: "mql"
+          displayOrder: 1
+        - label: "SQL"
+          stageId: "sql"
+          displayOrder: 2
+        - label: "Qualified"
+          stageId: "qualified"
+          displayOrder: 3
+        - label: "Disqualified"
+          stageId: "disqualified"
+          displayOrder: 4
+
+  deals:
+    - name: "B2B Transaction Deal Pipeline"
+      pipelineId: "b2b_transaction_deal_pipeline"
+      displayOrder: 1
+      stages:
+        - label: "Open"
+          stageId: "open"
+          displayOrder: 1
+          metadata:
+            probability: 0.20
+        - label: "Closed Won"
+          stageId: "closedwon"
+          displayOrder: 2
+          metadata:
+            probability: 1.00
+        - label: "Closed Lost"
+          stageId: "closedlost"
+          displayOrder: 3
+          metadata:
+            probability: 0.00
 
 webhooks:
   targetUrl: "/webhooks/hubspot"
