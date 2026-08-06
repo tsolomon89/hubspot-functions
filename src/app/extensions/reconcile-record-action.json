@@ -1,0 +1,42 @@
+{
+  "uid": "coa_reconcile_record_action",
+  "type": "workflowAction",
+  "config": {
+    "actionUrl": "https://api.hubspot.com/express/v1/app-functions/commercial_operations_automation_app/reconcileRecord",
+    "published": true,
+    "userAvailable": true,
+    "objectTypes": [
+      "CONTACT",
+      "COMPANY",
+      "LEAD",
+      "DEAL"
+    ],
+    "inputFields": [
+      {
+        "typeDefinition": {
+          "name": "relationshipType",
+          "type": "string",
+          "fieldType": "select"
+        },
+        "supportedValueTypes": ["STATIC_VALUE", "OBJECT_PROPERTY"]
+      },
+      {
+        "typeDefinition": {
+          "name": "offeringKeys",
+          "type": "string",
+          "fieldType": "text"
+        },
+        "supportedValueTypes": ["STATIC_VALUE", "OBJECT_PROPERTY"]
+      }
+    ],
+    "outputFields": [
+      { "name": "objectId", "type": "string", "fieldType": "text" },
+      { "name": "objectType", "type": "string", "fieldType": "text" },
+      { "name": "opportunityKey", "type": "string", "fieldType": "text" },
+      { "name": "qualificationState", "type": "string", "fieldType": "text" },
+      { "name": "appliedIntentsCount", "type": "number", "fieldType": "number" },
+      { "name": "verified", "type": "boolean", "fieldType": "boolean" },
+      { "name": "status", "type": "string", "fieldType": "text" }
+    ]
+  }
+}

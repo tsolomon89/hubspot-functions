@@ -1,0 +1,11 @@
+{
+  "runtime": "nodejs20.x",
+  "version": "1.0",
+  "environment": {},
+  "endpoints": {
+    "reconcileRecord": {
+      "file": "reconcile-record.js",
+      "method": "POST"
+    }
+  }
+}

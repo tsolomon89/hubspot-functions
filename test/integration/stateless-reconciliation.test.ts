@@ -5,7 +5,7 @@ import { evaluateOpportunity, QualificationConfig, OpportunitySnapshot } from '.
 describe('Stateless Commercial Operations Reconciliation Integration Suite', () => {
   it('should resolve portal installation mapping explicitly', () => {
     const resolver = new OrganizationConfigResolver();
-    const config = resolver.resolveConfig({ portalId: '149041124', relationshipType: 'b2b' });
+    const config = resolver.resolveConfig({ portalId: '2001001', relationshipType: 'b2b' });
 
     expect(config.organizationKey).toBe('org_global_corp');
     expect(config.relationshipType).toBe('b2b');

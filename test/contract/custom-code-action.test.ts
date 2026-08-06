@@ -7,7 +7,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
     await expect(processHubSpotCustomCodeAction({ object: { objectId: '0', objectType: 'CONTACT' } }))
       .rejects.toThrow('INVALID_ENROLLMENT');
 
-    await expect(processHubSpotCustomCodeAction({ origin: { portalId: 149041124 }, object: { objectId: '123' } } as any))
+    await expect(processHubSpotCustomCodeAction({ origin: { portalId: 2001001 }, object: { objectId: '123' } } as any))
       .rejects.toThrow('INVALID_ENROLLMENT');
   });
 
@@ -16,7 +16,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
     delete process.env.PRIVATE_APP_ACCESS_TOKEN;
     try {
       await expect(processHubSpotCustomCodeAction({
-        origin: { portalId: 149041124 },
+        origin: { portalId: 2001001 },
         object: { objectId: 'cnt_99812', objectType: 'CONTACT' }
       })).rejects.toThrow('MISSING_AUTHENTICATION_SECRET');
     } finally {
@@ -58,7 +58,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
     });
 
     const res = await processHubSpotCustomCodeAction({
-      origin: { portalId: 149041124 },
+      origin: { portalId: 2001001 },
       object: { objectId: 'cnt_99812', objectType: 'CONTACT' },
       inputFields: { relationshipType: 'b2c' }
     }, 'fake-token', fakeAdapter);
@@ -103,7 +103,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
     });
 
     const event = {
-      origin: { portalId: 149041124 },
+      origin: { portalId: 2001001 },
       object: { objectId: 'cnt_fail_readback', objectType: 'CONTACT' }
     };
 
@@ -130,7 +130,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
     const findLeadSpy = vi.spyOn(fakeAdapter, 'findOrCreateLeadForSubject');
 
     const event = {
-      origin: { portalId: 149041124 },
+      origin: { portalId: 2001001 },
       object: { objectId: 'cnt_unsuppressed', objectType: 'CONTACT' }
     };
 
@@ -159,7 +159,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
     });
 
     const event = {
-      origin: { portalId: 149041124 },
+      origin: { portalId: 2001001 },
       object: { objectId: 'cnt_rel_mismatch', objectType: 'CONTACT' }
     };
 
@@ -205,7 +205,7 @@ describe('HubSpot Custom Code Action Contract Tests', () => {
     });
 
     const event = {
-      origin: { portalId: 149041124 },
+      origin: { portalId: 2001001 },
       object: { objectId: 'comp_malformed_1', objectType: 'COMPANY' }
     };
 

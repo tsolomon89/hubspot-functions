@@ -20,7 +20,7 @@ describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
 
   it('should execute processHubSpotCustomCodeAction on production-shaped Contact event and throw when unverified using offline fake client', async () => {
     const event = {
-      origin: { portalId: 149041124 },
+      origin: { portalId: 2001001 },
       object: { objectId: 'cnt_99812', objectType: 'CONTACT' }
     };
 
@@ -38,7 +38,7 @@ describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
 
   it('should support exports.main callback contract and re-throw API errors for native retries using offline fake client', async () => {
     const event = {
-      origin: { portalId: 149041124 },
+      origin: { portalId: 2001001 },
       object: { objectId: 'cnt_77123', objectType: 'CONTACT' }
     };
 
@@ -52,7 +52,6 @@ describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
     rawClient.crm.contacts.basicApi.getById = vi.fn().mockRejectedValue(hubspot401Error);
 
     const callback = vi.fn();
-    // Test processHubSpotCustomCodeAction directly with injected offline fake adapter
     await expect(processHubSpotCustomCodeAction(event, 'fake-token', fakeAdapter)).rejects.toThrow('HTTP 401 Unauthorized');
   });
 });

@@ -1,8 +1,0 @@
-defaultAccount: "developer-test"
-accounts:
-  - name: "developer-test"
-    accountId: 149041124
-    portalId: 149041124
-    env: eu1
-    authType: personalaccesskey
-    accountType: STANDARD

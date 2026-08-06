@@ -23,8 +23,8 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      - name: Informational Security Audit
-        run: npm audit --audit-level=critical || true
+      - name: Enforceable Production Security Audit
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Validate Organization Configurations against JSON Schema
         run: npm run config:validate
@@ -37,6 +37,6 @@ jobs:
 
       - name: Validate HubSpot Project Structure
         env:
-          HUBSPOT_PORTAL_ID: ${{ secrets.HUBSPOT_PORTAL_ID }}
-          HUBSPOT_PERSONAL_ACCESS_KEY: ${{ secrets.HUBSPOT_PERSONAL_ACCESS_KEY || secrets.PRIVATE_APP_ACCESS_TOKEN }}
-        run: npx --no-install hs project validate --use-env || npx --no-install hs project validate || echo "[SUCCESS] Project hubspot-functions is valid and ready to upload"
+          HUBSPOT_PORTAL_ID: ${{ secrets.HUBSPOT_DEVELOPER_PORTAL_ID || secrets.HUBSPOT_PORTAL_ID }}
+          HUBSPOT_PERSONAL_ACCESS_KEY: ${{ secrets.HUBSPOT_DEVELOPER_PORTAL_KEY || secrets.HUBSPOT_PERSONAL_ACCESS_KEY }}
+        run: npx --no-install hs project validate

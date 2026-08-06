@@ -515,9 +515,20 @@ function planTransition(snapshot, evaluation, config, nowInstant) {
 
 // packages/domain/embedded-configs.ts
 var EMBEDDED_INSTALLATIONS = {
+  "2001001": {
+    "executionPortalId": 2001001,
+    "accountRole": "developer-test",
+    "organizationKey": "org_global_corp",
+    "allowedRelationshipTypes": [
+      "b2b",
+      "b2c"
+    ],
+    "defaultRelationshipType": "b2b",
+    "expectedConfigVersion": "1.0.0"
+  },
   "149041124": {
     "executionPortalId": 149041124,
-    "accountRole": "developer-test",
+    "accountRole": "APP_DEVELOPER",
     "organizationKey": "org_global_corp",
     "allowedRelationshipTypes": [
       "b2b",

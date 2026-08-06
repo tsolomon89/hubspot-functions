@@ -2,6 +2,16 @@ version: "1.0.0"
 installations:
   "149041124":
     executionPortalId: 149041124
+    accountRole: "APP_DEVELOPER"
+    organizationKey: "org_global_corp"
+    allowedRelationshipTypes:
+      - "b2b"
+      - "b2c"
+    defaultRelationshipType: "b2b"
+    expectedConfigVersion: "1.0.0"
+
+  "2001001":
+    executionPortalId: 2001001
     accountRole: "developer-test"
     organizationKey: "org_global_corp"
     allowedRelationshipTypes:
