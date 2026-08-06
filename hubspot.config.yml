@@ -1,5 +1,6 @@
 defaultAccount: "developer-test"
 accounts:
   - name: "developer-test"
+    accountId: 149041124
     portalId: 149041124
     personalAccessKey: "pat-na1-fake-key-for-ci-project-validation"
