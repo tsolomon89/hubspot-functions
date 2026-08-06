@@ -36,7 +36,4 @@ jobs:
         run: npm test
 
       - name: Validate HubSpot Project Structure
-        env:
-          HUBSPOT_PORTAL_ID: 149041124
-          HUBSPOT_PERSONAL_ACCESS_KEY: "pat-na1-fake-key-for-ci-project-validation"
-        run: npx --no-install hs project validate --use-env
+        run: npx --no-install hs project validate

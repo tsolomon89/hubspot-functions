@@ -3,8 +3,10 @@ accounts:
   - name: "developer-test"
     accountId: 149041124
     portalId: 149041124
-    authType: "personalaccesskey"
+    env: prod
+    authType: personalaccesskey
+    accountType: STANDARD
     personalAccessKey: "pat-na1-fake-key-for-ci-project-validation"
-    tokenInfo:
-      portalId: 149041124
-      accessToken: "pat-na1-fake-key-for-ci-project-validation"
+    auth:
+      tokenInfo:
+        accessToken: "pat-na1-fake-key-for-ci-project-validation"
