@@ -12,8 +12,8 @@ This document maps all HubSpot API endpoints invoked by the runtime and schema C
 | `/crm/v3/objects/deals` | GET, POST, PATCH | `SnapshotLoader`, `Adapter`, `SchemaTool` | `crm.objects.deals.read`, `crm.objects.deals.write` | Manage transaction Deals |
 | `/crm/v3/objects/products` | GET, POST | `SnapshotLoader`, `Adapter` | `crm.objects.products.read`, `crm.objects.products.write` | Resolve Product catalog items |
 | `/crm/v3/objects/line_items` | GET, POST, PATCH | `SnapshotLoader`, `Adapter` | `crm.objects.line_items.read`, `crm.objects.line_items.write` | Create and verify transaction Line Items parented to Deals |
-| `/crm/v3/objects/tasks` | GET, POST | `Adapter` | `crm.objects.contacts.write` / `automation` | Create Manual Review Tasks |
-| `/crm/v3/objects/meetings` | GET | `SnapshotLoader` | `crm.objects.contacts.read` | Read completed meeting evidence |
+| `/crm/v3/objects/tasks` | GET, POST | `Adapter` | `crm.objects.tasks.read`, `crm.objects.tasks.write` | Create and verify Manual Review Tasks |
+| `/crm/v3/objects/meetings` | GET | `SnapshotLoader` | `crm.objects.meetings.read` | Read completed meeting evidence |
 | `/crm/v4/associations/{fromObjectType}/{toObjectType}/batch/read` | GET, POST | `SnapshotLoader`, `Adapter` | Object read scopes | Query association pairs between CRM objects |
 | `/crm/v3/properties/{objectType}` | GET, POST | `SchemaTool` | `crm.schemas.contacts.read`, `crm.schemas.companies.read`, `crm.schemas.deals.read`, `crm.schemas.custom.read` | Inspect and reconcile CRM properties |
 | `/crm/v3/pipelines/{objectType}` | GET, POST, PATCH | `SchemaTool` | `crm.schemas.deals.read`, `crm.schemas.custom.read` | Inspect and reconcile Lead/Deal pipelines |

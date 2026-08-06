@@ -45,7 +45,7 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       cycleIndex: 1,
       openedAt: '2026-08-05T00:00:00.000Z',
       subject: { kind: 'COMPANY', key: 'comp_acme', contactKeys: ['cnt_1'] },
-      facts: { email: 'alice@acme.com', marketingConsent: true }, // No offering keys!
+      facts: { email: 'alice@acme.com', marketingConsent: true },
       evidence: []
     };
 
@@ -71,8 +71,9 @@ describe('End-to-End Vertical Slice: MQL -> SQL -> Qualified -> FTP Deal Creatio
       opportunityState: 'OPEN',
       cycleIndex: 1,
       openedAt: '2026-08-05T00:00:00.000Z',
+      mqlCompletedAt: '2026-08-05T00:00:00.000Z',
       subject: { kind: 'COMPANY', key: 'comp_acme', contactKeys: ['cnt_1'] },
-      facts: { email: 'alice@acme.com', marketingConsent: true, offeringKeys: ['prod_software'] }, // Genuine offering input!
+      facts: { email: 'alice@acme.com', marketingConsent: true, offeringKeys: ['prod_software'] },
       evidence: []
     };
 

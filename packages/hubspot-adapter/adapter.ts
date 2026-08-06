@@ -738,7 +738,7 @@ export class HubspotAdapter {
                 try {
                   const dAssoc = await this.client.crm.associations.v4.basicApi.getPage('line_item', Number(existingLineItemId) || (existingLineItemId as any), 'deal');
                   dealAssocVerified = (dAssoc.results || []).some(r => String(r.toObjectId) === String(targetDealId));
-                } catch { dealAssocVerified = true; } // allow mock fallback if line_item->deal assoc API not mocked
+                } catch { dealAssocVerified = false; } // allow mock fallback if line_item->deal assoc API not mocked
 
                 const liVerified = liReadback?.properties?.coa_line_item_key === lineItemKey &&
                                    liReadback?.properties?.hs_product_id === product.id &&
@@ -802,7 +802,7 @@ export class HubspotAdapter {
                 try {
                   const dAssoc = await this.client.crm.associations.v4.basicApi.getPage('line_item', Number(newLineItemId) || (newLineItemId as any), 'deal');
                   dealAssocVerified = (dAssoc.results || []).some(r => String(r.toObjectId) === String(targetDealId));
-                } catch { dealAssocVerified = true; }
+                } catch { dealAssocVerified = false; }
 
                 const liVerified = liReadback?.properties?.coa_line_item_key === lineItemKey &&
                                    liReadback?.properties?.hs_product_id === product.id &&

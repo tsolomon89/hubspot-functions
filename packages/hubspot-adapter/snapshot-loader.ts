@@ -58,8 +58,11 @@ export class HubSpotSnapshotLoader {
         if (is404 && pageCount === 1) {
           return [];
         }
-        // Defect 9: Fail closed on all API errors to prevent returning partial relationship snapshots!
         throw new Error(`ASSOCIATION_PAGINATION_FAILED: Failed to load associations for ${fromObjectType}:${fromObjectId} -> ${toObjectType} on page ${pageCount}: ${err.message || err}`);
+      }
+
+      if (after && pageCount >= maxPages) {
+        throw new Error(`ASSOCIATION_PAGINATION_LIMIT_EXCEEDED: Exceeded maxPages (${maxPages}) while more associations remain for ${fromObjectType}:${fromObjectId} -> ${toObjectType}`);
       }
     } while (after && pageCount < maxPages);
 
@@ -68,9 +71,6 @@ export class HubSpotSnapshotLoader {
 
   /**
    * Explicit primary contact resolution from list of associated contact IDs.
-   * If exactly 1 contact -> returns that contact ID.
-   * If >1 contacts and 1 is designated primary -> returns primary contact ID.
-   * If >1 contacts without a clear primary -> returns null and marks isAmbiguous = true.
    */
   public async resolvePrimaryContactId(
     fromObjectType: string,
@@ -84,7 +84,6 @@ export class HubSpotSnapshotLoader {
       return { primaryContactId: String(associationResults[0].toObjectId), isAmbiguous: false };
     }
 
-    // Inspect association type labels to find Primary association label or type
     for (const assoc of associationResults) {
       const types = assoc.associationTypes || [];
       for (const t of types) {
@@ -95,7 +94,6 @@ export class HubSpotSnapshotLoader {
       }
     }
 
-    // Defect 4: Ambiguous primary contact - DO NOT select first contact! Return null.
     return { primaryContactId: null, isAmbiguous: true };
   }
 
@@ -203,17 +201,14 @@ export class HubSpotSnapshotLoader {
         }
       }
 
-      // Defect 4 Canonical Anchor Contract:
-      // B2B relationship anchor = stable Company ID (`comp_123`).
-      // B2C relationship anchor = stable Contact ID (`cnt_456`).
       if (relationshipType === 'b2b') {
         if (companyKey) {
           relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', companyKey);
         } else {
-          // B2B Contact without associated Company MUST NOT receive Contact-anchored B2B key!
+          // B2B Contact without Company gets review identity, facts.missingCompany = true
           facts.missingCompany = true;
           facts.manualReviewRequired = true;
-          relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', recordRef.objectId);
+          relationshipKey = deriveRelationshipKey(organizationKey, 'review', recordRef.objectId);
         }
       } else {
         relationshipKey = deriveRelationshipKey(organizationKey, 'b2c', recordRef.objectId);
@@ -264,7 +259,7 @@ export class HubSpotSnapshotLoader {
       if (isAmbiguous) {
         facts.ambiguousPrimaryContact = true;
         facts.manualReviewRequired = true;
-        primaryContactId = undefined; // Defect 4: Do NOT select contactKeys[0] when ambiguous!
+        primaryContactId = undefined;
       } else {
         primaryContactId = resolvedPrimary || (contactKeys.length === 1 ? contactKeys[0] : undefined);
       }
@@ -285,7 +280,6 @@ export class HubSpotSnapshotLoader {
         }
       }
 
-      // Canonical Anchor Contract: B2B Company anchor = Company ID
       relationshipKey = deriveRelationshipKey(organizationKey, 'b2b', recordRef.objectId);
       opportunityKey = `${relationshipKey}::LEAD::1`;
 
@@ -438,7 +432,6 @@ export class HubSpotSnapshotLoader {
         opportunityState = 'OPEN';
       }
 
-      // Load parented Line Items parented to this Deal!
       const lineItemAssocs = await this.getAllAssociations('deal', recordRef.objectId, 'line_item');
       if (lineItemAssocs.length > 0) {
         const loadedOfferings: OfferingRef[] = [];
@@ -481,7 +474,6 @@ export class HubSpotSnapshotLoader {
       throw new Error(`INVALID_ENROLLMENT: Unsupported objectType '${recordRef.objectType}'`);
     }
 
-    // Hydrate primary contact properties (email, phone, suppression, consent)
     if (primaryContactId) {
       try {
         const primaryContact = await this.client.crm.contacts.basicApi.getById(primaryContactId, [
@@ -517,7 +509,6 @@ export class HubSpotSnapshotLoader {
       }
     }
 
-    // Load meeting evidence associated with primary contact using bounded pagination
     if (primaryContactId) {
       try {
         const lowerTime = predecessorCompletedAt ? new Date(predecessorCompletedAt).getTime() : new Date(openedAt).getTime();

@@ -257,6 +257,22 @@ export function evaluateOpportunity(
     };
   }
 
+  // Gate 2: Universal Manual Review precondition
+  if (
+    snapshot.facts.missingCompany === true ||
+    snapshot.facts.ambiguousPrimaryCompany === true ||
+    snapshot.facts.ambiguousPrimaryContact === true ||
+    snapshot.facts.manualReviewRequired === true
+  ) {
+    return {
+      qualificationState: 'MANUAL_REVIEW',
+      satisfiedGoalKeys: [],
+      unsatisfiedGoalKeys: [],
+      evidenceRefsByGoal: {},
+      evaluatedConfigVersion: config.configVersion
+    };
+  }
+
   const mergedConfig = injectUniversalGoals(config);
   const goals = mergedConfig.goalsByOpportunityType[snapshot.opportunityType] || [];
 

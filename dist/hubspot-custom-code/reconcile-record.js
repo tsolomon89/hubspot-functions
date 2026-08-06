@@ -243,6 +243,15 @@ function evaluateOpportunity(snapshot, config) {
       evaluatedConfigVersion: config.configVersion
     };
   }
+  if (snapshot.facts.missingCompany === true || snapshot.facts.ambiguousPrimaryCompany === true || snapshot.facts.ambiguousPrimaryContact === true || snapshot.facts.manualReviewRequired === true) {
+    return {
+      qualificationState: "MANUAL_REVIEW",
+      satisfiedGoalKeys: [],
+      unsatisfiedGoalKeys: [],
+      evidenceRefsByGoal: {},
+      evaluatedConfigVersion: config.configVersion
+    };
+  }
   const mergedConfig = injectUniversalGoals(config);
   const goals = mergedConfig.goalsByOpportunityType[snapshot.opportunityType] || [];
   const satisfiedGoalKeys = [];
@@ -276,6 +285,17 @@ function evaluateOpportunity(snapshot, config) {
     evidenceRefsByGoal,
     evaluatedConfigVersion: config.configVersion
   };
+}
+
+// packages/domain/identity.ts
+function sanitizeKey(value) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, "_");
+}
+function deriveRelationshipKey(organizationKey, relationshipType, subjectAnchor) {
+  const cleanOrg = sanitizeKey(organizationKey);
+  const cleanRel = sanitizeKey(relationshipType);
+  const cleanAnchor = sanitizeKey(subjectAnchor);
+  return `rel_${cleanOrg}_${cleanRel}_${cleanAnchor}`;
 }
 
 // packages/commercial-kernel/planner.ts
@@ -344,10 +364,25 @@ function planTransition(snapshot, evaluation, config, nowInstant) {
     return [{ kind: "NOOP", reason: "Opportunity qualification is BLOCKED" }];
   }
   if (evaluation.qualificationState === "MANUAL_REVIEW") {
-    const reason = snapshot.facts.missingCompany ? "B2B Contact has missing or unassociated Company" : snapshot.facts.ambiguousPrimaryContact ? "Multiple associated Contacts without explicit primary contact" : "Opportunity requires human manual review";
+    const isMissingCompany = Boolean(snapshot.facts.missingCompany);
+    const isAmbiguousCompany = Boolean(snapshot.facts.ambiguousPrimaryCompany);
+    const isAmbiguousContact = Boolean(snapshot.facts.ambiguousPrimaryContact);
+    let reason = "Opportunity requires human manual review";
+    if (isMissingCompany) {
+      reason = "B2B Contact has missing or unassociated Company";
+    } else if (isAmbiguousCompany) {
+      reason = "Multiple associated Companies without explicit primary company designation";
+    } else if (isAmbiguousContact) {
+      reason = "Multiple associated Contacts without explicit primary contact designation";
+    }
+    let reviewOpportunityKey = snapshot.opportunityKey;
+    if (isMissingCompany && snapshot.subject.kind === "CONTACT") {
+      const reviewRelKey = deriveRelationshipKey(snapshot.organizationKey, "review", snapshot.subject.key);
+      reviewOpportunityKey = `${reviewRelKey}::LEAD::1`;
+    }
     return [{
       kind: "CREATE_MANUAL_REVIEW",
-      opportunityKey: snapshot.opportunityKey,
+      opportunityKey: reviewOpportunityKey,
       reason,
       subject: snapshot.subject
     }];
@@ -388,7 +423,8 @@ function planTransition(snapshot, evaluation, config, nowInstant) {
       stage: "marketingqualifiedlead"
     });
   } else if (snapshot.opportunityType === "SQL") {
-    const mqlCompletedAt = snapshot.mqlCompletedAt || currentNow;
+    const mqlCompletedAt = snapshot.mqlCompletedAt;
+    const isValidMqlTime = Boolean(mqlCompletedAt && !isNaN(Date.parse(mqlCompletedAt)));
     intents.push({
       kind: "UPDATE_OPPORTUNITY",
       opportunityKey: snapshot.opportunityKey,
@@ -401,19 +437,22 @@ function planTransition(snapshot, evaluation, config, nowInstant) {
       subject: snapshot.subject,
       stage: "salesqualifiedlead"
     });
-    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, "FTP", 1);
-    intents.push({
-      kind: "CREATE_SUCCESSOR",
-      predecessorKey: snapshot.opportunityKey,
-      successorKey,
-      successorType: "FTP",
-      cycleIndex: 1,
-      subject: snapshot.subject,
-      offerings: snapshot.offerings,
-      predecessorCompletedAt: mqlCompletedAt
-    });
+    if (isValidMqlTime) {
+      const successorKey = deriveSuccessorKey(snapshot.relationshipKey, "FTP", 1);
+      intents.push({
+        kind: "CREATE_SUCCESSOR",
+        predecessorKey: snapshot.opportunityKey,
+        successorKey,
+        successorType: "FTP",
+        cycleIndex: 1,
+        subject: snapshot.subject,
+        offerings: snapshot.offerings,
+        predecessorCompletedAt: mqlCompletedAt
+      });
+    }
   } else if (snapshot.opportunityType === "FTP") {
-    const closedAt = snapshot.facts.closedAt || snapshot.facts.closedate || snapshot.predecessorCompletedAt || currentNow;
+    const closedAt = snapshot.facts.closedAt || snapshot.facts.closedate || snapshot.predecessorCompletedAt;
+    const isValidClosedTime = Boolean(closedAt && !isNaN(Date.parse(closedAt)));
     intents.push({
       kind: "UPDATE_OPPORTUNITY",
       opportunityKey: snapshot.opportunityKey,
@@ -426,20 +465,23 @@ function planTransition(snapshot, evaluation, config, nowInstant) {
       subject: snapshot.subject,
       stage: "customer"
     });
-    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, "RTP", 1);
-    const rtpOfferings = config.offeringPolicy?.rtpPolicy === "emptyUntilKnown" ? [] : snapshot.offerings || [];
-    intents.push({
-      kind: "CREATE_SUCCESSOR",
-      predecessorKey: snapshot.opportunityKey,
-      successorKey,
-      successorType: "RTP",
-      cycleIndex: 1,
-      subject: snapshot.subject,
-      offerings: rtpOfferings,
-      predecessorCompletedAt: closedAt
-    });
+    if (isValidClosedTime) {
+      const successorKey = deriveSuccessorKey(snapshot.relationshipKey, "RTP", 1);
+      const rtpOfferings = config.offeringPolicy?.rtpPolicy === "emptyUntilKnown" ? [] : snapshot.offerings || [];
+      intents.push({
+        kind: "CREATE_SUCCESSOR",
+        predecessorKey: snapshot.opportunityKey,
+        successorKey,
+        successorType: "RTP",
+        cycleIndex: 1,
+        subject: snapshot.subject,
+        offerings: rtpOfferings,
+        predecessorCompletedAt: closedAt
+      });
+    }
   } else if (snapshot.opportunityType === "RTP") {
-    const closedAt = snapshot.facts.closedAt || snapshot.facts.closedate || snapshot.predecessorCompletedAt || currentNow;
+    const closedAt = snapshot.facts.closedAt || snapshot.facts.closedate || snapshot.predecessorCompletedAt;
+    const isValidClosedTime = Boolean(closedAt && !isNaN(Date.parse(closedAt)));
     intents.push({
       kind: "UPDATE_OPPORTUNITY",
       opportunityKey: snapshot.opportunityKey,
@@ -452,19 +494,21 @@ function planTransition(snapshot, evaluation, config, nowInstant) {
       subject: snapshot.subject,
       stage: "customer"
     });
-    const nextCycle = (snapshot.cycleIndex || 1) + 1;
-    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, "RTP", nextCycle);
-    const rtpOfferings = config.offeringPolicy?.rtpPolicy === "emptyUntilKnown" ? [] : snapshot.offerings || [];
-    intents.push({
-      kind: "CREATE_SUCCESSOR",
-      predecessorKey: snapshot.opportunityKey,
-      successorKey,
-      successorType: "RTP",
-      cycleIndex: nextCycle,
-      subject: snapshot.subject,
-      offerings: rtpOfferings,
-      predecessorCompletedAt: closedAt
-    });
+    if (isValidClosedTime) {
+      const nextCycle = (snapshot.cycleIndex || 1) + 1;
+      const successorKey = deriveSuccessorKey(snapshot.relationshipKey, "RTP", nextCycle);
+      const rtpOfferings = config.offeringPolicy?.rtpPolicy === "emptyUntilKnown" ? [] : snapshot.offerings || [];
+      intents.push({
+        kind: "CREATE_SUCCESSOR",
+        predecessorKey: snapshot.opportunityKey,
+        successorKey,
+        successorType: "RTP",
+        cycleIndex: nextCycle,
+        subject: snapshot.subject,
+        offerings: rtpOfferings,
+        predecessorCompletedAt: closedAt
+      });
+    }
   }
   return intents;
 }
@@ -1309,7 +1353,7 @@ var HubspotAdapter = class {
                   const dAssoc = await this.client.crm.associations.v4.basicApi.getPage("line_item", Number(existingLineItemId) || existingLineItemId, "deal");
                   dealAssocVerified = (dAssoc.results || []).some((r) => String(r.toObjectId) === String(targetDealId));
                 } catch {
-                  dealAssocVerified = true;
+                  dealAssocVerified = false;
                 }
                 const liVerified = liReadback?.properties?.coa_line_item_key === lineItemKey && liReadback?.properties?.hs_product_id === product.id && String(liReadback?.properties?.quantity) === expectedQuantity && String(liReadback?.properties?.price) === expectedPrice && dealAssocVerified;
                 receipts.push({
@@ -1369,7 +1413,7 @@ var HubspotAdapter = class {
                   const dAssoc = await this.client.crm.associations.v4.basicApi.getPage("line_item", Number(newLineItemId) || newLineItemId, "deal");
                   dealAssocVerified = (dAssoc.results || []).some((r) => String(r.toObjectId) === String(targetDealId));
                 } catch {
-                  dealAssocVerified = true;
+                  dealAssocVerified = false;
                 }
                 const liVerified = liReadback?.properties?.coa_line_item_key === lineItemKey && liReadback?.properties?.hs_product_id === product.id && String(liReadback?.properties?.quantity) === expectedQuantity && String(liReadback?.properties?.price) === expectedPrice && dealAssocVerified;
                 receipts.push({
@@ -1457,19 +1501,6 @@ var HubspotAdapter = class {
 
 // packages/hubspot-adapter/snapshot-loader.ts
 var import_api_client2 = require("@hubspot/api-client");
-
-// packages/domain/identity.ts
-function sanitizeKey(value) {
-  return value.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, "_");
-}
-function deriveRelationshipKey(organizationKey, relationshipType, subjectAnchor) {
-  const cleanOrg = sanitizeKey(organizationKey);
-  const cleanRel = sanitizeKey(relationshipType);
-  const cleanAnchor = sanitizeKey(subjectAnchor);
-  return `rel_${cleanOrg}_${cleanRel}_${cleanAnchor}`;
-}
-
-// packages/hubspot-adapter/snapshot-loader.ts
 var HubSpotSnapshotLoader = class {
   client;
   constructor(accessTokenOrAdapter) {
@@ -1512,14 +1543,14 @@ var HubSpotSnapshotLoader = class {
         }
         throw new Error(`ASSOCIATION_PAGINATION_FAILED: Failed to load associations for ${fromObjectType}:${fromObjectId} -> ${toObjectType} on page ${pageCount}: ${err.message || err}`);
       }
+      if (after && pageCount >= maxPages) {
+        throw new Error(`ASSOCIATION_PAGINATION_LIMIT_EXCEEDED: Exceeded maxPages (${maxPages}) while more associations remain for ${fromObjectType}:${fromObjectId} -> ${toObjectType}`);
+      }
     } while (after && pageCount < maxPages);
     return results;
   }
   /**
    * Explicit primary contact resolution from list of associated contact IDs.
-   * If exactly 1 contact -> returns that contact ID.
-   * If >1 contacts and 1 is designated primary -> returns primary contact ID.
-   * If >1 contacts without a clear primary -> returns null and marks isAmbiguous = true.
    */
   async resolvePrimaryContactId(fromObjectType, fromObjectId, associationResults) {
     if (!associationResults || associationResults.length === 0) {
@@ -1624,7 +1655,7 @@ var HubSpotSnapshotLoader = class {
         } else {
           facts.missingCompany = true;
           facts.manualReviewRequired = true;
-          relationshipKey = deriveRelationshipKey(organizationKey, "b2b", recordRef.objectId);
+          relationshipKey = deriveRelationshipKey(organizationKey, "review", recordRef.objectId);
         }
       } else {
         relationshipKey = deriveRelationshipKey(organizationKey, "b2c", recordRef.objectId);

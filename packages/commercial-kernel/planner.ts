@@ -7,6 +7,7 @@ import {
   CommercialSubjectRef,
   GoalDefinition
 } from './types';
+import { deriveRelationshipKey } from '../domain/identity';
 
 export const SUPPORTED_PREDICATES = new Set([
   'anyCommunicationChannel',
@@ -112,14 +113,32 @@ export function planTransition(
     return [{ kind: 'NOOP', reason: 'Opportunity qualification is BLOCKED' }];
   }
 
+  // Gate 2: Universal Manual Review
   if (evaluation.qualificationState === 'MANUAL_REVIEW') {
-    const reason = snapshot.facts.missingCompany
-      ? 'B2B Contact has missing or unassociated Company'
-      : (snapshot.facts.ambiguousPrimaryContact ? 'Multiple associated Contacts without explicit primary contact' : 'Opportunity requires human manual review');
+    const isMissingCompany = Boolean(snapshot.facts.missingCompany);
+    const isAmbiguousCompany = Boolean(snapshot.facts.ambiguousPrimaryCompany);
+    const isAmbiguousContact = Boolean(snapshot.facts.ambiguousPrimaryContact);
+
+    let reason = 'Opportunity requires human manual review';
+    if (isMissingCompany) {
+      reason = 'B2B Contact has missing or unassociated Company';
+    } else if (isAmbiguousCompany) {
+      reason = 'Multiple associated Companies without explicit primary company designation';
+    } else if (isAmbiguousContact) {
+      reason = 'Multiple associated Contacts without explicit primary contact designation';
+    }
+
+    // A B2B Contact without a Company must NOT receive a B2B relationship key!
+    // Use a subject-scoped review identity key for the Task until the Company relationship exists.
+    let reviewOpportunityKey = snapshot.opportunityKey;
+    if (isMissingCompany && snapshot.subject.kind === 'CONTACT') {
+      const reviewRelKey = deriveRelationshipKey(snapshot.organizationKey, 'review', snapshot.subject.key);
+      reviewOpportunityKey = `${reviewRelKey}::LEAD::1`;
+    }
 
     return [{ 
       kind: 'CREATE_MANUAL_REVIEW', 
-      opportunityKey: snapshot.opportunityKey, 
+      opportunityKey: reviewOpportunityKey, 
       reason,
       subject: snapshot.subject
     }];
@@ -166,8 +185,9 @@ export function planTransition(
       stage: 'marketingqualifiedlead'
     });
   } else if (snapshot.opportunityType === 'SQL') {
-    // Fail-Closed Boundary: Require authoritative mqlCompletedAt timestamp!
-    const mqlCompletedAt = snapshot.mqlCompletedAt || currentNow;
+    // Gate 3: Fail-Closed Boundary: Require authoritative mqlCompletedAt timestamp (NO currentNow fallback)!
+    const mqlCompletedAt = snapshot.mqlCompletedAt;
+    const isValidMqlTime = Boolean(mqlCompletedAt && !isNaN(Date.parse(mqlCompletedAt)));
 
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
@@ -181,20 +201,24 @@ export function planTransition(
       subject: snapshot.subject,
       stage: 'salesqualifiedlead'
     });
-    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'FTP', 1);
-    intents.push({
-      kind: 'CREATE_SUCCESSOR',
-      predecessorKey: snapshot.opportunityKey,
-      successorKey,
-      successorType: 'FTP',
-      cycleIndex: 1,
-      subject: snapshot.subject,
-      offerings: snapshot.offerings,
-      predecessorCompletedAt: mqlCompletedAt
-    });
+
+    if (isValidMqlTime) {
+      const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'FTP', 1);
+      intents.push({
+        kind: 'CREATE_SUCCESSOR',
+        predecessorKey: snapshot.opportunityKey,
+        successorKey,
+        successorType: 'FTP',
+        cycleIndex: 1,
+        subject: snapshot.subject,
+        offerings: snapshot.offerings,
+        predecessorCompletedAt: mqlCompletedAt
+      });
+    }
   } else if (snapshot.opportunityType === 'FTP') {
-    // Fail-Closed Boundary: Require authoritative closedAt timestamp!
-    const closedAt = (snapshot.facts.closedAt as string) || (snapshot.facts.closedate as string) || snapshot.predecessorCompletedAt || currentNow;
+    // Gate 3: Fail-Closed Boundary: Require authoritative closedAt timestamp (NO currentNow fallback)!
+    const closedAt = (snapshot.facts.closedAt as string) || (snapshot.facts.closedate as string) || snapshot.predecessorCompletedAt;
+    const isValidClosedTime = Boolean(closedAt && !isNaN(Date.parse(closedAt)));
 
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
@@ -208,21 +232,25 @@ export function planTransition(
       subject: snapshot.subject,
       stage: 'customer'
     });
-    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', 1);
-    const rtpOfferings = config.offeringPolicy?.rtpPolicy === 'emptyUntilKnown' ? [] : (snapshot.offerings || []);
-    intents.push({
-      kind: 'CREATE_SUCCESSOR',
-      predecessorKey: snapshot.opportunityKey,
-      successorKey,
-      successorType: 'RTP',
-      cycleIndex: 1,
-      subject: snapshot.subject,
-      offerings: rtpOfferings,
-      predecessorCompletedAt: closedAt
-    });
+
+    if (isValidClosedTime) {
+      const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', 1);
+      const rtpOfferings = config.offeringPolicy?.rtpPolicy === 'emptyUntilKnown' ? [] : (snapshot.offerings || []);
+      intents.push({
+        kind: 'CREATE_SUCCESSOR',
+        predecessorKey: snapshot.opportunityKey,
+        successorKey,
+        successorType: 'RTP',
+        cycleIndex: 1,
+        subject: snapshot.subject,
+        offerings: rtpOfferings,
+        predecessorCompletedAt: closedAt
+      });
+    }
   } else if (snapshot.opportunityType === 'RTP') {
-    // Fail-Closed Boundary: Require authoritative closedAt timestamp!
-    const closedAt = (snapshot.facts.closedAt as string) || (snapshot.facts.closedate as string) || snapshot.predecessorCompletedAt || currentNow;
+    // Gate 3: Fail-Closed Boundary: Require authoritative closedAt timestamp (NO currentNow fallback)!
+    const closedAt = (snapshot.facts.closedAt as string) || (snapshot.facts.closedate as string) || snapshot.predecessorCompletedAt;
+    const isValidClosedTime = Boolean(closedAt && !isNaN(Date.parse(closedAt)));
 
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
@@ -236,19 +264,22 @@ export function planTransition(
       subject: snapshot.subject,
       stage: 'customer'
     });
-    const nextCycle = (snapshot.cycleIndex || 1) + 1;
-    const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', nextCycle);
-    const rtpOfferings = config.offeringPolicy?.rtpPolicy === 'emptyUntilKnown' ? [] : (snapshot.offerings || []);
-    intents.push({
-      kind: 'CREATE_SUCCESSOR',
-      predecessorKey: snapshot.opportunityKey,
-      successorKey,
-      successorType: 'RTP',
-      cycleIndex: nextCycle,
-      subject: snapshot.subject,
-      offerings: rtpOfferings,
-      predecessorCompletedAt: closedAt
-    });
+
+    if (isValidClosedTime) {
+      const nextCycle = (snapshot.cycleIndex || 1) + 1;
+      const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'RTP', nextCycle);
+      const rtpOfferings = config.offeringPolicy?.rtpPolicy === 'emptyUntilKnown' ? [] : (snapshot.offerings || []);
+      intents.push({
+        kind: 'CREATE_SUCCESSOR',
+        predecessorKey: snapshot.opportunityKey,
+        successorKey,
+        successorType: 'RTP',
+        cycleIndex: nextCycle,
+        subject: snapshot.subject,
+        offerings: rtpOfferings,
+        predecessorCompletedAt: closedAt
+      });
+    }
   }
 
   return intents;
