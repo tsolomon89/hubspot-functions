@@ -202,6 +202,13 @@ properties:
       groupName: "commercial_operations_automation"
       description: "Timestamp when Lead MQL qualification completed."
 
+    - name: "coa_sql_completed_at"
+      label: "SQL Completed At"
+      type: "datetime"
+      fieldType: "date"
+      groupName: "commercial_operations_automation"
+      description: "Timestamp when Lead SQL qualification completed."
+
     - name: "coa_config_version"
       label: "Config Version"
       type: "string"

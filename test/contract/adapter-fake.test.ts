@@ -167,7 +167,7 @@ describe('HubSpot Adapter Contract Tests with Strict Fake', () => {
     expect(result.success).toBe(true);
     expect(createTaskMock).toHaveBeenCalledWith(expect.objectContaining({
       properties: expect.objectContaining({
-        hs_task_subject: 'Manual Review Required: MQL qualification blocked by missing information'
+        hs_task_subject: 'Manual Review Required: rel_acme::LEAD::1'
       })
     }));
     expect(result.receipts[0].objectType).toBe('task');

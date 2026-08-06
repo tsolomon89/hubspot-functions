@@ -1,6 +1,7 @@
 organizationKey: "org_global_corp"
 configVersion: "1.0.0"
 relationshipType: "b2b"
+productType: "software"
 
 hubspotPipelines:
   leadPipelineId: "b2b_qualification_lead_pipeline"

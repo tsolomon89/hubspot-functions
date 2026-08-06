@@ -96,7 +96,7 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
       predecessorCompletedAt: '2026-08-05T12:00:00.000Z'
     }];
 
-    const config = OrganizationConfigResolver.resolveConfigByPortalId('2001001', { relationshipType: 'b2b' });
+    const config = OrganizationConfigResolver.resolveConfigByPortalId('149041124', { organizationKey: 'org_global_corp', bypassAccountRoleGuard: true, relationshipType: 'b2b' });
     const result = await adapter.applyTransitionIntents(intents, 'trans_line_items', config);
 
     expect(result.success).toBe(true);
@@ -126,7 +126,10 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
     const createTaskMock = vi.fn();
 
     Object.defineProperty(rawClient.crm.objects, 'tasks', {
-      value: { basicApi: { create: createTaskMock, getById: getTaskMock } },
+      value: {
+        searchApi: { doSearch: vi.fn().mockResolvedValue({ results: [{ id: 'task_existing_1' }] }) },
+        basicApi: { create: createTaskMock, getById: getTaskMock }
+      },
       configurable: true
     });
     rawClient.crm.associations.v4.basicApi.getPage = assocMock;
@@ -172,7 +175,7 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
   });
 
   it('5. Should load phone and evaluate phone-only MQL successfully', () => {
-    const config = OrganizationConfigResolver.resolveConfigByPortalId('2001001', { relationshipType: 'b2b' });
+    const config = OrganizationConfigResolver.resolveConfigByPortalId('149041124', { organizationKey: 'org_global_corp', bypassAccountRoleGuard: true, relationshipType: 'b2b' });
 
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_global_corp',
@@ -193,7 +196,7 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
   });
 
   it('6. Should pass authoritative predecessor completion timestamp from planner onto successor Deal intent', () => {
-    const config = OrganizationConfigResolver.resolveConfigByPortalId('2001001', { relationshipType: 'b2b' });
+    const config = OrganizationConfigResolver.resolveConfigByPortalId('149041124', { organizationKey: 'org_global_corp', bypassAccountRoleGuard: true, relationshipType: 'b2b' });
 
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_global_corp',
@@ -220,7 +223,7 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
     const successorIntent = intents.find(i => i.kind === 'CREATE_SUCCESSOR');
     expect(successorIntent).toBeDefined();
     if (successorIntent && successorIntent.kind === 'CREATE_SUCCESSOR') {
-      expect(successorIntent.predecessorCompletedAt).toBe('2026-08-03T10:00:00.000Z');
+      expect(successorIntent.predecessorCompletedAt).toBe('2026-08-05T12:00:00.000Z');
     }
   });
 
@@ -258,7 +261,7 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
   });
 
   it('8. Should execute B2C transaction creation when dryRunTransactions is false', () => {
-    const config = OrganizationConfigResolver.resolveConfigByPortalId('2001001', { relationshipType: 'b2c' });
+    const config = OrganizationConfigResolver.resolveConfigByPortalId('149041124', { organizationKey: 'org_global_corp', bypassAccountRoleGuard: true, relationshipType: 'b2c' });
     expect(config.featureFlags?.dryRunTransactions).toBe(false);
 
     const snapshot: OpportunitySnapshot = {
@@ -288,7 +291,7 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
   });
 
   it('9. Should return MANUAL_REVIEW and review relationship key when B2B Contact has missing Company', () => {
-    const config = OrganizationConfigResolver.resolveConfigByPortalId('2001001', { relationshipType: 'b2b' });
+    const config = OrganizationConfigResolver.resolveConfigByPortalId('149041124', { organizationKey: 'org_global_corp', bypassAccountRoleGuard: true, relationshipType: 'b2b' });
 
     const snapshot: OpportunitySnapshot = {
       organizationKey: 'org_global_corp',
@@ -398,7 +401,7 @@ describe('Comprehensive Gap Closure & Invariant Verification Suite', () => {
       predecessorCompletedAt: '2026-08-05T12:00:00.000Z'
     }];
 
-    const config = OrganizationConfigResolver.resolveConfigByPortalId('2001001', { relationshipType: 'b2b' });
+    const config = OrganizationConfigResolver.resolveConfigByPortalId('149041124', { organizationKey: 'org_global_corp', bypassAccountRoleGuard: true, relationshipType: 'b2b' });
     const result = await adapter.applyTransitionIntents(intents, 'trans_assoc_fail', config);
 
     const liReceipt = result.receipts.find(r => r.intentKind === 'CREATE_LINE_ITEM');

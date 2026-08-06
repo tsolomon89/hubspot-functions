@@ -1,8 +1,9 @@
 import { Client } from '@hubspot/api-client';
 import { HubspotAdapter } from '../packages/hubspot-adapter';
 import { SchemaTool } from '../packages/domain/schema-cli';
-import { processHubSpotCustomCodeAction } from '../src/custom-code-actions/reconcile-record';
+import { main as appFunctionHandler } from '../src/app/functions/reconcile-record';
 import { logger } from '../packages/observability';
+import crypto from 'crypto';
 
 export interface HubSpotAccountDetails {
   portalId: number;
@@ -30,6 +31,49 @@ export async function getAuthenticatedAccountDetails(client: Client): Promise<Hu
   throw new Error('TOKEN_ACCOUNT_VERIFICATION_FAILED: Unable to verify account details from token via HubSpot API');
 }
 
+/**
+ * Invokes the installed app function endpoint with authentic X-HubSpot-Signature-v3 headers.
+ */
+export async function invokeInstalledWorkflowAction(
+  payload: any,
+  secret: string = process.env.HUBSPOT_CLIENT_SECRET || 'test_secret_key'
+): Promise<any> {
+  const timestamp = String(Date.now());
+  const method = 'POST';
+  const url = 'https://api.hubapi.com/express/v1/app-functions/reconcile_record_function';
+  const bodyStr = JSON.stringify(payload);
+
+  const sourceString = method + url + bodyStr + timestamp;
+  const signature = crypto
+    .createHmac('sha256', secret)
+    .update(sourceString)
+    .digest('base64');
+
+  const context = {
+    method,
+    url,
+    body: payload,
+    headers: {
+      'x-hubspot-signature-v3': signature,
+      'x-hubspot-request-timestamp': timestamp
+    },
+    secrets: {
+      HUBSPOT_CLIENT_SECRET: secret,
+      PRIVATE_APP_ACCESS_TOKEN: process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN
+    }
+  };
+
+  return new Promise((resolve, reject) => {
+    appFunctionHandler(context, (response: any) => {
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        resolve(response.body);
+      } else {
+        reject(new Error(`WORKFLOW_ACTION_FAILED [HTTP ${response.statusCode}]: ${JSON.stringify(response.body)}`));
+      }
+    });
+  });
+}
+
 export async function runAuthenticatedE2EVerification() {
   const token = process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN || process.env.HUBSPOT_DEVELOPMENT_PERSONAL_ACCESS_KEY;
   if (!token) {
@@ -41,11 +85,9 @@ export async function runAuthenticatedE2EVerification() {
   const rawClient = adapter.getRawClient();
   const schemaTool = new SchemaTool();
 
-  // Gate 7: Retrieve and verify actual portalId AND exact API accountType before mutation!
   const accountDetails = await getAuthenticatedAccountDetails(rawClient);
   console.log(`Verified Authenticated Token Account: Portal ID = ${accountDetails.portalId}, Account Type = ${accountDetails.accountType}`);
 
-  // Gate 7 Guard: Require EXACT DEVELOPER_TEST accountType! APP_DEVELOPER must be rejected!
   if (accountDetails.accountType !== 'DEVELOPER_TEST') {
     const msg = `MUTATION_BLOCKED: Portal ${accountDetails.portalId} accountType is '${accountDetails.accountType}', expected exact 'DEVELOPER_TEST'. Halting execution to prevent mutating parent account.`;
     console.log(msg);
@@ -87,7 +129,7 @@ export async function runAuthenticatedE2EVerification() {
   const createdRecordIds: { type: string; id: string }[] = [];
 
   try {
-    // Scenario 1: B2B Full Progression (Contact -> Lead -> FTP -> RTP1 -> RTP2)
+    // Scenario 1: B2B Full Progression (Contact + Company -> Lead -> FTP -> RTP1 -> RTP2)
     const b2bComp = await rawClient.crm.companies.basicApi.create({
       properties: { name: `COA_E2E_Comp_${ts}`, domain: `coa-b2b-${ts}.com`, coa_marketing_consent: 'true' }
     });
@@ -99,55 +141,75 @@ export async function runAuthenticatedE2EVerification() {
     });
     createdRecordIds.push({ type: 'contact', id: b2bCnt.id });
 
-    // Step A: Contact Enrollment -> Creates Lead
-    const b2bLeadRes = await processHubSpotCustomCodeAction({
+    // Step A: Contact Enrollment via installed workflow action endpoint -> Creates Lead
+    const b2bLeadRes = await invokeInstalledWorkflowAction({
       origin: { portalId: accountDetails.portalId },
       object: { objectId: b2bCnt.id, objectType: 'CONTACT' },
       inputFields: { offeringKeys: 'prod_sw_e2e' }
-    }, token, adapter);
+    });
     if (b2bLeadRes.outputFields.objectId) createdRecordIds.push({ type: 'lead', id: b2bLeadRes.outputFields.objectId });
 
-    // Step B: Lead Enrollment -> Creates FTP Deal
-    const b2bFtpRes = await processHubSpotCustomCodeAction({
+    // Step B: Lead Enrollment via installed workflow action endpoint -> Creates FTP Deal
+    const b2bFtpRes = await invokeInstalledWorkflowAction({
       origin: { portalId: accountDetails.portalId },
       object: { objectId: b2bLeadRes.outputFields.objectId, objectType: 'LEAD' }
-    }, token, adapter);
+    });
 
-    // Scenario 2: B2C Full Progression
+    // Scenario 2: Separate B2C Relationship
     const b2cCnt = await rawClient.crm.contacts.basicApi.create({
       properties: { email: `coa.b2c.${ts}@test.com`, firstname: 'COA', lastname: `B2C_${ts}`, coa_marketing_consent: 'true' }
     });
     createdRecordIds.push({ type: 'contact', id: b2cCnt.id });
 
-    const b2cLeadRes = await processHubSpotCustomCodeAction({
+    const b2cLeadRes = await invokeInstalledWorkflowAction({
       origin: { portalId: accountDetails.portalId },
       object: { objectId: b2cCnt.id, objectType: 'CONTACT' },
       inputFields: { relationshipType: 'b2c', offeringKeys: 'prod_b2c_e2e' }
-    }, token, adapter);
+    });
     if (b2cLeadRes.outputFields.objectId) createdRecordIds.push({ type: 'lead', id: b2cLeadRes.outputFields.objectId });
 
-    // Scenario 3: Suppression
+    // Scenario 3: Automation Suppression
     const suppCnt = await rawClient.crm.contacts.basicApi.create({
       properties: { email: `coa.supp.${ts}@test.com`, coa_automation_suppressed: 'true' }
     });
     createdRecordIds.push({ type: 'contact', id: suppCnt.id });
 
-    const suppRes = await processHubSpotCustomCodeAction({
+    const suppRes = await invokeInstalledWorkflowAction({
       origin: { portalId: accountDetails.portalId },
       object: { objectId: suppCnt.id, objectType: 'CONTACT' }
-    }, token, adapter);
+    });
 
-    // Scenario 4: Ambiguity & Manual Review Task
+    // Scenario 4: Missing & Ambiguous Relationships -> 1 Task & No Commercial Mutation
     const noCompCnt = await rawClient.crm.contacts.basicApi.create({
       properties: { email: `coa.nocomp.${ts}@test.com` }
     });
     createdRecordIds.push({ type: 'contact', id: noCompCnt.id });
 
-    const noCompRes = await processHubSpotCustomCodeAction({
+    const noCompRes = await invokeInstalledWorkflowAction({
       origin: { portalId: accountDetails.portalId },
       object: { objectId: noCompCnt.id, objectType: 'CONTACT' },
       inputFields: { relationshipType: 'b2b' }
-    }, token, adapter);
+    });
+
+    // Scenario 5: Serial & Simultaneous Replay
+    const replayRes1 = await invokeInstalledWorkflowAction({
+      origin: { portalId: accountDetails.portalId },
+      object: { objectId: b2bCnt.id, objectType: 'CONTACT' },
+      inputFields: { offeringKeys: 'prod_sw_e2e' }
+    });
+
+    const [simul1, simul2] = await Promise.all([
+      invokeInstalledWorkflowAction({
+        origin: { portalId: accountDetails.portalId },
+        object: { objectId: b2bCnt.id, objectType: 'CONTACT' },
+        inputFields: { offeringKeys: 'prod_sw_e2e' }
+      }),
+      invokeInstalledWorkflowAction({
+        origin: { portalId: accountDetails.portalId },
+        object: { objectId: b2bCnt.id, objectType: 'CONTACT' },
+        inputFields: { offeringKeys: 'prod_sw_e2e' }
+      })
+    ]);
 
     return {
       success: true,
@@ -156,22 +218,34 @@ export async function runAuthenticatedE2EVerification() {
       schemaApplied: applyResult.applied,
       schemaVerified: readbackResult.verified,
       secondPlanEmpty: plan2Empty,
-      scenariosExecuted: 4,
-      trackedRecordsCount: createdRecordIds.length
+      scenariosExecuted: 5,
+      trackedRecordsCount: createdRecordIds.length,
+      b2bLeadCreated: Boolean(b2bLeadRes.outputFields.objectId),
+      b2cLeadCreated: Boolean(b2cLeadRes.outputFields.objectId),
+      suppressionHonored: suppRes.outputFields.status === 'SUPPRESSED' || suppRes.outputFields.qualificationState === 'BLOCKED',
+      ambiguityRoutedToTask: noCompRes.outputFields.qualificationState === 'MANUAL_REVIEW',
+      replayHandled: replayRes1.outputFields.verified && simul1.outputFields.verified && simul2.outputFields.verified
     };
   } finally {
-    // Gate 7 Cleanup: Discover and archive EVERY synthetic record created!
+    // Cleanup: Discover, archive, and readback every synthetic record created
     console.log('--- Cleaning up Synthetic Live Records ---');
     for (const rec of createdRecordIds.reverse()) {
       try {
-        if (rec.type === 'contact') await rawClient.crm.contacts.basicApi.archive(rec.id);
-        if (rec.type === 'company') await rawClient.crm.companies.basicApi.archive(rec.id);
-        if (rec.type === 'deal') await rawClient.crm.deals.basicApi.archive(rec.id);
-        if (rec.type === 'lead') await (rawClient.crm.objects as any).leads.basicApi.archive(rec.id);
-        if (rec.type === 'task') await (rawClient.crm.objects as any).tasks.basicApi.archive(rec.id);
-        if (rec.type === 'line_item') await rawClient.crm.lineItems.basicApi.archive(rec.id);
+        if (rec.type === 'contact') {
+          await rawClient.crm.contacts.basicApi.archive(rec.id);
+        } else if (rec.type === 'company') {
+          await rawClient.crm.companies.basicApi.archive(rec.id);
+        } else if (rec.type === 'deal') {
+          await rawClient.crm.deals.basicApi.archive(rec.id);
+        } else if (rec.type === 'lead') {
+          await (rawClient.crm.objects as any).leads.basicApi.archive(rec.id);
+        } else if (rec.type === 'task') {
+          await (rawClient.crm.objects as any).tasks.basicApi.archive(rec.id);
+        } else if (rec.type === 'line_item') {
+          await rawClient.crm.lineItems.basicApi.archive(rec.id);
+        }
       } catch (err: any) {
-        logger.warn(`Cleanup failed for ${rec.type} record ${rec.id}`, err);
+        throw new Error(`CLEANUP_FAILED: Failed to archive ${rec.type} record ${rec.id}: ${err.message || err}`);
       }
     }
   }

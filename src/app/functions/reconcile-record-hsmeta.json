@@ -1,0 +1,10 @@
+{
+  "type": "app-function",
+  "uid": "reconcile_record_function",
+  "config": {
+    "endpoint": {
+      "file": "reconcile-record.js",
+      "method": "POST"
+    }
+  }
+}

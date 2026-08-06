@@ -1,10 +1,17 @@
 {
-  "uid": "coa_reconcile_record_action",
-  "type": "workflowAction",
+  "type": "workflow-action",
+  "uid": "reconcile_record_workflow_action",
   "config": {
-    "actionUrl": "https://api.hubspot.com/express/v1/app-functions/commercial_operations_automation_app/reconcileRecord",
-    "published": true,
-    "userAvailable": true,
+    "actionUrl": "https://api.hubapi.com/express/v1/app-functions/reconcile_record_function",
+    "isPublished": true,
+    "supportedClients": ["WORKFLOWS"],
+    "labels": {
+      "en": {
+        "actionName": "Reconcile Commercial Record",
+        "actionDescription": "Evaluates commercial qualification and executes state transitions natively in HubSpot CRM.",
+        "appDisplayName": "Commercial Operations Automation"
+      }
+    },
     "objectTypes": [
       "CONTACT",
       "COMPANY",
@@ -15,8 +22,12 @@
       {
         "typeDefinition": {
           "name": "relationshipType",
-          "type": "string",
-          "fieldType": "select"
+          "type": "enumeration",
+          "fieldType": "select",
+          "options": [
+            { "label": "B2B", "value": "b2b" },
+            { "label": "B2C", "value": "b2c" }
+          ]
         },
         "supportedValueTypes": ["STATIC_VALUE", "OBJECT_PROPERTY"]
       },

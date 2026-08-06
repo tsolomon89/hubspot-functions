@@ -1,0 +1,8 @@
+{
+  "name": "reconcile-record-function",
+  "version": "1.0.0",
+  "main": "reconcile-record.js",
+  "dependencies": {
+    "@hubspot/api-client": "^12.1.0"
+  }
+}

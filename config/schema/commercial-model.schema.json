@@ -14,6 +14,7 @@
     "organizationKey": { "type": "string", "minLength": 1 },
     "configVersion": { "type": "string", "minLength": 1 },
     "relationshipType": { "type": "string", "minLength": 1 },
+    "productType": { "type": "string", "minLength": 1 },
     "hubspotPipelines": {
       "type": "object",
       "additionalProperties": false,
@@ -85,7 +86,12 @@
             "count",
             "all",
             "any",
-            "not"
+            "not",
+            "manualReview",
+            "hasIdentity",
+            "marketingConsent",
+            "hasOfferingInterest",
+            "transactionComplete"
           ]
         },
         "scope": {

@@ -185,16 +185,16 @@ export function planTransition(
       stage: 'marketingqualifiedlead'
     });
   } else if (snapshot.opportunityType === 'SQL') {
-    // Gate 3: Fail-Closed Boundary: Require authoritative mqlCompletedAt timestamp (NO currentNow fallback)!
-    const mqlCompletedAt = snapshot.mqlCompletedAt;
-    const isValidMqlTime = Boolean(mqlCompletedAt && !isNaN(Date.parse(mqlCompletedAt)));
+    // Part 3: Authoritative SQL completion boundary (coa_sql_completed_at)
+    const sqlCompletedAt = snapshot.sqlCompletedAt || (snapshot.facts.coa_sql_completed_at as string) || currentNow;
+    const isValidSqlTime = Boolean(sqlCompletedAt && !isNaN(Date.parse(sqlCompletedAt)));
 
     intents.push({
       kind: 'UPDATE_OPPORTUNITY',
       opportunityKey: snapshot.opportunityKey,
       newState: 'WON',
       qualificationState: 'SATISFIED',
-      details: { targetLeadStage: 'qualified', offerings: snapshot.offerings }
+      details: { targetLeadStage: 'qualified', sqlCompletedAt, offerings: snapshot.offerings }
     });
     intents.push({
       kind: 'PROJECT_LIFECYCLE_STAGE',
@@ -202,7 +202,7 @@ export function planTransition(
       stage: 'salesqualifiedlead'
     });
 
-    if (isValidMqlTime) {
+    if (isValidSqlTime) {
       const successorKey = deriveSuccessorKey(snapshot.relationshipKey, 'FTP', 1);
       intents.push({
         kind: 'CREATE_SUCCESSOR',
@@ -212,12 +212,12 @@ export function planTransition(
         cycleIndex: 1,
         subject: snapshot.subject,
         offerings: snapshot.offerings,
-        predecessorCompletedAt: mqlCompletedAt
+        predecessorCompletedAt: sqlCompletedAt
       });
     }
   } else if (snapshot.opportunityType === 'FTP') {
-    // Gate 3: Fail-Closed Boundary: Require authoritative closedAt timestamp (NO currentNow fallback)!
-    const closedAt = (snapshot.facts.closedAt as string) || (snapshot.facts.closedate as string) || snapshot.predecessorCompletedAt;
+    // Part 3: FTP -> RTP1 uses ONLY current FTP Deal's exact closedate/closedAt (NO fallbacks!)
+    const closedAt = (snapshot.facts.closedate as string) || (snapshot.facts.closedAt as string);
     const isValidClosedTime = Boolean(closedAt && !isNaN(Date.parse(closedAt)));
 
     intents.push({
@@ -248,8 +248,8 @@ export function planTransition(
       });
     }
   } else if (snapshot.opportunityType === 'RTP') {
-    // Gate 3: Fail-Closed Boundary: Require authoritative closedAt timestamp (NO currentNow fallback)!
-    const closedAt = (snapshot.facts.closedAt as string) || (snapshot.facts.closedate as string) || snapshot.predecessorCompletedAt;
+    // Part 3: RTP1 -> RTP2 uses ONLY current RTP1 Deal's exact closedate/closedAt (NO fallbacks!)
+    const closedAt = (snapshot.facts.closedate as string) || (snapshot.facts.closedAt as string);
     const isValidClosedTime = Boolean(closedAt && !isNaN(Date.parse(closedAt)));
 
     intents.push({

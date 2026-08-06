@@ -98,10 +98,10 @@ export class HubSpotSnapshotLoader {
   }
 
   /**
-   * Explicit primary company resolution from list of associated company IDs for Contact.
+   * Explicit primary company resolution from list of associated company IDs for Contact, Lead or Deal.
    */
   public async resolvePrimaryCompanyId(
-    contactId: string,
+    recordId: string,
     companyAssocs: any[]
   ): Promise<{ primaryCompanyId: string | null; isAmbiguous: boolean }> {
     if (!companyAssocs || companyAssocs.length === 0) {
@@ -156,6 +156,7 @@ export class HubSpotSnapshotLoader {
     let openedAt = new Date().toISOString();
     let predecessorCompletedAt: string | undefined = undefined;
     let mqlCompletedAt: string | undefined = undefined;
+    let sqlCompletedAt: string | undefined = undefined;
     let relationshipKey = '';
 
     if (rawType === 'contact' || rawType === '0-1') {
@@ -309,6 +310,7 @@ export class HubSpotSnapshotLoader {
         'coa_qualification_state',
         'coa_predecessor_opportunity_key',
         'coa_mql_completed_at',
+        'coa_sql_completed_at',
         'coa_offering_keys',
         'createdate'
       ]);
@@ -329,7 +331,14 @@ export class HubSpotSnapshotLoader {
 
       const compAssocs = await this.getAllAssociations('lead', recordRef.objectId, 'company');
       if (compAssocs.length > 0) {
-        companyKey = String(compAssocs[0].toObjectId);
+        const { primaryCompanyId: resComp, isAmbiguous: isCompAmbiguous } = await this.resolvePrimaryCompanyId(recordRef.objectId, compAssocs);
+        if (isCompAmbiguous) {
+          facts.ambiguousPrimaryCompany = true;
+          facts.manualReviewRequired = true;
+          companyKey = undefined;
+        } else {
+          companyKey = resComp || undefined;
+        }
       }
 
       if (companyKey) {
@@ -363,6 +372,7 @@ export class HubSpotSnapshotLoader {
       }
 
       mqlCompletedAt = parseHubSpotTimestamp(lProps.coa_mql_completed_at) || undefined;
+      sqlCompletedAt = parseHubSpotTimestamp(lProps.coa_sql_completed_at) || undefined;
       cycleIndex = Number(lProps.coa_cycle_index) || 1;
       openedAt = parseHubSpotTimestamp(lProps.createdate) || openedAt;
 
@@ -382,6 +392,7 @@ export class HubSpotSnapshotLoader {
         'coa_predecessor_opportunity_key',
         'coa_predecessor_completed_at',
         'coa_mql_completed_at',
+        'coa_sql_completed_at',
         'coa_offering_keys',
         'createdate'
       ]);
@@ -402,7 +413,14 @@ export class HubSpotSnapshotLoader {
 
       const compAssocs = await this.getAllAssociations('deal', recordRef.objectId, 'company');
       if (compAssocs.length > 0) {
-        companyKey = String(compAssocs[0].toObjectId);
+        const { primaryCompanyId: resComp, isAmbiguous: isCompAmbiguous } = await this.resolvePrimaryCompanyId(recordRef.objectId, compAssocs);
+        if (isCompAmbiguous) {
+          facts.ambiguousPrimaryCompany = true;
+          facts.manualReviewRequired = true;
+          companyKey = undefined;
+        } else {
+          companyKey = resComp || undefined;
+        }
       }
 
       if (companyKey) {
@@ -425,7 +443,7 @@ export class HubSpotSnapshotLoader {
       if (stage === 'closedwon') {
         opportunityState = 'WON';
         facts.transactionCompleted = true;
-        facts.closedAt = parseHubSpotTimestamp(dProps.closedate || dProps.closedAt || dProps.coa_predecessor_completed_at) || openedAt;
+        facts.closedAt = parseHubSpotTimestamp(dProps.closedate || dProps.closedAt) || undefined;
       } else if (stage === 'closedlost') {
         opportunityState = 'LOST';
       } else {
@@ -470,6 +488,7 @@ export class HubSpotSnapshotLoader {
 
       predecessorCompletedAt = parseHubSpotTimestamp(dProps.coa_predecessor_completed_at) || undefined;
       mqlCompletedAt = parseHubSpotTimestamp(dProps.coa_mql_completed_at) || undefined;
+      sqlCompletedAt = parseHubSpotTimestamp(dProps.coa_sql_completed_at) || undefined;
     } else {
       throw new Error(`INVALID_ENROLLMENT: Unsupported objectType '${recordRef.objectType}'`);
     }
@@ -556,6 +575,7 @@ export class HubSpotSnapshotLoader {
       openedAt,
       predecessorCompletedAt,
       mqlCompletedAt,
+      sqlCompletedAt,
       offerings,
       subject: {
         kind: subjectKind,

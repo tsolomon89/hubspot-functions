@@ -1,9 +1,20 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as path from 'path';
 import { main, processHubSpotCustomCodeAction } from '../../src/custom-code-actions/reconcile-record';
 import { parseHubSpotTimestamp, HubspotAdapter } from '../../packages/hubspot-adapter/adapter';
+import { OrganizationConfigResolver } from '../../packages/domain/config-resolver';
 
 describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
+  beforeEach(() => {
+    OrganizationConfigResolver.registerDynamicInstallation(10001, {
+      executionPortalId: 10001,
+      accountRole: 'developer-test',
+      organizationKey: 'org_global_corp',
+      allowedRelationshipTypes: ['b2b', 'b2c'],
+      defaultRelationshipType: 'b2b'
+    });
+  });
+
   it('should verify that committed generated CommonJS bundle exposes exports.main', () => {
     const bundlePath = path.join(__dirname, '../../dist/hubspot-custom-code/reconcile-record.js');
     const bundle = require(bundlePath);
@@ -20,7 +31,7 @@ describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
 
   it('should execute processHubSpotCustomCodeAction on production-shaped Contact event and throw when unverified using offline fake client', async () => {
     const event = {
-      origin: { portalId: 2001001 },
+      origin: { portalId: 10001 },
       object: { objectId: 'cnt_99812', objectType: 'CONTACT' }
     };
 
@@ -38,7 +49,7 @@ describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
 
   it('should support exports.main callback contract and re-throw API errors for native retries using offline fake client', async () => {
     const event = {
-      origin: { portalId: 2001001 },
+      origin: { portalId: 10001 },
       object: { objectId: 'cnt_77123', objectType: 'CONTACT' }
     };
 
@@ -51,7 +62,6 @@ describe('True End-to-End Custom Code Action Lifecycle Tests', () => {
 
     rawClient.crm.contacts.basicApi.getById = vi.fn().mockRejectedValue(hubspot401Error);
 
-    const callback = vi.fn();
     await expect(processHubSpotCustomCodeAction(event, 'fake-token', fakeAdapter)).rejects.toThrow('HTTP 401 Unauthorized');
   });
 });

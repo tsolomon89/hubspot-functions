@@ -9,13 +9,3 @@ installations:
       - "b2c"
     defaultRelationshipType: "b2b"
     expectedConfigVersion: "1.0.0"
-
-  "2001001":
-    executionPortalId: 2001001
-    accountRole: "developer-test"
-    organizationKey: "org_global_corp"
-    allowedRelationshipTypes:
-      - "b2b"
-      - "b2c"
-    defaultRelationshipType: "b2b"
-    expectedConfigVersion: "1.0.0"

@@ -1,9 +1,18 @@
 import { describe, it, expect, vi } from 'vitest';
 import { processHubSpotCustomCodeAction } from '../../src/custom-code-actions/reconcile-record';
 import { HubspotAdapter } from '../../packages/hubspot-adapter/adapter';
+import { OrganizationConfigResolver } from '../../packages/domain/config-resolver';
 
 describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', () => {
   it('Should execute processHubSpotCustomCodeAction through Contact -> Lead -> FTP Deal -> Closed Won -> RTP1 Deal -> Closed Won -> RTP2 Deal with exact Contact and Company associations and Replay Safety', async () => {
+    OrganizationConfigResolver.registerDynamicInstallation(10001, {
+      executionPortalId: 10001,
+      accountRole: 'developer-test',
+      organizationKey: 'org_global_corp',
+      allowedRelationshipTypes: ['b2b', 'b2c'],
+      defaultRelationshipType: 'b2b'
+    });
+
     const meetingTime = String(Date.now() + 600000);
 
     // Stateful fake CRM store
@@ -182,7 +191,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
 
     // Mock Products API
     rawClient.crm.products.searchApi.doSearch = vi.fn().mockImplementation(async () => ({
-      results: [{ id: 'prod_100', properties: { name: 'prod_software', price: '100' } }]
+      results: [{ id: 'prod_100', properties: { name: 'prod_software', hs_sku: 'prod_software', price: '100' } }]
     }));
 
     // Mock Line Items API with dynamic store for exact coa_line_item_key readback
@@ -260,7 +269,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
 
     // STEP 1: Process initial Contact enrollment -> Managed Lead created & progressed to SQL
     const step1Result = await processHubSpotCustomCodeAction({
-      origin: { portalId: 2001001 },
+      origin: { portalId: 10001 },
       object: { objectId: 'cnt_1001', objectType: 'CONTACT' },
       inputFields: { offeringKeys: 'prod_software' }
     }, 'fake-token', fakeAdapter);
@@ -283,7 +292,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
 
     // STEP 2: Process created Lead enrollment -> Moves to Qualified & Creates FTP Deal
     const step2Result = await processHubSpotCustomCodeAction({
-      origin: { portalId: 2001001 },
+      origin: { portalId: 10001 },
       object: { objectId: createdLeadId, objectType: 'LEAD' }
     }, 'fake-token', fakeAdapter);
 
@@ -306,7 +315,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
 
     // STEP 3: Replay Lead enrollment -> Idempotent NO_CHANGE
     const step3Result = await processHubSpotCustomCodeAction({
-      origin: { portalId: 2001001 },
+      origin: { portalId: 10001 },
       object: { objectId: createdLeadId, objectType: 'LEAD' }
     }, 'fake-token', fakeAdapter);
     expect(step3Result.outputFields.status).toBe('NO_CHANGE');
@@ -318,7 +327,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
     crmStore.deals[ftpDeal.id].properties.coa_predecessor_completed_at = '2026-08-05T12:00:00.000Z';
 
     const step4Result = await processHubSpotCustomCodeAction({
-      origin: { portalId: 2001001 },
+      origin: { portalId: 10001 },
       object: { objectId: ftpDeal.id, objectType: 'DEAL' }
     }, 'fake-token', fakeAdapter);
 
@@ -340,7 +349,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
 
     // STEP 5: Replay FTP Deal enrollment -> Idempotent NO_CHANGE
     const step5Result = await processHubSpotCustomCodeAction({
-      origin: { portalId: 2001001 },
+      origin: { portalId: 10001 },
       object: { objectId: ftpDeal.id, objectType: 'DEAL' }
     }, 'fake-token', fakeAdapter);
     expect(step5Result.outputFields.status).toBe('NO_CHANGE');
@@ -353,7 +362,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
       crmStore.deals[rtp1Deal.id].properties.coa_predecessor_completed_at = '2026-08-05T13:00:00.000Z';
 
       const step6Result = await processHubSpotCustomCodeAction({
-        origin: { portalId: 2001001 },
+        origin: { portalId: 10001 },
         object: { objectId: rtp1Deal.id, objectType: 'DEAL' }
       }, 'fake-token', fakeAdapter);
 
@@ -375,7 +384,7 @@ describe('True Stateful End-to-End Custom Code Action Lifecycle Contract Test', 
 
       // STEP 7: Replay RTP1 Deal enrollment -> Idempotent NO_CHANGE
       const step7Result = await processHubSpotCustomCodeAction({
-        origin: { portalId: 2001001 },
+        origin: { portalId: 10001 },
         object: { objectId: rtp1Deal.id, objectType: 'DEAL' }
       }, 'fake-token', fakeAdapter);
       expect(step7Result.outputFields.status).toBe('NO_CHANGE');

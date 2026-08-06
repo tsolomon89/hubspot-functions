@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 
-describe('Architecture Invariants & Component Packaging Assertions', () => {
+describe('Architecture Invariants & 2026.03 Component Packaging Assertions', () => {
   const rootDir = path.join(__dirname, '../../');
 
   it('should verify pg and fastify dependencies are absent from package.json', () => {
@@ -29,17 +29,33 @@ describe('Architecture Invariants & Component Packaging Assertions', () => {
     expect(apiDirExists).toBe(false);
   });
 
-  it('should verify src/app/app.functions/ app function component directory exists and is packaged', () => {
-    const appFunctionsDir = path.join(rootDir, 'src/app/app.functions');
-    expect(fs.existsSync(appFunctionsDir)).toBe(true);
-    expect(fs.existsSync(path.join(appFunctionsDir, 'serverless.json'))).toBe(true);
-    expect(fs.existsSync(path.join(appFunctionsDir, 'reconcile-record.js'))).toBe(true);
+  it('should verify src/app/functions/ official 2026.03 app function component directory exists and is packaged', () => {
+    const functionsDir = path.join(rootDir, 'src/app/functions');
+    expect(fs.existsSync(functionsDir)).toBe(true);
+    expect(fs.existsSync(path.join(functionsDir, 'package.json'))).toBe(true);
+    expect(fs.existsSync(path.join(functionsDir, 'reconcile-record-hsmeta.json'))).toBe(true);
+    expect(fs.existsSync(path.join(functionsDir, 'reconcile-record.js'))).toBe(true);
+
+    const meta = JSON.parse(fs.readFileSync(path.join(functionsDir, 'reconcile-record-hsmeta.json'), 'utf-8'));
+    expect(meta.type).toBe('app-function');
+    expect(meta.uid).toBe('reconcile_record_function');
   });
 
-  it('should verify src/app/extensions/ custom workflow action component directory exists and is packaged', () => {
-    const extensionsDir = path.join(rootDir, 'src/app/extensions');
-    expect(fs.existsSync(extensionsDir)).toBe(true);
-    expect(fs.existsSync(path.join(extensionsDir, 'reconcile-record-action.json'))).toBe(true);
+  it('should verify src/app/workflow-actions/ official 2026.03 custom workflow action component directory exists and is packaged', () => {
+    const actionsDir = path.join(rootDir, 'src/app/workflow-actions');
+    expect(fs.existsSync(actionsDir)).toBe(true);
+    expect(fs.existsSync(path.join(actionsDir, 'reconcile-record-action-hsmeta.json'))).toBe(true);
+
+    const actionMeta = JSON.parse(fs.readFileSync(path.join(actionsDir, 'reconcile-record-action-hsmeta.json'), 'utf-8'));
+    expect(actionMeta.type).toBe('workflow-action');
+    expect(actionMeta.uid).toBe('reconcile_record_workflow_action');
+    expect(actionMeta.config.actionUrl).toBeDefined();
+    expect(actionMeta.config.isPublished).toBe(true);
+    expect(actionMeta.config.supportedClients).toContain('WORKFLOWS');
+    expect(actionMeta.config.labels).toBeDefined();
+    expect(actionMeta.config.objectTypes).toEqual(['CONTACT', 'COMPANY', 'LEAD', 'DEAL']);
+    expect(actionMeta.config.inputFields).toHaveLength(2);
+    expect(actionMeta.config.outputFields).toHaveLength(7);
   });
 
   it('should verify no vercel.app URLs exist in project files', () => {

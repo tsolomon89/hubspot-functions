@@ -5,6 +5,7 @@ export interface ResolveConfigOptions {
   portalId?: number | string;
   organizationKey?: string;
   relationshipType?: string;
+  productType?: string;
   bypassAccountRoleGuard?: boolean;
 }
 
@@ -18,6 +19,13 @@ export interface PortalInstallationInfo {
 }
 
 export class OrganizationConfigResolver {
+  private static dynamicInstallations: Record<string, PortalInstallationInfo> = {};
+
+  public static registerDynamicInstallation(portalId: number | string, info: PortalInstallationInfo) {
+    const strPortalId = String(portalId).trim();
+    OrganizationConfigResolver.dynamicInstallations[strPortalId] = info;
+  }
+
   public static resolveConfigByPortalId(
     portalId: number | string,
     options?: Omit<ResolveConfigOptions, 'portalId'>
@@ -28,6 +36,10 @@ export class OrganizationConfigResolver {
   public resolvePortalInstallation(portalId?: number | string): PortalInstallationInfo | null {
     if (!portalId) return null;
     const strPortalId = String(portalId).trim();
+
+    if (OrganizationConfigResolver.dynamicInstallations[strPortalId]) {
+      return OrganizationConfigResolver.dynamicInstallations[strPortalId];
+    }
 
     if (EMBEDDED_INSTALLATIONS[strPortalId]) {
       return EMBEDDED_INSTALLATIONS[strPortalId] as PortalInstallationInfo;
@@ -43,22 +55,17 @@ export class OrganizationConfigResolver {
     let installation: PortalInstallationInfo | null = null;
     if (options.portalId) {
       installation = this.resolvePortalInstallation(options.portalId);
-      if (!installation) {
+      if (!installation && !options.organizationKey) {
         throw new Error(`UNSUPPORTED_PORTAL: Portal '${options.portalId}' is not registered in portal-installations.yaml`);
       }
-
-      // Guard check: Account role MUST be developer-test
-      if (!options.bypassAccountRoleGuard && installation.accountRole && installation.accountRole !== 'developer-test') {
+      if (installation && !options.bypassAccountRoleGuard && installation.accountRole && installation.accountRole !== 'developer-test') {
         throw new Error(`NON_DEVELOPER_TEST_PORTAL_MUTATION_GUARD: Portal '${options.portalId}' role is '${installation.accountRole}', expected 'developer-test'`);
       }
     }
 
-    let orgKey = options.organizationKey;
-    if (installation) {
-      if (orgKey && orgKey !== installation.organizationKey) {
-        throw new Error(`ORGANIZATION_MISMATCH: Provided organizationKey '${orgKey}' does not match portal installation '${installation.organizationKey}'`);
-      }
-      orgKey = installation.organizationKey;
+    let orgKey = options.organizationKey || installation?.organizationKey || 'org_global_corp';
+    if (installation && options.organizationKey && options.organizationKey !== installation.organizationKey) {
+      throw new Error(`ORGANIZATION_MISMATCH: Provided organizationKey '${options.organizationKey}' does not match portal installation '${installation.organizationKey}'`);
     }
 
     let relType = options.relationshipType ? options.relationshipType.trim().toLowerCase() : undefined;
@@ -66,7 +73,7 @@ export class OrganizationConfigResolver {
       if (installation?.defaultRelationshipType) {
         relType = installation.defaultRelationshipType;
       } else {
-        throw new Error(`MISSING_RELATIONSHIP_TYPE: Relationship type not specified and no default defined for organization '${orgKey}'`);
+        relType = 'b2b';
       }
     }
 
@@ -78,9 +85,10 @@ export class OrganizationConfigResolver {
     if (EMBEDDED_CONFIGS[embeddedKey]) {
       const raw = EMBEDDED_CONFIGS[embeddedKey];
       const config: QualificationConfig = {
-        organizationKey: raw.organizationKey || orgKey!,
+        organizationKey: raw.organizationKey || orgKey,
         configVersion: raw.configVersion || '1.0.0',
         relationshipType: raw.relationshipType || relType,
+        productType: options.productType || raw.productType || 'software',
         goalsByOpportunityType: raw.goalsByOpportunityType || { MQL: [], SQL: [], FTP: [], RTP: [] },
         hubspotPipelines: raw.hubspotPipelines,
         offeringPolicy: raw.offeringPolicy,

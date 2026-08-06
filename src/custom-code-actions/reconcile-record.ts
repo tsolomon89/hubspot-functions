@@ -1,12 +1,23 @@
+import { HubSpotSnapshotLoader, HubspotAdapter, VerificationReceipt } from '../../packages/hubspot-adapter';
 import { OrganizationConfigResolver } from '../../packages/domain/config-resolver';
-import { HubspotAdapter, HubSpotSnapshotLoader } from '../../packages/hubspot-adapter';
 import { evaluateOpportunity, planTransition } from '../../packages/commercial-kernel';
 import { logger } from '../../packages/observability';
 
 export interface HubSpotEventPayload {
-  origin?: { portalId?: number };
-  object?: { objectId?: string | number; id?: string | number; objectType?: string };
-  inputFields?: Record<string, any>;
+  origin?: {
+    portalId?: number;
+    userUserId?: number;
+  };
+  object?: {
+    objectId?: string | number;
+    objectType?: string;
+  };
+  inputFields?: {
+    organizationKey?: string;
+    relationshipType?: string;
+    productType?: string;
+    offeringKeys?: string;
+  };
 }
 
 export interface CustomCodeActionResult {
@@ -26,45 +37,70 @@ export async function processHubSpotCustomCodeAction(
   accessToken?: string,
   adapterInstance?: HubspotAdapter
 ): Promise<CustomCodeActionResult> {
-  const portalId = event?.origin?.portalId;
-  const rawObjectId = event?.object?.objectId !== undefined ? String(event.object.objectId) : (event?.object?.id !== undefined ? String(event.object.id) : undefined);
-  const rawObjectType = event?.object?.objectType;
+  logger.info("Executing stateless HubSpot Custom Code Action", { event });
 
-  if (!portalId || !rawObjectId || rawObjectId === '0' || !rawObjectType) {
-    throw new Error("INVALID_ENROLLMENT: Missing valid origin.portalId, object.objectId, or object.objectType in HubSpot event payload");
+  const rawPortalId = event?.origin?.portalId;
+  const rawObjectId = event?.object?.objectId ? String(event.object.objectId) : undefined;
+  const objectType = event?.object?.objectType;
+
+  if (!rawObjectId || rawObjectId === '0' || !objectType) {
+    throw new Error(`INVALID_ENROLLMENT: Missing valid objectId ('${rawObjectId}') or objectType ('${objectType}') in event payload`);
   }
 
-  // Fail fast if required access token secret is missing and no fake adapter supplied
   const token = accessToken || process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
   if (!adapterInstance && (!token || token.trim() === '')) {
-    throw new Error("MISSING_AUTHENTICATION_SECRET: PRIVATE_APP_ACCESS_TOKEN secret is missing or empty");
+    throw new Error("MISSING_AUTHENTICATION_SECRET: PRIVATE_APP_ACCESS_TOKEN secret is missing or empty in execution environment");
   }
 
-  const objectType = String(rawObjectType).toLowerCase();
+  const adapter = adapterInstance || new HubspotAdapter(token);
+  const loader = new HubSpotSnapshotLoader(adapter);
+  const resolver = new OrganizationConfigResolver();
 
-  logger.info("Executing stateless HubSpot Custom Code Action", {
-    event: { origin: event?.origin, object: { objectId: rawObjectId, objectType } }
+  const inputOrgKey = event?.inputFields?.organizationKey;
+  const inputRelType = event?.inputFields?.relationshipType;
+  const inputProductType = event?.inputFields?.productType;
+
+  let config = resolver.resolveConfig({
+    portalId: rawPortalId,
+    organizationKey: inputOrgKey,
+    relationshipType: inputRelType,
+    productType: inputProductType
   });
 
-  const relTypeInput = event?.inputFields?.relationshipType || event?.inputFields?.coa_relationship_type;
-  const offeringInput = event?.inputFields?.offeringKeys || event?.inputFields?.coa_offering_keys;
-
-  const config = OrganizationConfigResolver.resolveConfigByPortalId(portalId, { relationshipType: relTypeInput });
-  const adapter = adapterInstance || new HubspotAdapter(token);
-  const snapshotLoader = new HubSpotSnapshotLoader(adapter);
-
-  // Load subject snapshot first
-  const snapshot = await snapshotLoader.loadSnapshotFromRecord(
-    { objectType, objectId: rawObjectId },
+  const snapshot = await loader.loadPureSnapshotFromHubSpot(
+    { objectId: rawObjectId, objectType },
     config.organizationKey,
     config.relationshipType
   );
 
-  logger.info("Loading pure opportunity snapshot directly from HubSpot CRM", { objectType, objectId: rawObjectId });
+  if (snapshot.facts?.manualReviewRequired || snapshot.facts?.ambiguousPrimaryContact || snapshot.facts?.ambiguousPrimaryCompany || snapshot.facts?.missingCompany) {
+    logger.warn("Ambiguity or missing relationship detected on snapshot; generating Manual Review Task intent", { snapshot });
+    
+    const taskIntent = {
+      kind: 'CREATE_MANUAL_REVIEW' as const,
+      opportunityKey: snapshot.opportunityKey,
+      reason: snapshot.facts?.missingCompany 
+        ? 'B2B Relationship missing required Company association'
+        : (snapshot.facts?.ambiguousPrimaryCompany ? 'Ambiguous primary Company association detected' : 'Ambiguous primary Contact association detected'),
+      subject: snapshot.subject
+    };
 
-  // Early Suppression Gate: check if automation is suppressed BEFORE Lead bootstrap
-  if (snapshot.facts.automationSuppressed === true || config.featureFlags?.automationSuppressed === true) {
-    logger.info("Automation suppressed for subject record", { objectType, objectId: rawObjectId });
+    const mutationResult = await adapter.applyTransitionIntents([taskIntent], snapshot.opportunityKey, config);
+    return {
+      outputFields: {
+        objectId: rawObjectId,
+        objectType,
+        opportunityKey: snapshot.opportunityKey,
+        qualificationState: 'MANUAL_REVIEW',
+        appliedIntentsCount: mutationResult.appliedIntents,
+        verified: mutationResult.success,
+        status: 'MANUAL_REVIEW_REQUIRED'
+      }
+    };
+  }
+
+  if (snapshot.facts?.automationSuppressed) {
+    logger.info("Automation suppressed for subject; returning SUPPRESSED response", { snapshot });
     return {
       outputFields: {
         objectId: rawObjectId,
@@ -73,67 +109,48 @@ export async function processHubSpotCustomCodeAction(
         qualificationState: 'BLOCKED',
         appliedIntentsCount: 0,
         verified: true,
-        status: 'BLOCKED'
+        status: 'SUPPRESSED'
       }
     };
   }
 
-  // Pre-Lead creation check: missing Company or ambiguous primary contact/company MUST NOT create a Lead!
-  const needsManualReview = Boolean(
-    snapshot.facts.missingCompany === true ||
-    snapshot.facts.ambiguousPrimaryCompany === true ||
-    snapshot.facts.ambiguousPrimaryContact === true ||
-    snapshot.facts.manualReviewRequired === true
-  );
-
-  if ((objectType === 'contact' || objectType === '0-1' || objectType === 'company' || objectType === '0-2') && !needsManualReview) {
-    const lead = await adapter.findOrCreateLeadForSubject(
+  if ((objectType.toLowerCase() === 'contact' || objectType === '0-1') && snapshot.opportunityType === 'MQL') {
+    const inputOfferings = event?.inputFields?.offeringKeys;
+    const initialLead = await adapter.findOrCreateLeadForSubject(
       snapshot.subject,
       snapshot.relationshipKey,
-      config.relationshipType,
+      snapshot.relationshipType,
       config,
-      offeringInput
+      inputOfferings
     );
 
-    if (lead) {
-      const leadSnapshot = await snapshotLoader.loadSnapshotFromRecord(
-        { objectType: 'lead', objectId: lead.id },
+    if (initialLead && initialLead.id) {
+      const leadSnapshot = await loader.loadPureSnapshotFromHubSpot(
+        { objectId: initialLead.id, objectType: 'LEAD' },
         config.organizationKey,
         config.relationshipType
       );
 
-      const evalRes = evaluateOpportunity(leadSnapshot, config);
-      const intents = planTransition(leadSnapshot, evalRes, config);
+      const evalResult = evaluateOpportunity(leadSnapshot, config);
+      const intents = planTransition(leadSnapshot, evalResult, config);
 
       const mutationResult = await adapter.applyTransitionIntents(intents, leadSnapshot.opportunityKey, config);
 
       if (!mutationResult.success) {
-        const failedReceipts = mutationResult.receipts.filter(r => !r.verified);
-        throw new Error(`ACTION_UNVERIFIED: Mutation readback verification failed: ${JSON.stringify(failedReceipts)}`);
+        const failedReceipts = mutationResult.receipts.filter((r: VerificationReceipt) => !r.verified);
+        throw new Error(`ACTION_UNVERIFIED: Initial Lead mutation readback verification failed: ${JSON.stringify(failedReceipts)}`);
       }
 
-      let status = 'NO_CHANGE';
-      if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_SUCCESSOR' && r.operation === 'CREATE' && r.verified)) {
-        status = 'CREATED_SUCCESSOR';
-      } else if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_SUCCESSOR' && r.operation === 'NOOP' && r.verified)) {
-        status = config.featureFlags?.dryRunTransactions ? 'DRY_RUN_SUCCESSOR_PLANNED' : 'NO_CHANGE';
-      } else if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_MANUAL_REVIEW')) {
-        status = 'MANUAL_REVIEW_REQUIRED';
-      } else if (evalRes.qualificationState === 'BLOCKED') {
-        status = 'BLOCKED';
-      } else if (mutationResult.receipts.some(r => r.operation === 'UPDATE' && r.verified)) {
-        status = 'UPDATED_EXISTING';
-      }
-
+      const hasSuccessor = mutationResult.receipts.some((r: VerificationReceipt) => r.intentKind === 'CREATE_SUCCESSOR');
       return {
         outputFields: {
-          objectId: String(lead.id),
+          objectId: initialLead.id,
           objectType: 'lead',
           opportunityKey: leadSnapshot.opportunityKey,
-          qualificationState: evalRes.qualificationState,
-          appliedIntentsCount: mutationResult.appliedIntents,
+          qualificationState: evalResult.qualificationState,
+          appliedIntentsCount: mutationResult.appliedIntents + 1,
           verified: mutationResult.success,
-          status
+          status: hasSuccessor ? 'CREATED_SUCCESSOR' : 'UPDATED_EXISTING'
         }
       };
     }
@@ -145,20 +162,20 @@ export async function processHubSpotCustomCodeAction(
   const mutationResult = await adapter.applyTransitionIntents(intents, snapshot.opportunityKey, config);
 
   if (!mutationResult.success) {
-    const failedReceipts = mutationResult.receipts.filter(r => !r.verified);
+    const failedReceipts = mutationResult.receipts.filter((r: VerificationReceipt) => !r.verified);
     throw new Error(`ACTION_UNVERIFIED: Mutation readback verification failed: ${JSON.stringify(failedReceipts)}`);
   }
 
   let status = 'NO_CHANGE';
-  if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_SUCCESSOR' && r.operation === 'CREATE' && r.verified)) {
+  if (mutationResult.receipts.some((r: VerificationReceipt) => r.intentKind === 'CREATE_SUCCESSOR' && r.operation === 'CREATE' && r.verified)) {
     status = 'CREATED_SUCCESSOR';
-  } else if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_SUCCESSOR' && r.operation === 'NOOP' && r.verified)) {
+  } else if (mutationResult.receipts.some((r: VerificationReceipt) => r.intentKind === 'CREATE_SUCCESSOR' && r.operation === 'NOOP' && r.verified)) {
     status = config.featureFlags?.dryRunTransactions ? 'DRY_RUN_SUCCESSOR_PLANNED' : 'NO_CHANGE';
-  } else if (mutationResult.receipts.some(r => r.intentKind === 'CREATE_MANUAL_REVIEW')) {
+  } else if (mutationResult.receipts.some((r: VerificationReceipt) => r.intentKind === 'CREATE_MANUAL_REVIEW')) {
     status = 'MANUAL_REVIEW_REQUIRED';
   } else if (evaluation.qualificationState === 'BLOCKED') {
     status = 'BLOCKED';
-  } else if (mutationResult.receipts.some(r => r.operation === 'UPDATE' && r.verified)) {
+  } else if (mutationResult.receipts.some((r: VerificationReceipt) => r.operation === 'UPDATE' && r.verified)) {
     status = 'UPDATED_EXISTING';
   }
 
@@ -195,8 +212,21 @@ export async function main(
       callback(result);
     }
     return result;
-  } catch (err) {
+  } catch (err: any) {
     logger.error("HubSpot Custom Code Action execution error", { error: err });
+    if (callback) {
+      callback({
+        outputFields: {
+          objectId: String(event?.object?.objectId || '0'),
+          objectType: String(event?.object?.objectType || 'CONTACT'),
+          opportunityKey: 'UNKNOWN',
+          qualificationState: 'MANUAL_REVIEW',
+          appliedIntentsCount: 0,
+          verified: false,
+          status: 'FAILED'
+        }
+      });
+    }
     throw err;
   }
 }

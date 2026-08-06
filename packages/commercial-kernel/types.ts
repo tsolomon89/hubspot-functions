@@ -32,6 +32,7 @@ export interface OpportunitySnapshot {
   predecessorOpportunityKey?: string;
   predecessorCompletedAt?: string;
   mqlCompletedAt?: string;
+  sqlCompletedAt?: string;
   offerings?: OfferingRef[];
   subject: CommercialSubjectRef;
   facts: Record<string, unknown>;
@@ -45,6 +46,7 @@ export interface EvaluationResult {
   evidenceRefsByGoal: Record<string, string[]>;
   evaluatedConfigVersion: string;
   mqlCompletedAt?: string;
+  sqlCompletedAt?: string;
 }
 
 export interface GoalDefinition {
@@ -74,6 +76,7 @@ export interface QualificationConfig {
   organizationKey: string;
   configVersion: string;
   relationshipType: string;
+  productType?: string;
   goalsByOpportunityType: Record<OpportunityType, GoalDefinition[]>;
   hubspotPipelines?: HubSpotPipelineConfig;
   offeringPolicy?: OfferingPolicyConfig;
@@ -97,6 +100,7 @@ export type TransitionIntent =
         targetLeadStage?: string; 
         targetDealStage?: string; 
         mqlCompletedAt?: string;
+        sqlCompletedAt?: string;
         unsatisfiedGoalKeys?: string[];
         offerings?: OfferingRef[];
       } 

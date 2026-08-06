@@ -1,13 +1,14 @@
 const crypto = require('crypto');
-const { processHubSpotCustomCodeAction } = require('../../../src/custom-code-actions/reconcile-record');
+const { processHubSpotCustomCodeAction } = require('../../custom-code-actions/reconcile-record');
 
 function verifyHubSpotSignatureV3(context) {
-  const rawSignature = context.headers ? context.headers['x-hubspot-signature-v3'] : null;
-  const requestTimestamp = context.headers ? context.headers['x-hubspot-request-timestamp'] : null;
-  const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
+  const headers = context.headers || {};
+  const rawSignature = headers['x-hubspot-signature-v3'] || headers['X-HubSpot-Signature-v3'];
+  const requestTimestamp = headers['x-hubspot-request-timestamp'] || headers['X-HubSpot-Request-Timestamp'];
+  const clientSecret = process.env.HUBSPOT_CLIENT_SECRET || context.secrets?.HUBSPOT_CLIENT_SECRET;
 
   if (!rawSignature || !requestTimestamp || !clientSecret) {
-    return true; // Skip signature check if headers or secret are absent in test environment
+    return false; // Fail closed strictly! Return 401 if signature, timestamp or secret is missing.
   }
 
   // Reject requests older than 5 minutes (300,000 ms) to prevent replay attacks
@@ -20,7 +21,7 @@ function verifyHubSpotSignatureV3(context) {
 
   const requestUrl = context.url || '';
   const httpMethod = (context.method || 'POST').toUpperCase();
-  const requestBody = JSON.stringify(context.body || {});
+  const requestBody = typeof context.body === 'string' ? context.body : JSON.stringify(context.body || {});
 
   const sourceString = httpMethod + requestUrl + requestBody + requestTimestamp;
   const hash = crypto
@@ -40,7 +41,7 @@ exports.main = async (context = {}, sendResponse) => {
     if (!verifyHubSpotSignatureV3(context)) {
       return sendResponse({
         statusCode: 401,
-        body: { error: 'UNAUTHORIZED: X-HubSpot-Signature-v3 verification failed or timestamp expired' }
+        body: { error: 'UNAUTHORIZED: X-HubSpot-Signature-v3 verification failed or signature headers missing' }
       });
     }
 

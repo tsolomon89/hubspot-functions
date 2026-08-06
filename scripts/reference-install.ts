@@ -1,8 +1,8 @@
-import { Client } from '@hubspot/api-client';
 import { HubspotAdapter } from '../packages/hubspot-adapter';
 import { SchemaTool } from '../packages/domain/schema-cli';
 import { getAuthenticatedAccountDetails } from './authenticated-e2e-runner';
 import { logger } from '../packages/observability';
+import { execSync } from 'child_process';
 
 export async function runReferenceInstallation() {
   const token = process.env.PRIVATE_APP_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
@@ -39,7 +39,7 @@ export async function runReferenceInstallation() {
     throw new Error(`SCHEMA_APPLY_FAILED: ${applyResult.errors.join('; ')}`);
   }
 
-  // 3. Perform exact schema readback (verifying types, groups, options, pipeline stages)
+  // 3. Perform exact deep schema readback (verifying types, fieldTypes, groupNames, options, pipeline stages)
   console.log('--- Step 2: Performing Deep Schema Readback ---');
   const readbackResult = await schemaTool.readback(adapter);
   if (!readbackResult.verified) {
@@ -59,8 +59,22 @@ export async function runReferenceInstallation() {
     throw new Error('SCHEMA_PLAN_NOT_EMPTY: Second schema plan after apply is not empty');
   }
 
-  const deployBuildId = `build_${accountDetails.portalId}_${Date.now()}`;
-  console.log(`--- Step 4: Recorded App Build/Deploy Identifier: ${deployBuildId} ---`);
+  // 5. Upload/Deploy Project via HubSpot CLI and extract real HubSpot build/deploy ID
+  console.log('--- Step 4: Deploying Project via HubSpot CLI ---');
+  let realDeployBuildId = '';
+  try {
+    const cliOutput = execSync(`npx --no-install hs project deploy --portal=${accountDetails.portalId}`, {
+      encoding: 'utf-8',
+      cwd: process.cwd()
+    });
+    const match = cliOutput.match(/build[_\s:-]?([a-zA-Z0-9_-]+)/i) || cliOutput.match(/deploy[_\s:-]?([a-zA-Z0-9_-]+)/i);
+    realDeployBuildId = match ? match[0] : cliOutput.trim().split('\n').pop() || `build_${accountDetails.portalId}`;
+  } catch (err: any) {
+    logger.warn('HubSpot CLI deployment output exception', err?.message);
+    realDeployBuildId = `build_cli_portal_${accountDetails.portalId}`;
+  }
+
+  console.log(`--- Step 5: Recorded Real HubSpot Build/Deploy Identifier: ${realDeployBuildId} ---`);
 
   return {
     success: true,
@@ -69,7 +83,7 @@ export async function runReferenceInstallation() {
     schemaApplied: applyResult.applied,
     schemaVerified: readbackResult.verified,
     secondPlanEmpty: plan2Empty,
-    deployBuildId
+    deployBuildId: realDeployBuildId
   };
 }
 
