@@ -5,3 +5,5 @@ accounts:
     portalId: 149041124
     authType: "personalaccesskey"
     personalAccessKey: "pat-na1-fake-key-for-ci-project-validation"
+    tokenInfo:
+      accessToken: "pat-na1-fake-key-for-ci-project-validation"
