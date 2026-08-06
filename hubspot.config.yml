@@ -6,8 +6,8 @@ accounts:
     env: eu1
     authType: personalaccesskey
     accountType: STANDARD
-    personalAccessKey: "pat-na1-fake-key-for-ci-project-validation"
+    personalAccessKey: "pat-eu1-149041124-fake-key-for-ci-project-validation"
     auth:
       tokenInfo:
-        accessToken: "pat-na1-fake-key-for-ci-project-validation"
+        accessToken: "pat-eu1-149041124-fake-key-for-ci-project-validation"
         expiresAt: "2099-01-01T00:00:00.000Z"
